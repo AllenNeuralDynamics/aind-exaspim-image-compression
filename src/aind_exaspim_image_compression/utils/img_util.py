@@ -8,6 +8,9 @@ Helper routines for working with images.
 
 """
 
+from bm4d import bm4d
+from botocore.config import Config
+
 import boto3
 import botocore
 import logging
@@ -16,9 +19,8 @@ import numpy as np
 import s3fs
 import zarr
 
-from botocore.config import Config
 
-
+# --- Image Reader ---
 def open_img(prefix):
     """
     Opens an image stored in an S3 bucket as a Zarr array.
@@ -144,6 +146,17 @@ def get_start_end(voxel, shape, from_center=True):
     return start, end
 
 
+# --- Custom Classes ---
+class BM4D:
+    def __init__(self, sigma=20):
+        self.sigma = sigma
+
+    def __call__(self, noise):
+        mn, mx = noise.min(), noise.max()
+        denoised = bm4d(noise, self.sigma)
+        return noise / 1000, denoised / 1000
+
+
 # --- Coordinate Conversions ---
 def to_physical(voxel, anisotropy):
     """
@@ -214,7 +227,7 @@ def local_to_physical(local_voxel, offset, multiscale):
 
 
 # --- Visualizations ---
-def plot_mips(img):
+def plot_mips(img, vmax=None):
     """
     Plots the Maximum Intensity Projections (MIPs) of a 3D image along the XY,
     XZ, and YZ axes.
@@ -229,11 +242,12 @@ def plot_mips(img):
     None
 
     """
+    vmax = vmax or np.percentile(img, 99.9)
     fig, axs = plt.subplots(1, 3, figsize=(10, 4))
     axs_names = ["XY", "XZ", "YZ"]
     for i in range(3):
         mip = np.max(img, axis=i)
-        axs[i].imshow(mip, vmax=np.percentile(mip, 99.9))
+        axs[i].imshow(mip, vmax=vmax)
         axs[i].set_title(axs_names[i], fontsize=16)
         axs[i].set_xticks([])
         axs[i].set_yticks([])
@@ -241,8 +255,8 @@ def plot_mips(img):
     plt.show()
 
 
-# --- Utils ---
-def compute_cratio(img):
+# --- Helpers ---
+def compute_cratio(img, codec):
     return img.nbytes / len(codec.encode(img))
 
 
@@ -309,7 +323,7 @@ def is_inbounds(voxel, shape):
 
 def normalize(img_patch):
     """
-    Rescales the input image to a [0, 1] intensity range.
+    Rescales the given image to [0, 1] intensity range.
 
     Parameters
     ----------
@@ -324,31 +338,3 @@ def normalize(img_patch):
     """
     img_patch -= np.min(img_patch)
     return img_patch / np.max(img_patch)
-
-
-def rescale(img_patch, clip_bool=True):
-    """
-    Rescales the input image to a [0, 2**16 - 1] intensity range, with optional
-    clipping at the 99th percentile.
-
-    Parameters
-    ----------
-    img_patch : numpy.ndarray
-        Image patch to be rescaled.
-    clip_bool : bool, optional
-        If True, the resulting MIP will be clipped at the 99th percentile. The
-        default is True.
-
-    Returns
-    -------
-    numpy.ndarray
-        Rescaled image.
-
-    """
-    # Clip image
-    if clip_bool:
-        img_patch = np.clip(img_patch, 0, np.percentile(img_patch, 99.9))
-
-    # Rescale image
-    img_patch = (2**16 - 1) * normalize(img_patch)
-    return img_patch.astype(np.uint16)
