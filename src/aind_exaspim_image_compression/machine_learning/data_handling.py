@@ -226,7 +226,7 @@ class ValidateDataset(Dataset):
     def get_patch(self, brain_id, voxel):
         s, e = img_util.get_start_end(voxel, self.patch_shape)
         patch = self.imgs[brain_id][0, 0, s[0]: e[0], s[1]: e[1], s[2]: e[2]]
-        return patch / np.percentile(patch, 99.9)
+        return patch #/ np.percentile(patch, 99.9)
 
 
 # --- Custom Dataloaders ---
@@ -338,10 +338,10 @@ class TrainBM4DDataLoader(DataLoader):
             noise_patches = np.zeros((self.batch_size, 1,) + self.patch_shape)
             clean_patches = np.zeros((self.batch_size, 1,) + self.patch_shape)
             for i, process in enumerate(as_completed(processes)):
-                noise, clean = process.result()
+                noise, clean, _ = process.result()
                 noise_patches[i, 0, ...] = noise
                 clean_patches[i, 0, ...] = clean
-        return to_tensor(noise_patches), to_tensor(clean_patches)
+        return to_tensor(noise_patches), to_tensor(clean_patches), None
 
 
 class ValidateN2VDataLoader(DataLoader):
@@ -415,11 +415,13 @@ class ValidateBM4DDataLoader(DataLoader):
             # Process results
             noise_patches = np.zeros((self.batch_size, 1,) + self.patch_shape)
             clean_patches = np.zeros((self.batch_size, 1,) + self.patch_shape)
+            mn_mxes = np.zeros((self.batch_size, 2))
             for i, process in enumerate(as_completed(processes)):
-                noise, clean = process.result()
+                noise, clean, mn_mx = process.result()
                 noise_patches[i, 0, ...] = noise
                 clean_patches[i, 0, ...] = clean
-        return to_tensor(noise_patches), to_tensor(clean_patches)
+                mn_mxes[i, :] = mn_mx
+        return to_tensor(noise_patches), to_tensor(clean_patches), mn_mxes
 
 
 # --- Helpers ---
@@ -461,7 +463,6 @@ def init_datasets(
         brain_id = train_dataset.sample_brain()
         voxel = train_dataset.sample_voxel(brain_id)
         val_dataset.ingest_example(brain_id, voxel)
-
     return train_dataset, val_dataset
 
 

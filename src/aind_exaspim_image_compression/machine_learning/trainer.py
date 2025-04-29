@@ -16,6 +16,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
+from tifffile import imwrite
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 
@@ -75,7 +76,10 @@ class Trainer:
             train_loss = self.train_step(train_dataloader, epoch)
             val_loss, val_cratio, new_best = self.validate_model(val_dataloader, epoch)
             if new_best:
+                print(f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio} - New Best!")
+            else:
                 print(f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio}")
+                
 
             # Step scheduler
             self.scheduler.step()
@@ -83,7 +87,7 @@ class Trainer:
     def train_step(self, train_dataloader, epoch):
         losses = list()
         self.model.train()
-        for x_i, y_i in train_dataloader:
+        for x_i, y_i, _ in train_dataloader:
             # Forward pass
             x_i, y_i = x_i.to("cuda"), y_i.to("cuda")
             hat_y_i = self.model(x_i)
@@ -100,24 +104,24 @@ class Trainer:
         return np.mean(losses)
 
     def validate_model(self, val_dataloader, epoch):
-        # Run model
         losses = list()
         cratios = list()
         self.model.eval()
         with torch.no_grad():
-            for x_i, y_i in val_dataloader:
-                x_i, y_i = x_i.to("cuda"), y_i.to("cuda")
-                hat_y_i = self.model(x_i)
-                loss = self.criterion(hat_y_i, y_i)
+            for x, y, mn_mx in val_dataloader:
+                # Run model
+                x, y = x.to("cuda"), y.to("cuda")
+                hat_y = self.model(x)
+                loss = self.criterion(hat_y, y)                
 
-            # Store loss for tensorboard
-            cratios.extend(self.compute_cratios(hat_y_i))
-            losses.append(loss.detach().cpu())
+                # Evalute result
+                cratios.extend(self.compute_cratios(hat_y, mn_mx))
+                losses.append(loss.detach().cpu())
 
         # Log results
-        loss, cratio = np.median(losses), np.median(cratios)
+        loss, cratio = np.mean(losses), np.mean(cratios)
         self.writer.add_scalar("val_loss", loss, epoch)
-        self.writer.add_scalar("val_cratio", cratio, epoch) if cratio < 1000 else None
+        self.writer.add_scalar("val_cratio", cratio, epoch)
         if loss < self.best_l1:
             self.save_model(epoch)
             self.best_l1 = loss
@@ -125,12 +129,15 @@ class Trainer:
         else:
             return loss, cratio, False
 
-    def compute_cratios(self, denoised_patches):
+    def compute_cratios(self, imgs, mn_mx):
         cratios = list()
-        denoised_patches = 1000 * np.array(denoised_patches.detach().cpu())
-        for i in range(denoised_patches.shape[0]):
-            patch = denoised_patches[i, 0, ...].astype(np.uint16)
-            cratios.append(img_util.compute_cratio(patch, self.codec))
+        imgs = np.array(imgs.detach().cpu())
+        for i in range(imgs.shape[0]):
+            mn, mx = tuple(mn_mx[i, :])
+            img = (imgs[i, 0, ...] * mx + mn).astype(np.uint16)
+            cratios.append(
+                img_util.compute_cratio(img, self.codec)
+            )
         return cratios
 
     def save_model(self, epoch):
