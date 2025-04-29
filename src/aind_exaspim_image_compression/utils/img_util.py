@@ -154,7 +154,7 @@ class BM4D:
     def __call__(self, noise):
         mn, mx = noise.min(), noise.max()
         denoised = bm4d(noise, self.sigma)
-        return noise / 1000, denoised / 1000
+        return (noise - mn) / mx, (denoised - mn) / mx, (mn, mx)
 
 
 # --- Coordinate Conversions ---
