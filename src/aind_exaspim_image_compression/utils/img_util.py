@@ -152,7 +152,7 @@ class BM4D:
         self.sigma = sigma
 
     def __call__(self, noise):
-        mn, mx = noise.min(), noise.max()
+        mn, mx = noise.min(), np.percentile(noise, 99.9)
         denoised = bm4d(noise, self.sigma)
         return (noise - mn) / mx, (denoised - mn) / mx, (mn, mx)
 
