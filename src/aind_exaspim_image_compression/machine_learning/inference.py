@@ -31,6 +31,7 @@ def predict(img, model, batch_size=32, patch_size=64, overlap=16):
         # Get patch
         patch = img[i:i_end, j:j_end, k:k_end]
         mn, mx = patch.min(), patch.max()
+        #mn, mx = np.percentile(patch, 5), np.percentile(patch, 99.9)
         patch = (patch - mn) / mx
         mn_mx.append((mn, mx))
 
