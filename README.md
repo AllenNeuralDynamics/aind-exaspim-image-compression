@@ -7,3 +7,5 @@
 ![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen?logo=codecov)
 ![Python](https://img.shields.io/badge/python->=3.10-blue?logo=python)
 
+A Python package for compressing ExaSPIM image datasets via denoising and loseless compression
+
