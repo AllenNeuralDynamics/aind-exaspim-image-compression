@@ -9,6 +9,7 @@ Miscellaneous helper routines.
 """
 
 from concurrent.futures import as_completed, ThreadPoolExecutor
+from google.cloud import storage
 from random import sample
 
 import boto3
@@ -17,7 +18,7 @@ import os
 import shutil
 
 
-# --- os utils ---
+# --- OS utils ---
 def mkdir(path, delete=False):
     """
     Creates a directory at "path".
@@ -57,6 +58,30 @@ def rmdir(path):
     """
     if os.path.exists(path):
         shutil.rmtree(path)
+
+
+def list_dir(directory, extension=None):
+    """
+    Lists filenames in the given directory. If "extension" is provided,
+    filenames ending with the given extension are returned.
+
+    Parameters
+    ----------
+    directory : str
+        Path to directory to be searched.
+    extension : str, optional
+       Extension of filenames to be returned. The default is None.
+
+    Returns
+    -------
+    List[str]
+        Filenames in the given directory.
+
+    """
+    if extension is None:
+        return [f for f in os.listdir(directory)]
+    else:
+        return [f for f in os.listdir(directory) if f.endswith(extension)]
 
 
 def list_subdirectory_names(directory_path):
@@ -185,6 +210,23 @@ def write_to_list(path, my_list):
     with open(path, "w") as file:
         for item in my_list:
             file.write(f"{item}\n")
+
+
+# --- GCS utils ---
+def upload_directory_to_gcs(bucket_name, source_dir, destination_dir):
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    for root, _, files in os.walk(source_dir):
+        for filename in files:
+            local_path = os.path.join(root, filename)
+
+            # Compute the relative path and GCS destination path
+            path = os.path.relpath(local_path, start=source_dir)
+            blob_path = os.path.join(destination_dir, path).replace("\\", "/")
+
+            # Upload the file
+            blob = bucket.blob(blob_path)
+            blob.upload_from_filename(local_path)
 
 
 # --- S3 utils ---

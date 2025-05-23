@@ -148,11 +148,11 @@ def get_start_end(voxel, shape, from_center=True):
 
 # --- Custom Classes ---
 class BM4D:
-    def __init__(self, sigma=20):
+    def __init__(self, sigma=10):
         self.sigma = sigma
 
     def __call__(self, noise):
-        mn, mx = noise.min(), np.percentile(noise, 99.9)
+        mn, mx = np.percentile(noise, 5), np.percentile(noise, 99.9)
         denoised = bm4d(noise, self.sigma)
         return (noise - mn) / mx, (denoised - mn) / mx, (mn, mx)
 
@@ -257,7 +257,56 @@ def plot_mips(img, vmax=None):
 
 # --- Helpers ---
 def compute_cratio(img, codec):
+    """
+    Computes the compression ratio for a given image.
+
+    Parameters
+    ----------
+    img : numpy.ndarray
+        Image to compute compression ratio of.
+    codec : ...
+        Object used to compress image.
+
+    Returns
+    -------
+    float
+        Compression ratio for a given image.
+
+    """
     return img.nbytes / len(codec.encode(img))
+
+
+def fill_boundary(img, depth, value):
+    """
+    Fill boundary of a 3D image with a given value.
+
+    Parameters
+    ----------
+    img : numpy.ndarray
+        Image to be updated
+    depth : int
+        Distance to boundary from boundary to be filled.
+    value : float
+        Fill value.
+
+    Returns
+    -------
+    numpy.ndarray
+        Updated image.
+
+    """
+    # Fill along axis 0 (z)
+    img[:depth, :, :] = value
+    img[-depth:, :, :] = value
+
+    # Fill along axis 1 (y)
+    img[:, :depth, :] = value
+    img[:, -depth:, :] = value
+
+    # Fill along axis 2 (x)
+    img[:, :, :depth] = value
+    img[:, :, -depth:] = value
+    return img
 
 
 def get_nbs(voxel, shape):
