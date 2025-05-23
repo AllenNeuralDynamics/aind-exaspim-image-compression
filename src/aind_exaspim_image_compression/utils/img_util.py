@@ -10,13 +10,24 @@ Helper routines for working with images.
 
 from bm4d import bm4d
 from botocore.config import Config
+from numcodecs import Blosc
+from ome_zarr.writer import write_image, write_multiscale
+from ome_zarr.scale import Scaler
+from pathlib import Path
+from typing import Union, Any
+from xarray_multiscale import multiscale, windowed_mode
 
+import argparse
 import boto3
 import botocore
+import json
 import logging
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 import s3fs
+import shutil
+import tifffile
 import zarr
 
 
@@ -256,6 +267,49 @@ def plot_mips(img, vmax=None):
 
 
 # --- Helpers ---
+def convert_tiff_ome_zarr(
+        in_path,
+        out_path,
+        chunks: tuple = (1, 1, 64, 128, 128),
+        compressor: Any = Blosc(cname='zstd', clevel=1, shuffle=Blosc.SHUFFLE),
+        voxel_size: list = (0.748, 0.748, 1.0),
+        n_levels: int = 3
+):
+    """
+    Convert a Tiff stack to an N5 dataset.
+
+    Args:
+         in_path: the path to the Tiff
+         out_path: the path to write the N5
+         chunks: the chunk shape of the N5 dataset
+         compressor: the numcodecs compressor instance for the N5 dataset
+         voxel_size: the voxel spacing of the image, in nanometers
+         n_levels: the number of levels in the multiscale pyramid
+    """
+    im = tifffile.imread(in_path)
+    while im.ndim < 5:
+        im = im[np.newaxis, ...]
+    pyramid = multiscale(im, windowed_mode, scale_factors=[1, 1, 2, 2, 2])[:n_levels]
+    pyramid = [l.data for l in pyramid]
+    z = zarr.open(store=zarr.DirectoryStore(out_path, dimension_separator='/'), mode='w')
+    voxel_size = np.array([1, 1] + list(reversed(voxel_size)))
+    scales = [np.concatenate((voxel_size[:2], voxel_size[2:] * 2 ** i)) for i in range(n_levels)]
+    coordinate_transformations = [[{"type": "scale", "scale": scale.tolist()}] for scale in scales]
+    storage_options = {"compressor": compressor}
+    write_multiscale(
+        pyramid=pyramid,
+        group=z,
+        chunks=chunks,
+        axes=[{"name": 't', "type": "time", "unit": "millisecond"},
+              {"name": 'c', "type": "channel"},
+              {"name": 'z', "type": "space", "unit": "micrometer"},
+              {"name": 'y', "type": "space", "unit": "micrometer"},
+              {"name": 'x', "type": "space", "unit": "micrometer"}],
+        coordinate_transformations=coordinate_transformations,
+        storage_options=storage_options
+    )
+
+
 def compute_cratio(img, codec):
     """
     Computes the compression ratio for a given image.

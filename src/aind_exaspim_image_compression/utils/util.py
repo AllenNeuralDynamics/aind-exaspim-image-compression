@@ -213,6 +213,22 @@ def write_to_list(path, my_list):
 
 
 # --- GCS utils ---
+def copy_gcs_file(bucket_name, source_path, destination_path):
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    source_blob = bucket.blob(source_path)
+    destination_blob = bucket.copy_blob(source_blob, bucket, destination_path)
+
+
+def copy_gcs_directory(bucket_name, source_prefix, destination_prefix):
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blobs = client.list_blobs(bucket, prefix=source_prefix)
+    for blob in blobs:
+        new_blob_name = blob.name.replace(source_prefix, destination_prefix, 1)
+        bucket.copy_blob(blob, bucket, new_blob_name)
+
+
 def upload_directory_to_gcs(bucket_name, source_dir, destination_dir):
     client = storage.Client()
     bucket = client.bucket(bucket_name)
