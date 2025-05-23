@@ -142,6 +142,6 @@ class Trainer:
 
     def save_model(self, epoch):
         date = datetime.today().strftime("%Y%m%d")
-        filename = f"GraphNeuralNet-{date}-{epoch}-{round(self.best_l1, 4)}.pth"
+        filename = f"BM4DNet-{date}-{epoch}-{round(self.best_l1, 4)}.pth"
         path = os.path.join(self.log_dir, filename)
         torch.save(self.model.state_dict(), path)
