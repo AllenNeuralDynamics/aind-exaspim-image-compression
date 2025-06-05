@@ -9,49 +9,74 @@ Helper routines for working with images.
 """
 
 from bm4d import bm4d
-from botocore.config import Config
 from numcodecs import Blosc
-from ome_zarr.writer import write_image, write_multiscale
-from ome_zarr.scale import Scaler
-from pathlib import Path
-from typing import Union, Any
+from ome_zarr.writer import write_multiscale
+from scipy.ndimage import uniform_filter
+from typing import Any
 from xarray_multiscale import multiscale, windowed_mode
 
-import argparse
-import boto3
-import botocore
-import json
-import logging
+import gcsfs
 import matplotlib.pyplot as plt
 import numpy as np
 import os
 import s3fs
-import shutil
 import tifffile
 import zarr
 
+from aind_exaspim_image_compression.utils import util
+
 
 # --- Image Reader ---
-def open_img(prefix):
-    """
-    Opens an image stored in an S3 bucket as a Zarr array.
-
-    Parameters
-    ----------
-    prefix : str
-        Prefix (or path) within the S3 bucket where the image is stored.
-
-    Returns
-    -------
-    zarr.core.Array
-        A Zarr object representing an image.
-
-    """
-    fs = s3fs.S3FileSystem(config_kwargs={"max_pool_connections": 50})
-    store = s3fs.S3Map(root=prefix, s3=fs)
-    return zarr.open(store, mode="r")
+def read(img_path):
+    if ".zarr" in img_path:
+        return _read_zarr(img_path)
+    elif ".n5" in img_path:
+        return _read_n5(img_path)
+    elif ".tif" in img_path or ".tiff" in img_path:
+        return _read_tiff(img_path)
+    else:
+        raise ValueError(f"Unsupported image format: {img_path}")
 
 
+def _read_zarr(img_path):
+    if _is_gcs_path(img_path):
+        fs = gcsfs.GCSFileSystem(anon=False)
+        store = zarr.storage.FSStore(img_path, fs=fs)
+    elif _is_s3_path(img_path):
+        fs = s3fs.S3FileSystem(config_kwargs={"max_pool_connections": 50})
+        store = s3fs.S3Map(root=img_path, s3=fs)
+    else:
+        store = zarr.DirectoryStore(img_path)
+    return zarr.open(store, mode="r")[0]
+
+
+def _read_n5(img_path):
+    if _is_gcs_path(img_path):
+        fs = gcsfs.GCSFileSystem(anon=False)
+        store = zarr.n5.N5FSStore(img_path, s=fs)
+    else:
+        store = zarr.n5.N5Store(img_path)
+    return zarr.open(store, mode="r")["volume"]
+
+
+def _read_tiff(img_path, storage_options=None):
+    if _is_gcs_path(img_path):
+        fs = gcsfs.GCSFileSystem(**(storage_options or {}))
+        with fs.open(img_path, "rb") as f:
+            return tifffile.imread(f)
+    else:
+        return tifffile.imread(img_path)
+
+
+def _is_gcs_path(path):
+    return path.startswith("gs://")
+
+
+def _is_s3_path(path):
+    return path.startswith("s3://")
+
+
+# --- Read Patches ---
 def get_patch(img, voxel, shape, from_center=True):
     """
     Extracts a patch from an image based on the given voxel coordinate and
@@ -157,17 +182,6 @@ def get_start_end(voxel, shape, from_center=True):
     return start, end
 
 
-# --- Custom Classes ---
-class BM4D:
-    def __init__(self, sigma=10):
-        self.sigma = sigma
-
-    def __call__(self, noise):
-        mn, mx = np.percentile(noise, 5), np.percentile(noise, 99.9)
-        denoised = bm4d(noise, self.sigma)
-        return (noise - mn) / mx, (denoised - mn) / mx, (mn, mx)
-
-
 # --- Coordinate Conversions ---
 def to_physical(voxel, anisotropy):
     """
@@ -237,8 +251,20 @@ def local_to_physical(local_voxel, offset, multiscale):
     return to_physical(global_voxel, multiscale)
 
 
+# --- Custom Classes ---
+class BM4D:
+    def __init__(self, sigma=10):
+        self.sigma = sigma
+
+    def __call__(self, noise):
+        mn, mx = np.percentile(noise, 5), np.percentile(noise, 99.9)
+        mx = max(1, mx)
+        denoised = bm4d(noise, self.sigma)
+        return (noise - mn) / mx, (denoised - mn) / mx, (mn, mx)
+
+
 # --- Visualizations ---
-def plot_mips(img, vmax=None):
+def plot_mips(img, output_path=None, vmax=None):
     """
     Plots the Maximum Intensity Projections (MIPs) of a 3D image along the XY,
     XZ, and YZ axes.
@@ -262,18 +288,90 @@ def plot_mips(img, vmax=None):
         axs[i].set_title(axs_names[i], fontsize=16)
         axs[i].set_xticks([])
         axs[i].set_yticks([])
+
     plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=200)
     plt.show()
+    plt.close(fig)
+
+
+# --- Image Prefix Search ---
+def get_img_prefix(brain_id, img_prefix_path=None):
+    # Check prefix path
+    if img_prefix_path:
+        prefix_lookup = util.read_json(img_prefix_path)
+        if brain_id in prefix_lookup:
+            return prefix_lookup[brain_id]
+
+    # Search for prefix path
+    result = find_img_prefix(brain_id)
+    if len(result) == 1:
+        prefix = result[0] + "/"
+        if img_prefix_path:
+            prefix_lookup[brain_id] = prefix
+            util.write_json(img_prefix_path, prefix_lookup)
+        return prefix
+
+    raise Exception(f"Image Prefixes Found - {result}")
+
+
+def find_img_prefix(brain_id):
+    # Get possible prefixes
+    bucket_name = "aind-open-data"
+    prefixes = util.list_s3_bucket_prefixes(
+        "aind-open-data", keyword="exaspim"
+    )
+    valid_prefixes = list()
+    for prefix in prefixes:
+        if is_valid_prefix(bucket_name, prefix, brain_id):
+            valid_prefixes.append(
+                os.path.join("s3://aind-open-data", prefix, "fused.zarr")
+            )
+    return find_functional_img_prefix(valid_prefixes)
+
+
+def is_valid_prefix(bucket_name, prefix, brain_id):
+    # Quick checks
+    is_test = "test" in prefix.lower()
+    has_correct_id = str(brain_id) in prefix
+    if not has_correct_id or is_test:
+        return False
+
+    # Check inside prefix
+    if util.exists_in_prefix(bucket_name, prefix, "fused.zarr"):
+        img_prefix = os.path.join(prefix, "fused.zarr")
+        subprefixes = util.list_s3_prefixes(bucket_name, img_prefix)
+        subprefixes = [p.split("/")[-2] for p in subprefixes]
+        for i in range(0, 8):
+            if str(i) not in subprefixes:
+                return False
+    return True
+
+
+def find_functional_img_prefix(prefixes):
+    # Filter img prefixes that fail to open
+    functional_prefixes = list()
+    for prefix in prefixes:
+        try:
+            root = os.path.join(prefix, str(0))
+            store = s3fs.S3Map(root=root, s3=s3fs.S3FileSystem(anon=True))
+            img = zarr.open(store, mode="r")
+            if np.max(img.shape) > 25000:
+                functional_prefixes.append(prefix)
+        except:
+            pass
+    return functional_prefixes
 
 
 # --- Helpers ---
 def convert_tiff_ome_zarr(
-        in_path,
-        out_path,
-        chunks: tuple = (1, 1, 64, 128, 128),
-        compressor: Any = Blosc(cname='zstd', clevel=1, shuffle=Blosc.SHUFFLE),
-        voxel_size: list = (0.748, 0.748, 1.0),
-        n_levels: int = 3
+    in_path,
+    out_path,
+    chunks: tuple = (1, 1, 64, 128, 128),
+    compressor: Any = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
+    voxel_size: list = (0.748, 0.748, 1.0),
+    n_levels: int = 3,
 ):
     """
     Convert a Tiff stack to an N5 dataset.
@@ -286,48 +384,127 @@ def convert_tiff_ome_zarr(
          voxel_size: the voxel spacing of the image, in nanometers
          n_levels: the number of levels in the multiscale pyramid
     """
+    # Open image
     im = tifffile.imread(in_path)
     while im.ndim < 5:
         im = im[np.newaxis, ...]
-    pyramid = multiscale(im, windowed_mode, scale_factors=[1, 1, 2, 2, 2])[:n_levels]
-    pyramid = [l.data for l in pyramid]
-    z = zarr.open(store=zarr.DirectoryStore(out_path, dimension_separator='/'), mode='w')
+
+    # Initializations
+    pyramid = multiscale(im, windowed_mode, scale_factors=[1, 1, 2, 2, 2])[
+        :n_levels
+    ]
+    pyramid = [level.data for level in pyramid]
+    z = zarr.open(
+        store=zarr.DirectoryStore(out_path, dimension_separator="/"), mode="w"
+    )
     voxel_size = np.array([1, 1] + list(reversed(voxel_size)))
-    scales = [np.concatenate((voxel_size[:2], voxel_size[2:] * 2 ** i)) for i in range(n_levels)]
-    coordinate_transformations = [[{"type": "scale", "scale": scale.tolist()}] for scale in scales]
+    scales = [
+        np.concatenate((voxel_size[:2], voxel_size[2:] * 2**i))
+        for i in range(n_levels)
+    ]
+    coordinate_transformations = [
+        [{"type": "scale", "scale": scale.tolist()}] for scale in scales
+    ]
     storage_options = {"compressor": compressor}
+
+    # Write image
     write_multiscale(
         pyramid=pyramid,
         group=z,
         chunks=chunks,
-        axes=[{"name": 't', "type": "time", "unit": "millisecond"},
-              {"name": 'c', "type": "channel"},
-              {"name": 'z', "type": "space", "unit": "micrometer"},
-              {"name": 'y', "type": "space", "unit": "micrometer"},
-              {"name": 'x', "type": "space", "unit": "micrometer"}],
+        axes=[
+            {"name": "t", "type": "time", "unit": "millisecond"},
+            {"name": "c", "type": "channel"},
+            {"name": "z", "type": "space", "unit": "micrometer"},
+            {"name": "y", "type": "space", "unit": "micrometer"},
+            {"name": "x", "type": "space", "unit": "micrometer"},
+        ],
         coordinate_transformations=coordinate_transformations,
-        storage_options=storage_options
+        storage_options=storage_options,
     )
 
 
-def compute_cratio(img, codec):
+def compute_cratio(img, codec, chunk_shape=(64, 64, 64)):
     """
-    Computes the compression ratio for a given image.
+    Computes a Zarr-style chunked compression ratio for a given image.
 
     Parameters
     ----------
-    img : numpy.ndarray
+    img : np.ndarray
         Image to compute compression ratio of.
-    codec : ...
-        Object used to compress image.
+    codec : blosc.Blosc
+        Blosc codec used to compress each chunk.
+    chunk_shape : tuple of ints
+        Shape of chunks Zarr would use.
 
     Returns
     -------
     float
-        Compression ratio for a given image.
+        Compression ratio = total uncompressed size / total compressed size
 
     """
-    return img.nbytes / len(codec.encode(img))
+    img = np.ascontiguousarray(img)
+    total_compressed_size = 0
+    total_uncompressed_size = 0
+
+    z = [range(0, s, c) for s, c in zip(img.shape, chunk_shape)]
+    for z0 in z[0]:
+        for z1 in z[1]:
+            for z2 in z[2] if len(z) > 2 else [0]:
+                slice_ = img[
+                    z0: z0 + chunk_shape[0],
+                    z1: z1 + chunk_shape[1],
+                    z2: z2 + chunk_shape[2] if len(z) > 2 else slice(None),
+                ]
+                chunk = np.ascontiguousarray(slice_)
+                compressed = codec.encode(chunk)
+                total_compressed_size += len(compressed)
+                total_uncompressed_size += chunk.nbytes
+    return round(total_uncompressed_size / total_compressed_size, 2)
+
+
+def compute_ssim3D(
+    img1, img2, data_range=None, window_size=11, K1=0.01, K2=0.03
+):
+    """
+    Compute SSIM between two 3D images.
+
+    Parameters:
+    - img1, img2: 3D numpy arrays (must have the same shape)
+    - data_range: value range of input images (if None, computed from img1)
+    - window_size: size of the 3D filter window (default: 11)
+    - K1, K2: stability constants in the SSIM formula
+
+    Returns:
+    - SSIM value (float)
+    """
+    if img1.shape != img2.shape:
+        raise ValueError("Input images must have the same dimensions")
+
+    if data_range is None:
+        data_range = np.max(img1) - np.min(img1)
+
+    C1 = (K1 * data_range) ** 2
+    C2 = (K2 * data_range) ** 2
+
+    # Mean filter
+    mu1 = uniform_filter(img1, window_size)
+    mu2 = uniform_filter(img2, window_size)
+
+    mu1_sq = mu1**2
+    mu2_sq = mu2**2
+    mu1_mu2 = mu1 * mu2
+
+    # Variance and covariance
+    sigma1_sq = uniform_filter(img1**2, window_size) - mu1_sq
+    sigma2_sq = uniform_filter(img2**2, window_size) - mu2_sq
+    sigma12 = uniform_filter(img1 * img2, window_size) - mu1_mu2
+
+    # SSIM map
+    numerator = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
+    denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+    ssim_map = numerator / (denominator + 1e-8)
+    return np.mean(ssim_map)
 
 
 def fill_boundary(img, depth, value):
@@ -350,16 +527,16 @@ def fill_boundary(img, depth, value):
 
     """
     # Fill along axis 0 (z)
-    img[:depth, :, :] = value
-    img[-depth:, :, :] = value
+    img[0, 0, :depth, :, :] = value
+    img[0, 0, -depth:, :, :] = value
 
     # Fill along axis 1 (y)
-    img[:, :depth, :] = value
-    img[:, -depth:, :] = value
+    img[0, 0, :, :depth, :] = value
+    img[0, 0, :, -depth:, :] = value
 
     # Fill along axis 2 (x)
-    img[:, :, :depth] = value
-    img[:, :, -depth:] = value
+    img[0, 0, :, :, :depth] = value
+    img[0, 0, :, :, -depth:] = value
     return img
 
 
@@ -422,22 +599,3 @@ def is_inbounds(voxel, shape):
         return True
     else:
         return False
-
-
-def normalize(img_patch):
-    """
-    Rescales the given image to [0, 1] intensity range.
-
-    Parameters
-    ----------
-    img_patch : numpy.ndarray
-        Image patch to be normalized.
-
-    Returns
-    -------
-    numpy.ndarray
-        Normalized image.
-
-    """
-    img_patch -= np.min(img_patch)
-    return img_patch / np.max(img_patch)

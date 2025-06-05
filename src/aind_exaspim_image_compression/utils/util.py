@@ -8,7 +8,6 @@ Miscellaneous helper routines.
 
 """
 
-from concurrent.futures import as_completed, ThreadPoolExecutor
 from google.cloud import storage
 from random import sample
 
@@ -187,7 +186,7 @@ def write_json(path, my_dict):
     None
 
     """
-    with open(path, 'w') as file:
+    with open(path, "w") as file:
         json.dump(my_dict, file, indent=4)
 
 
@@ -229,6 +228,64 @@ def copy_gcs_directory(bucket_name, source_prefix, destination_prefix):
         bucket.copy_blob(blob, bucket, new_blob_name)
 
 
+def find_subprefix_with_keyword(bucket_name, prefix, keyword):
+    for subprefix in list_gcs_subprefixes(bucket_name, prefix):
+        if keyword in subprefix:
+            return subprefix
+    raise Exception(f"Prefix with keyword '{keyword}' not found in {prefix}")
+
+
+def list_block_paths(brain_id):
+    # Find prefix containing blocks
+    bucket_name = "allen-nd-goog"
+    prefix = find_subprefix_with_keyword(bucket_name, "from_aind/", brain_id)
+    prefix += "blocks/"
+
+    # Iterate over blocks
+    img_paths = list()
+    for block_prefix in list_gcs_subprefixes("allen-nd-goog", prefix):
+        img_path = find_subprefix_with_keyword(
+            bucket_name, block_prefix, "input"
+        )
+        img_paths.append(f"gs://{bucket_name}/{img_path}")
+    return img_paths
+
+
+def list_gcs_subprefixes(bucket_name, prefix):
+    """
+    Lists all direct subdirectories of a given prefix in a GCS bucket.
+
+    Parameters
+    ----------
+    bucket : str
+        Name of bucket to be read from.
+    prefix : str
+        Path to directory in "bucket".
+
+    Returns
+    -------
+    list[str]
+         List of direct subdirectories.
+
+    """
+    # Load blobs
+    storage_client = storage.Client()
+    blobs = storage_client.list_blobs(
+        bucket_name, prefix=prefix, delimiter="/"
+    )
+    [blob.name for blob in blobs]
+
+    # Parse directory contents
+    prefix_depth = len(prefix.split("/"))
+    subdirs = list()
+    for prefix in blobs.prefixes:
+        is_dir = prefix.endswith("/")
+        is_direct_subdir = len(prefix.split("/")) - 1 == prefix_depth
+        if is_dir and is_direct_subdir:
+            subdirs.append(prefix)
+    return subdirs
+
+
 def upload_directory_to_gcs(bucket_name, source_dir, destination_dir):
     client = storage.Client()
     bucket = client.bucket(bucket_name)
@@ -246,6 +303,29 @@ def upload_directory_to_gcs(bucket_name, source_dir, destination_dir):
 
 
 # --- S3 utils ---
+def exists_in_prefix(bucket_name, prefix, name):
+    """
+    Checks if a given filename is in a prefix.
+
+    Parameters
+    ----------
+    bucket_name : str
+        Name of the S3 bucket to search.
+    prefix : str
+        S3 prefix to search within.
+    name : str
+        Filename to search for.
+
+    Returns
+    -------
+    bool
+        Indiciation of whether a given file is in a prefix.
+
+    """
+    prefixes = list_s3_prefixes(bucket_name, prefix)
+    return sum([1 for prefix in prefixes if name in prefix]) > 0
+
+
 def list_s3_prefixes(bucket_name, prefix):
     """
     Lists all immediate subdirectories of a given S3 path (prefix).
@@ -255,7 +335,7 @@ def list_s3_prefixes(bucket_name, prefix):
     bucket_name : str
         Name of the S3 bucket to search.
     prefix : str
-        S3 prefix (path) to search within.
+        S3 prefix to search within.
 
     Returns:
     --------
@@ -303,6 +383,7 @@ def list_s3_bucket_prefixes(bucket_name, keyword=None):
     s3 = boto3.client("s3")
 
     # Main
+    keyword = keyword.lower()
     while True:
         # Call the list_objects_v2 API
         list_kwargs = {"Bucket": bucket_name, "Delimiter": "/"}

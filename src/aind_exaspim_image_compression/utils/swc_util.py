@@ -1,4 +1,3 @@
-
 """
 Created on Wed June 5 16:00:00 2023
 
@@ -26,10 +25,8 @@ Note: Each uncommented line in an SWC file corresponds to a node and contains
 from collections import deque
 from concurrent.futures import (
     ProcessPoolExecutor,
-    ThreadPoolExecutor,
     as_completed,
 )
-from io import BytesIO
 from tqdm import tqdm
 from zipfile import ZipFile
 
@@ -37,7 +34,7 @@ import networkx as nx
 import numpy as np
 import os
 
-from aind_exaspim_image_compression.utils import img_util, util
+from aind_exaspim_image_compression.utils import util
 
 
 class Reader:
@@ -114,8 +111,6 @@ class Reader:
             if len(paths) > 0:
                 return self.read_from_paths(paths)
 
-            raise Exception(f"Directory is invalid - {swc_pointer}")
-
         # Path to...
         if isinstance(swc_pointer, str):
             # ZIP archive with SWC files
@@ -125,10 +120,9 @@ class Reader:
             # Path to single SWC file
             if ".swc" in swc_pointer:
                 return self.read_from_path(swc_pointer)
-
-            raise Exception(f"Path is invalid - {swc_pointer}")
-
-        raise Exception(f"SWC Pointer is invalid - {swc_pointer}")
+        # No swcs found
+        print(f"No swcs found at -{swc_pointer}-")
+        return list()
 
     # --- Read subroutines ---
     def read_from_paths(self, swc_paths):
@@ -151,9 +145,7 @@ class Reader:
             # Assign processes
             processes = list()
             for path in swc_paths:
-                processes.append(
-                    executor.submit(self.read_from_path, path)
-                )
+                processes.append(executor.submit(self.read_from_path, path))
 
             # Store results
             swc_dicts = deque()
@@ -212,9 +204,7 @@ class Reader:
             processes = list()
             for f in zip_names:
                 zip_path = os.path.join(zip_dir, f)
-                processes.append(
-                    executor.submit(self.read_from_zip, zip_path)
-                )
+                processes.append(executor.submit(self.read_from_zip, zip_path))
 
             # Store results
             swc_dicts = deque()
