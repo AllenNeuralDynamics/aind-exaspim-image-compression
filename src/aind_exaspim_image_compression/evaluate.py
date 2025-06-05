@@ -53,7 +53,6 @@ class Evaluator:
 
             output_path = os.path.join(noise_dir, block_id)
             img_util.plot_mips(img[0, 0, ...], output_path=output_path)
-            break
 
     # --- Main ---
     def run(self, model_path):
