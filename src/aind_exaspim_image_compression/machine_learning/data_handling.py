@@ -11,9 +11,10 @@ Routines for loading data during training and inference.
 from abc import ABC, abstractmethod
 from careamics.transforms.n2v_manipulate import N2VManipulate
 from concurrent.futures import (
-    ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
 )
-from scipy.spatial import distance
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
@@ -30,6 +31,7 @@ from aind_exaspim_image_compression.utils.swc_util import Reader
 
 logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
 
+
 class DataModule(L.LightningDataModule):
     def __init__(
         self,
@@ -40,7 +42,7 @@ class DataModule(L.LightningDataModule):
         foreground_sampling_rate=0.2,
         n_upds=100,
         n_validate_examples=200,
-        patch_shape=(64, 64, 64)
+        patch_shape=(64, 64, 64),
     ):
         # Call parent class
         super(DataModule, self).__init__()
@@ -91,7 +93,7 @@ class TrainDataset(Dataset):
         patch_shape,
         transform,
         anisotropy=(0.748, 0.748, 1.0),
-        foreground_sampling_rate=0.2
+        foreground_sampling_rate=0.2,
     ):
         # Call parent class
         super(TrainDataset, self).__init__()
@@ -112,12 +114,12 @@ class TrainDataset(Dataset):
         # Adjust bbox
         for i in range(3):
             bbox["min"][i] += self.patch_shape[i]
-            bbox["max"][i] -= self.patch_shape[i]        
+            bbox["max"][i] -= self.patch_shape[i]
 
         # Store result
         self.bboxes[brain_id] = bbox
         self.foreground[brain_id] = self.ingest_swcs(swc_pointer)
-        self.imgs[brain_id] = img_util.open_img(img_prefix)
+        self.imgs[brain_id] = img_util.read(img_prefix)
 
     def ingest_swcs(self, swc_pointer):
         if swc_pointer:
@@ -126,16 +128,16 @@ class TrainDataset(Dataset):
             n_points = np.sum([len(swc_dict["xyz"]) for swc_dict in swc_dicts])
 
             # Extract foreground voxels
-            start = 0
-            foreground = np.zeros((n_points, 3), dtype=np.int32)
-            for swc_dict in swc_dicts:
-                end = start + len(swc_dict["xyz"])
-                foreground[start:end] = self.to_voxels(swc_dict["xyz"])
-                start = end
-        else:
-            foreground = set()
-        return foreground
-        
+            if n_points > 0:
+                start = 0
+                foreground = np.zeros((n_points, 3), dtype=np.int32)
+                for swc_dict in swc_dicts:
+                    end = start + len(swc_dict["xyz"])
+                    foreground[start:end] = self.to_voxels(swc_dict["xyz"])
+                    start = end
+                return foreground
+        return set()
+
     def __len__(self):
         """
         Counts the number of whole-brain images in dataset.
@@ -160,7 +162,8 @@ class TrainDataset(Dataset):
         return util.sample_once(self.imgs.keys())
 
     def sample_voxel(self, brain_id):
-        if random.random() < self.foreground_sampling_rate:
+        sample_foreground = random.random() < self.foreground_sampling_rate
+        if sample_foreground and len(self.foreground[brain_id]) > 0:
             idx = random.randint(0, len(self.foreground[brain_id]) - 1)
             shift = np.random.randint(0, 32, size=3)
             return tuple(self.foreground[brain_id][idx] + shift)
@@ -175,15 +178,17 @@ class TrainDataset(Dataset):
     # --- Helpers ---
     def get_patch(self, brain_id, voxel):
         s, e = img_util.get_start_end(voxel, self.patch_shape)
-        patch = self.imgs[brain_id][0, 0, s[0]: e[0], s[1]: e[1], s[2]: e[2]]
-        return patch #/ np.percentile(patch, 99.9)
+        patch = self.imgs[brain_id][
+            0, 0, s[0]: e[0], s[1]: e[1], s[2]: e[2]
+        ]
+        return patch
 
     def to_voxels(self, xyz_arr):
         for i in range(3):
             xyz_arr[:, i] = xyz_arr[:, i] / self.anisotropy[i]
         return np.flip(xyz_arr, axis=1).astype(int)
 
-    
+
 class ValidateDataset(Dataset):
     def __init__(self, patch_shape, transform):
         # Call parent class
@@ -194,8 +199,11 @@ class ValidateDataset(Dataset):
         self.transform = transform
 
         # Data structures
+        self.ids = list()
         self.imgs = dict()
-        self.examples = list()
+        self.denoised = list()
+        self.noise = list()
+        self.mn_mxs = list()
 
     def __len__(self):
         """
@@ -210,23 +218,33 @@ class ValidateDataset(Dataset):
         Number of whole-brain images in dataset.
 
         """
-        return len(self.examples)
+        return len(self.ids)
 
     def ingest_img(self, brain_id, img_prefix):
         self.imgs[brain_id] = img_util.open_img(img_prefix)
 
     def ingest_example(self, brain_id, voxel):
-        self.examples.append((brain_id, voxel))
+        # Get clean image
+        noise, denoised, mn_mx = self.transform(
+            self.get_patch(brain_id, voxel)
+        )
+
+        # Store results
+        self.ids.append((brain_id, voxel))
+        self.denoised.append(denoised)
+        self.noise.append(noise)
+        self.mn_mxs.append(mn_mx)
 
     def __getitem__(self, idx):
-        brain_id, voxel = self.examples[idx]
-        return self.transform(self.get_patch(brain_id, voxel))
+        return self.noise[idx], self.denoised[idx], self.mn_mxs[idx]
 
     # --- Helpers ---
     def get_patch(self, brain_id, voxel):
         s, e = img_util.get_start_end(voxel, self.patch_shape)
-        patch = self.imgs[brain_id][0, 0, s[0]: e[0], s[1]: e[1], s[2]: e[2]]
-        return patch #/ np.percentile(patch, 99.9)
+        patch = self.imgs[brain_id][
+            0, 0, s[0]: e[0], s[1]: e[1], s[2]: e[2]
+        ]
+        return patch
 
 
 # --- Custom Dataloaders ---
@@ -277,14 +295,30 @@ class TrainN2VDataLoader(DataLoader):
             # Assign threads
             threads = list()
             for _ in range(self.batch_size):
-                threads.append(
-                    executor.submit(self.dataset.__getitem__, -1)
-                )
+                threads.append(executor.submit(self.dataset.__getitem__, -1))
 
             # Process results
-            masked_patches = np.zeros((self.batch_size, 1,) + self.patch_shape)
-            patches = np.zeros((self.batch_size, 1,) + self.patch_shape)
-            masks = np.zeros((self.batch_size, 1,) + self.patch_shape)
+            masked_patches = np.zeros(
+                (
+                    self.batch_size,
+                    1,
+                )
+                + self.patch_shape
+            )
+            patches = np.zeros(
+                (
+                    self.batch_size,
+                    1,
+                )
+                + self.patch_shape
+            )
+            masks = np.zeros(
+                (
+                    self.batch_size,
+                    1,
+                )
+                + self.patch_shape
+            )
             for i, thread in enumerate(as_completed(threads)):
                 masked_patch, patch, mask = thread.result()
                 masked_patches[i, 0, ...] = masked_patch
@@ -330,13 +364,23 @@ class TrainBM4DDataLoader(DataLoader):
             # Assign processes
             processes = list()
             for _ in range(self.batch_size):
-                processes.append(
-                    executor.submit(self.dataset.__getitem__, -1)
-                )
+                processes.append(executor.submit(self.dataset.__getitem__, -1))
 
             # Process results
-            noise_patches = np.zeros((self.batch_size, 1,) + self.patch_shape)
-            clean_patches = np.zeros((self.batch_size, 1,) + self.patch_shape)
+            noise_patches = np.zeros(
+                (
+                    self.batch_size,
+                    1,
+                )
+                + self.patch_shape
+            )
+            clean_patches = np.zeros(
+                (
+                    self.batch_size,
+                    1,
+                )
+                + self.patch_shape
+            )
             for i, process in enumerate(as_completed(processes)):
                 noise, clean, _ = process.result()
                 noise_patches[i, 0, ...] = noise
@@ -368,14 +412,30 @@ class ValidateN2VDataLoader(DataLoader):
             threads = list()
             for idx_shift in range(batch_size):
                 idx = start_idx + idx_shift
-                threads.append(
-                    executor.submit(self.dataset.__getitem__, idx)
-                )
+                threads.append(executor.submit(self.dataset.__getitem__, idx))
 
             # Process results
-            masked_patches = np.zeros((batch_size, 1,) + self.patch_shape)
-            patches = np.zeros((batch_size, 1,) + self.patch_shape)
-            masks = np.zeros((batch_size, 1,) + self.patch_shape)
+            masked_patches = np.zeros(
+                (
+                    batch_size,
+                    1,
+                )
+                + self.patch_shape
+            )
+            patches = np.zeros(
+                (
+                    batch_size,
+                    1,
+                )
+                + self.patch_shape
+            )
+            masks = np.zeros(
+                (
+                    batch_size,
+                    1,
+                )
+                + self.patch_shape
+            )
             for i, thread in enumerate(as_completed(threads)):
                 masked_patch, patch, mask = thread.result()
                 masked_patches[i, 0, ...] = masked_patch
@@ -413,15 +473,27 @@ class ValidateBM4DDataLoader(DataLoader):
                 )
 
             # Process results
-            noise_patches = np.zeros((self.batch_size, 1,) + self.patch_shape)
-            clean_patches = np.zeros((self.batch_size, 1,) + self.patch_shape)
-            mn_mxes = np.zeros((self.batch_size, 2))
+            noise_patches = np.zeros(
+                (
+                    self.batch_size,
+                    1,
+                )
+                + self.patch_shape
+            )
+            clean_patches = np.zeros(
+                (
+                    self.batch_size,
+                    1,
+                )
+                + self.patch_shape
+            )
+            mn_mxs = np.zeros((self.batch_size, 2))
             for i, process in enumerate(as_completed(processes)):
                 noise, clean, mn_mx = process.result()
                 noise_patches[i, 0, ...] = noise
                 clean_patches[i, 0, ...] = clean
-                mn_mxes[i, :] = mn_mx
-        return to_tensor(noise_patches), to_tensor(clean_patches), mn_mxes
+                mn_mxs[i, :] = mn_mx
+        return to_tensor(noise_patches), to_tensor(clean_patches), mn_mxs
 
 
 # --- Helpers ---
@@ -448,7 +520,7 @@ def init_datasets(
     train_dataset = TrainDataset(
         patch_shape,
         transform,
-        foreground_sampling_rate=foreground_sampling_rate
+        foreground_sampling_rate=foreground_sampling_rate,
     )
 
     # Load data
@@ -457,7 +529,7 @@ def init_datasets(
         swc_pointer = os.path.join(swc_dir, brain_id)
         train_dataset.ingest_img(brain_id, img_prefix, bbox, swc_pointer)
         val_dataset.ingest_img(brain_id, img_prefix)
-        
+
     # Generate validation examples
     for _ in range(n_validate_examples):
         brain_id = train_dataset.sample_brain()

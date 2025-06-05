@@ -10,13 +10,6 @@ Code used to train neural network to classify somas proposals.
 
 from datetime import datetime
 from numcodecs import blosc
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-)
-from tifffile import imwrite
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 
@@ -66,7 +59,8 @@ class Trainer:
             train_dataset, batch_size=self.batch_size, n_upds=n_upds
         )
         val_dataloader = ValidateBM4DDataLoader(
-            val_dataset, batch_size=self.batch_size,
+            val_dataset,
+            batch_size=self.batch_size,
         )
 
         # Main
@@ -74,12 +68,17 @@ class Trainer:
         for epoch in range(self.max_epochs):
             # Updates
             train_loss = self.train_step(train_dataloader, epoch)
-            val_loss, val_cratio, new_best = self.validate_model(val_dataloader, epoch)
+            val_loss, val_cratio, new_best = self.validate_model(
+                val_dataloader, epoch
+            )
             if new_best:
-                print(f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio} - New Best!")
+                print(
+                    f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio} - New Best!"
+                )
             else:
-                print(f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio}")
-                
+                print(
+                    f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio}"
+                )
 
             # Step scheduler
             self.scheduler.step()
@@ -112,7 +111,7 @@ class Trainer:
                 # Run model
                 x, y = x.to("cuda"), y.to("cuda")
                 hat_y = self.model(x)
-                loss = self.criterion(hat_y, y)                
+                loss = self.criterion(hat_y, y)
 
                 # Evalute result
                 cratios.extend(self.compute_cratios(hat_y, mn_mx))
@@ -135,9 +134,7 @@ class Trainer:
         for i in range(imgs.shape[0]):
             mn, mx = tuple(mn_mx[i, :])
             img = (imgs[i, 0, ...] * mx + mn).astype(np.uint16)
-            cratios.append(
-                img_util.compute_cratio(img, self.codec)
-            )
+            cratios.append(img_util.compute_cratio(img, self.codec))
         return cratios
 
     def save_model(self, epoch):

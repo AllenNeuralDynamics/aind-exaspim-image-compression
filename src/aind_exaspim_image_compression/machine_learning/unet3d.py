@@ -1,17 +1,15 @@
-"""Adapted from https://github.com/milesial/Pytorch-UNet/tree/master/unet"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class UNet(nn.Module):
-    def __init__(self, width_multiplier=1, trilinear=True, use_ds_conv=False):
+    def __init__(self, width_multiplier=1, trilinear=True):
         # Call parent class
         super(UNet, self).__init__()
 
         # Initializations
         _channels = (32, 64, 128, 256, 512)
-        conv_type = DepthwiseSeparableConv3d if use_ds_conv else nn.Conv3d
         factor = 2 if trilinear else 1
 
         # Instance attributes
@@ -19,11 +17,11 @@ class UNet(nn.Module):
         self.trilinear = trilinear
 
         # Contracting layers
-        self.inc = DoubleConv(1, self.channels[0], conv_type=conv_type)
-        self.down1 = Down(self.channels[0], self.channels[1], conv_type=conv_type)
-        self.down2 = Down(self.channels[1], self.channels[2], conv_type=conv_type)
-        self.down3 = Down(self.channels[2], self.channels[3], conv_type=conv_type)
-        self.down4 = Down(self.channels[3], self.channels[4] // factor, conv_type=conv_type)
+        self.inc = DoubleConv(1, self.channels[0])
+        self.down1 = Down(self.channels[0], self.channels[1])
+        self.down2 = Down(self.channels[1], self.channels[2])
+        self.down3 = Down(self.channels[2], self.channels[3])
+        self.down4 = Down(self.channels[3], self.channels[4] // factor)
 
         # Expanding layers
         self.up1 = Up(self.channels[4], self.channels[3] // factor, trilinear)
@@ -52,17 +50,17 @@ class UNet(nn.Module):
 class DoubleConv(nn.Module):
     """(convolution => [BN] => ReLU) * 2"""
 
-    def __init__(self, in_channels, out_channels, conv_type=nn.Conv3d, mid_channels=None):
+    def __init__(self, in_channels, out_channels, mid_channels=None):
         super().__init__()
         if not mid_channels:
             mid_channels = out_channels
         self.double_conv = nn.Sequential(
-            conv_type(in_channels, mid_channels, kernel_size=3, padding=1),
+            nn.Conv3d(in_channels, mid_channels, kernel_size=3, padding=1),
             nn.BatchNorm3d(mid_channels),
             nn.ReLU(inplace=True),
-            conv_type(mid_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv3d(mid_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm3d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
@@ -72,11 +70,10 @@ class DoubleConv(nn.Module):
 class Down(nn.Module):
     """Downscaling with maxpool then double conv"""
 
-    def __init__(self, in_channels, out_channels, conv_type=nn.Conv3d):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
         self.maxpool_conv = nn.Sequential(
-            nn.MaxPool3d(2),
-            DoubleConv(in_channels, out_channels, conv_type=conv_type)
+            nn.MaxPool3d(2), DoubleConv(in_channels, out_channels)
         )
 
     def forward(self, x):
@@ -88,15 +85,18 @@ class Up(nn.Module):
 
     def __init__(self, in_channels, out_channels, trilinear=True):
         super().__init__()
-
-        # if trilinear, use the normal convolutions to reduce the number of channels
         if trilinear:
-            self.up = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=True)
-            self.conv = DoubleConv(in_channels, out_channels, mid_channels=in_channels // 2)
+            self.up = nn.Upsample(
+                scale_factor=2, mode="trilinear", align_corners=True
+            )
+            self.conv = DoubleConv(
+                in_channels, out_channels, mid_channels=in_channels // 2
+            )
         else:
-            self.up = nn.ConvTranspose3d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.up = nn.ConvTranspose3d(
+                in_channels, in_channels // 2, kernel_size=2, stride=2
+            )
             self.conv = DoubleConv(in_channels, out_channels)
-
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
@@ -104,11 +104,10 @@ class Up(nn.Module):
         diffY = x2.size()[2] - x1.size()[2]
         diffX = x2.size()[3] - x1.size()[3]
 
-        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
-                        diffY // 2, diffY - diffY // 2])
-        # if you have padding issues, see
-        # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
-        # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
+        x1 = F.pad(
+            x1,
+            [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2],
+        )
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
@@ -125,8 +124,16 @@ class OutConv(nn.Module):
 class DepthwiseSeparableConv3d(nn.Module):
     def __init__(self, nin, nout, kernel_size, padding, kernels_per_layer=1):
         super(DepthwiseSeparableConv3d, self).__init__()
-        self.depthwise = nn.Conv3d(nin, nin * kernels_per_layer, kernel_size=kernel_size, padding=padding, groups=nin)
-        self.pointwise = nn.Conv3d(nin * kernels_per_layer, nout, kernel_size=1)
+        self.depthwise = nn.Conv3d(
+            nin,
+            nin * kernels_per_layer,
+            kernel_size=kernel_size,
+            padding=padding,
+            groups=nin,
+        )
+        self.pointwise = nn.Conv3d(
+            nin * kernels_per_layer, nout, kernel_size=1
+        )
 
     def forward(self, x):
         out = self.depthwise(x)
