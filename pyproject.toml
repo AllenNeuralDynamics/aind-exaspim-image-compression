@@ -17,6 +17,22 @@ readme = "README.md"
 dynamic = ["version"]
 
 dependencies = [
+    'bm4d',
+    'boto3',
+    'gcsfs',
+    'google-cloud-storage',
+    'interrogate',
+    'ome-zarr',
+    'pandas',
+    's3fs',
+    'scikit-image',
+    'scikit-learn',
+    'scipy',
+    'torch',
+    'torchvision',
+    'tqdm',
+    'xarray_multiscale',
+    'zarr'
 ]
 
 [project.optional-dependencies]
