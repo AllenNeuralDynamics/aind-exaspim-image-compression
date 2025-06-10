@@ -4,6 +4,11 @@ Created on Wed April 30 14:00:00 2025
 @author: Anna Grim
 @email: anna.grim@alleninstitute.org
 
+Denoising routines for 3D microscopy images using patch-based deep learning
+inference. Includes functions to extract overlapping patches, normalize and
+batch process them through a model on GPU, and stitch denoised patches back
+into a full 3D volume.
+
 """
 
 from tqdm import tqdm
@@ -11,12 +16,37 @@ from tqdm import tqdm
 import numpy as np
 import torch
 
-from aind_exaspim_image_compression.utils import img_util
-
 
 def predict(
     img, model, batch_size=32, patch_size=64, overlap=16, verbose=True
 ):
+    """
+    Denoises a 3D image by processing patches in batches and running deep
+    learning model.
+
+    Parameters
+    ----------
+    img : numpy.ndarray
+        Input 3D image of shape (1, 1, depth, height, width).
+    model : torch.nn.Module
+        PyTorch model to perform prediction on patches.
+    batch_size : int, optional
+        Number of patches to process in a batch. Default is 32.
+    patch_size : int, optional
+        Size of the cubic patch extracted from the image. Default is 64.
+    overlap : int, optional
+        Number of voxels to overlap between patches. Default is 16.
+    verbose : bool, optional
+        Whether to show a tqdm progress bar. Default is True.
+
+    Returns
+    -------
+    coords : list of tuples
+        List of (i, j, k) starting coordinates of patches processed.
+    preds : list of numpy.ndarray
+        List of predicted patches (3D arrays) matching the patch size.
+
+    """
     # Initializations
     batch_coords, batch_inputs, mn_mx = list(), list(), list()
     coords = generate_coords(img, patch_size, overlap)
@@ -63,6 +93,31 @@ def predict(
 
 
 def stitch(img, coords, preds, patch_size=64, trim=5):
+    """
+    Stitches overlapping 3D patches back into a full denoised image by
+    averaging overlapping regions, with optional trimming of patch borders.
+
+    Parameters
+    ----------
+    img : numpy.ndarray
+        Original image array of shape (batch, channels, depth, height, width).
+    coords : List[Tuple[int]]
+        List of starting (i, j, k) coordinates for each patch.
+    preds : List[numpy.ndarray]
+        Predicted patches with shape (patch_size, patch_size, patch_size).
+    patch_size : int, optional
+        Size of each cubic patch. Default is 64.
+    trim : int, optional
+        Number of voxels to trim from each side of a patch before stitching.
+        Default is 5.
+
+    Returns
+    -------
+    numpy.ndarray
+        Reconstructed image with patches stitched and overlapping areas
+        averaged.
+
+    """
     denoised_accum = np.zeros_like(img, dtype=np.float32)
     weight_map = np.zeros_like(img, dtype=np.float32)
     for (i, j, k), pred in zip(coords, preds):
@@ -102,17 +157,27 @@ def stitch(img, coords, preds, patch_size=64, trim=5):
 
     # Average accumulated
     weight_map[weight_map == 0] = 1
-    denoised = denoised_accum / weight_map
-
-    # Fill boundary trim
-    fill_value = np.percentile(
-        denoised[..., trim:-trim, trim:-trim, trim:-trim], 10
-    )
-    return img_util.fill_boundary(denoised, trim, fill_value)
+    return denoised_accum / weight_map
 
 
 # --- Helpers ---
 def add_padding(patch, patch_size):
+    """
+    Pads a 3D patch with zeros to reach the desired patch shape.
+
+    Parameters
+    ----------
+    patch : numpy.ndarray
+        3D array representing the patch to be padded.
+    patch_size : int
+        Target size for each dimension after padding.
+
+    Returns
+    -------
+    numpy.ndarray
+        Zero-padded patch with shape (patch_size, patch_size, patch_size).
+
+    """
     pad_width = [
         (0, patch_size - patch.shape[0]),
         (0, patch_size - patch.shape[1]),
@@ -122,6 +187,26 @@ def add_padding(patch, patch_size):
 
 
 def generate_coords(img, patch_size, overlap):
+    """
+    Generates starting coordinates for 3D patches extracted from an image
+    tensor, based on specified patch size and overlap.
+
+    Parameters
+    ----------
+    img : torch.Tensor or numpy.ndarray
+        Input image tensor with shape (batch, channels, depth, height, width).
+    patch_size : int
+        The size of each cubic patch along each spatial dimension.
+    overlap : int
+        Number of voxels that adjacent patches overlap.
+
+    Returns
+    -------
+    coords : List[Tuple[int]]
+        List of (depth_start, height_start, width_start) coordinates for image
+        patches.
+
+    """
     coords = list()
     stride = patch_size - overlap
     for i in range(0, img.shape[2] - patch_size + stride, stride):
@@ -132,5 +217,21 @@ def generate_coords(img, patch_size, overlap):
 
 
 def to_tensor(arr):
+    """
+    Converts a NumPy array to a PyTorch tensor with an added channel dimension,
+    and moves it to the GPU.
+
+    Parameters
+    ----------
+    arr : numpy.ndarray
+        Input array to be converted.
+
+    Returns
+    -------
+    torch.Tensor
+        Input array as a float tensor on the CUDA device, with shape
+        (batch_size, 1, ...).
+
+    """
     dtype = torch.float
     return torch.tensor(arr[:, np.newaxis, ...]).to("cuda", dtype=dtype)
