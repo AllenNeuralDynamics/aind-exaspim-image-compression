@@ -165,7 +165,7 @@ def get_start_end(voxel, shape, from_center=True):
         Shape of the image patch to be read.
     from_center : bool, optional
         Indication of whether the provided coordinates represent the center of
-        the patch or the front-top-left corner. The default is True.
+        the patch or the front-top-left corner. Default is True.
 
     Return
     ------
@@ -383,15 +383,14 @@ def convert_tiff_ome_zarr(
     out_path : str
         Path to write the N5.
     chunks : Tuple[int], optional
-        Chunk shape of the N5 dataset. The default is (1, 1, 64, 128, 128).
+        Chunk shape of the N5 dataset. Default is (1, 1, 64, 128, 128).
     compressor : Blosc, optional
-        Numcodecs compressor instance for the N5 dataset. The default is
+        Numcodecs compressor instance for the N5 dataset. Default is
         Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE).
     voxel_size : Tuple[float], optional
-        Voxel spacing of the image, in nanometers. The default is
-        (748, 748, 1000).
+        Voxel spacing of the image. Default is (748, 748, 1000).
     n_levels : int, optional
-        Number of levels in the multiscale pyramid. The default is 3.
+        Number of levels in the multiscale pyramid. Default is 3.
 
     Returns
     -------
@@ -448,8 +447,8 @@ def compute_cratio(img, codec, chunk_shape=(64, 64, 64)):
         Image to compute compression ratio of.
     codec : blosc.Blosc
         Blosc codec used to compress each chunk.
-    chunk_shape : tuple of ints
-        Shape of chunks Zarr would use.
+    chunk_shape : Tuple[int]
+        Shape of chunks Zarr would use. Default is (64, 64, 64).
 
     Returns
     -------
@@ -488,10 +487,10 @@ def compute_ssim3D(img1, img2, data_range=None, window_size=16):
     img2 : numpy.ndarray
         3D Image.
     data_range : float, optional
-        Value range of input images. If None, computed from "img1". The
-        default is None.
+        Value range of input images. If None, computed from "img1". Default
+        is None.
     window_size : int, optional
-        Size of the 3D filter window. The default is 16.
+        Size of the 3D filter window. Default is 16.
 
     Returns
     -------

@@ -28,7 +28,7 @@ def mkdir(path, delete=False):
         Path of directory to be created.
     delete : bool, optional
         Indication of whether to delete directory at path if it already
-        exists. The default is False.
+        exists. Default is False.
 
     Returns
     -------
@@ -69,7 +69,7 @@ def list_dir(directory, extension=None):
     directory : str
         Path to directory to be searched.
     extension : str, optional
-       Extension of filenames to be returned. The default is None.
+       Extension of filenames to be returned. Default is None.
 
     Returns
     -------
@@ -94,7 +94,7 @@ def list_subdirectory_names(directory_path):
 
     Returns
     -------
-    List[str]
+    subdir_names : List[str]
         List of the names of subdirectories.
 
     """
@@ -115,12 +115,12 @@ def list_paths(directory, extension=""):
     directory : str
         Directory to be searched.
     extension : str, optional
-        If provided, only paths of files with the extension are returned. The
-        default is an empty string.
+        If provided, only paths of files with the extension are returned.
+        Default is an empty string.
 
     Returns
     -------
-    list[str]
+    List[str]
         List of all paths within "directory".
 
     """
@@ -321,20 +321,20 @@ def list_block_paths(brain_id):
 
 def list_gcs_filenames(gcs_dict, extension):
     """
-    Lists all files in a GCS bucket with the given extension.
+    Lists filenames in a GCS bucket path filtered by file extension.
 
     Parameters
     ----------
     gcs_dict : dict
-        ...
+        Dictionary with keys "bucket_name" and "path" specifying the GCS
+        location.
     extension : str
-        File extension of filenames to be listed.
+        File extension to filter by (e.g., '.tif').
 
     Returns
     -------
-    list
-        Filenames stored at "cloud" path with the given extension.
-
+    List[str]
+        List of blob names containing the specified extension.
     """
     bucket = storage.Client().bucket(gcs_dict["bucket_name"])
     blobs = bucket.list_blobs(prefix=gcs_dict["path"])
@@ -354,7 +354,7 @@ def list_gcs_subprefixes(bucket_name, prefix):
 
     Returns
     -------
-    list[str]
+    subdirs : List[str]
          List of direct subdirectories.
 
     """
@@ -476,11 +476,11 @@ def list_s3_bucket_prefixes(bucket_name, keyword=None):
     bucket_name : str
         Name of the S3 bucket to search.
     keyword : str, optional
-        Keyword used to filter the prefixes.
+        Keyword used to filter the prefixes. Default is None.
 
     Returns
     --------
-    List[str]
+    prefixes : List[str]
         A list of top-level prefixes (directories) in the S3 bucket. If a
         keyword is provided, only the matching prefixes are returned.
 
@@ -566,7 +566,7 @@ def write_to_s3(local_path, bucket_name, prefix):
 # --- Miscellaneous ---
 def sample_once(my_container):
     """
-    Samples a single element from "my_container".
+    Samples a single element from the given container.
 
     Parameters
     ----------
@@ -575,7 +575,8 @@ def sample_once(my_container):
 
     Returns
     -------
-    sample
+    object
+        Element sampled from the given container
 
     """
     return sample(my_container, 1)[0]
@@ -590,13 +591,13 @@ def time_writer(t, unit="seconds"):
     t : float
         Runtime.
     unit : str, optional
-        Unit of time that "t" is expressed in.
+        Unit of time that "t" is expressed in. Default is "seconds".
 
     Returns
     -------
-    float
+    t : float
         Runtime
-    str
+    unit : str
         Unit of time.
 
     """

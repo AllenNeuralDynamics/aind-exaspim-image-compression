@@ -52,10 +52,10 @@ class Reader:
         ----------
         anisotropy : Tuple[float], optional
             Image to physical coordinates scaling factors to account for the
-            anisotropy of the microscope. The default is [1.0, 1.0, 1.0].
+            anisotropy of the microscope. Default is [1.0, 1.0, 1.0].
         min_size : int, optional
             Threshold on the number nodes in SWC files that are parsed and
-            returned. The default is 0.
+            returned. Default is 0.
 
         Returns
         -------
@@ -140,7 +140,7 @@ class Reader:
 
         Returns
         -------
-        Dequeue[dict]
+        swc_dicts : Dequeue[dict]
             List of dictionaries whose keys and values are the attribute
             names and values from an SWC file.
 
@@ -170,7 +170,7 @@ class Reader:
 
         Returns
         -------
-        dict
+        result : dict
             Dictionaries whose keys and values are the attribute names and
             values from an SWC file.
 
@@ -193,7 +193,7 @@ class Reader:
 
         Returns
         -------
-        Deque[dict]
+        swc_dicts : Deque[dict]
             Dictionaries whose keys and values are the attribute names and
             values from an SWC file.
 
@@ -223,7 +223,7 @@ class Reader:
 
         Returns
         -------
-        Dequeue[dict]
+        swc_dicts : Dequeue[dict]
             List of dictionaries whose keys and values are the attribute
             names and values from an SWC file.
 
@@ -250,7 +250,7 @@ class Reader:
 
         Returns
         -------
-        dict
+        result : dict
             Dictionaries whose keys and values are the attribute names and
             values from an SWC file.
 
@@ -274,7 +274,7 @@ class Reader:
 
         Returns
         -------
-        Dequeue[dict]
+        swc_dicts : Dequeue[dict]
             List of dictionaries whose keys and values are the attribute
             names and values from an SWC file.
 
@@ -337,7 +337,7 @@ class Reader:
 
         Returns
         -------
-        dict
+        swc_dict : dict
             Dictionaries whose keys and values are the attribute names
             and values from an SWC file.
 
@@ -380,10 +380,10 @@ class Reader:
 
         Returns
         -------
-        List[str]
+        content : List[str]
             A list of strings representing the lines of text starting from the
             line immediately after the last commented line.
-        List[float]
+        offset : List[float]
             Offset used to shift coordinates.
 
         """
@@ -403,12 +403,12 @@ class Reader:
         xyz_str : str
             Coordinate stored as a str.
         offset : List[float], optional
-            Offset used to shift coordinates if provided in the SWC file. The
-            default is [0.0, 0.0, 0.0].
+            Offset used to shift coordinates if provided in the SWC file.
+            Default is [0.0, 0.0, 0.0].
 
         Returns
         -------
-        numpy.ndarray
+        xyz : numpy.ndarray
             Coordinate of a node from an SWC file.
 
         """
