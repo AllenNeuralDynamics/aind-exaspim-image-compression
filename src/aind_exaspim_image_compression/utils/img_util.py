@@ -47,7 +47,7 @@ def _read_zarr(img_path):
         store = s3fs.S3Map(root=img_path, s3=fs)
     else:
         store = zarr.DirectoryStore(img_path)
-    return zarr.open(store, mode="r")[0]
+    return zarr.open(store, mode="r")
 
 
 def _read_n5(img_path):
@@ -370,19 +370,33 @@ def convert_tiff_ome_zarr(
     out_path,
     chunks: tuple = (1, 1, 64, 128, 128),
     compressor: Any = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
-    voxel_size: list = (0.748, 0.748, 1.0),
+    voxel_size: tuple = (748, 748, 1000),
     n_levels: int = 3,
 ):
     """
     Convert a Tiff stack to an N5 dataset.
 
-    Args:
-         in_path: the path to the Tiff
-         out_path: the path to write the N5
-         chunks: the chunk shape of the N5 dataset
-         compressor: the numcodecs compressor instance for the N5 dataset
-         voxel_size: the voxel spacing of the image, in nanometers
-         n_levels: the number of levels in the multiscale pyramid
+    Parameters
+    ----------
+    in_path : str
+        Path to TIFF iamge.
+    out_path : str
+        Path to write the N5.
+    chunks : Tuple[int], optional
+        Chunk shape of the N5 dataset. The default is (1, 1, 64, 128, 128).
+    compressor : Blosc, optional
+        Numcodecs compressor instance for the N5 dataset. The default is
+        Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE).
+    voxel_size : Tuple[float], optional
+        Voxel spacing of the image, in nanometers. The default is
+        (748, 748, 1000).
+    n_levels : int, optional
+        Number of levels in the multiscale pyramid. The default is 3.
+
+    Returns
+    -------
+    None
+
     """
     # Open image
     im = tifffile.imread(in_path)
@@ -463,20 +477,27 @@ def compute_cratio(img, codec, chunk_shape=(64, 64, 64)):
     return round(total_uncompressed_size / total_compressed_size, 2)
 
 
-def compute_ssim3D(
-    img1, img2, data_range=None, window_size=11, K1=0.01, K2=0.03
-):
+def compute_ssim3D(img1, img2, data_range=None, window_size=16):
     """
-    Compute SSIM between two 3D images.
+    Compute structural similarity (SSIM) between two 3D images.
 
-    Parameters:
-    - img1, img2: 3D numpy arrays (must have the same shape)
-    - data_range: value range of input images (if None, computed from img1)
-    - window_size: size of the 3D filter window (default: 11)
-    - K1, K2: stability constants in the SSIM formula
+    Parameters
+    ----------
+    img1 : numpy.ndarray
+        3D Image.
+    img2 : numpy.ndarray
+        3D Image.
+    data_range : float, optional
+        Value range of input images. If None, computed from "img1". The
+        default is None.
+    window_size : int, optional
+        Size of the 3D filter window. The default is 16.
 
-    Returns:
-    - SSIM value (float)
+    Returns
+    -------
+    float
+        SSIM between the two input images.
+
     """
     if img1.shape != img2.shape:
         raise ValueError("Input images must have the same dimensions")
@@ -484,60 +505,22 @@ def compute_ssim3D(
     if data_range is None:
         data_range = np.max(img1) - np.min(img1)
 
-    C1 = (K1 * data_range) ** 2
-    C2 = (K2 * data_range) ** 2
-
     # Mean filter
     mu1 = uniform_filter(img1, window_size)
     mu2 = uniform_filter(img2, window_size)
 
-    mu1_sq = mu1**2
-    mu2_sq = mu2**2
-    mu1_mu2 = mu1 * mu2
-
     # Variance and covariance
-    sigma1_sq = uniform_filter(img1**2, window_size) - mu1_sq
-    sigma2_sq = uniform_filter(img2**2, window_size) - mu2_sq
-    sigma12 = uniform_filter(img1 * img2, window_size) - mu1_mu2
+    sigma1_sq = uniform_filter(img1**2, window_size) - mu1**2
+    sigma2_sq = uniform_filter(img2**2, window_size) - mu2**2
+    sigma12 = uniform_filter(img1 * img2, window_size) - mu1 * mu2
 
     # SSIM map
-    numerator = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2)
-    denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
-    ssim_map = numerator / (denominator + 1e-8)
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+    numerator = (2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)
+    denominator = (mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2)
+    ssim_map = numerator / (denominator + 1e-6)
     return np.mean(ssim_map)
-
-
-def fill_boundary(img, depth, value):
-    """
-    Fill boundary of a 3D image with a given value.
-
-    Parameters
-    ----------
-    img : numpy.ndarray
-        Image to be updated
-    depth : int
-        Distance to boundary from boundary to be filled.
-    value : float
-        Fill value.
-
-    Returns
-    -------
-    numpy.ndarray
-        Updated image.
-
-    """
-    # Fill along axis 0 (z)
-    img[0, 0, :depth, :, :] = value
-    img[0, 0, -depth:, :, :] = value
-
-    # Fill along axis 1 (y)
-    img[0, 0, :, :depth, :] = value
-    img[0, 0, :, -depth:, :] = value
-
-    # Fill along axis 2 (x)
-    img[0, 0, :, :, :depth] = value
-    img[0, 0, :, :, -depth:] = value
-    return img
 
 
 def get_nbs(voxel, shape):

@@ -190,7 +190,7 @@ def write_json(path, my_dict):
         json.dump(my_dict, file, indent=4)
 
 
-def write_to_list(path, my_list):
+def write_list(path, my_list):
     """
     Writes each item in a list to a text file, with each item on a new line.
 
@@ -213,13 +213,48 @@ def write_to_list(path, my_list):
 
 # --- GCS utils ---
 def copy_gcs_file(bucket_name, source_path, destination_path):
+    """
+    Copies a file within a GCS bucket.
+
+    Parameters
+    ----------
+    bucket_name : str
+        Name of the GCS bucket.
+    source_path : str
+        Path to the source file within the bucket.
+    destination_path : str
+        Path where the source file will be copied to within the same bucket.
+
+    Returns
+    -------
+    None
+
+    """
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     source_blob = bucket.blob(source_path)
-    destination_blob = bucket.copy_blob(source_blob, bucket, destination_path)
+    bucket.copy_blob(source_blob, bucket, destination_path)
 
 
 def copy_gcs_directory(bucket_name, source_prefix, destination_prefix):
+    """
+    Copies all files from one directory prefix to another within the same GCS
+    bucket.
+
+    Parameters
+    ----------
+    bucket_name : str
+        Name of the GCS bucket.
+    source_prefix : str
+        Prefix of the source directory to copy from.
+    destination_prefix : str
+        Prefix where files will be copied to.
+
+    Returns
+    -------
+    None
+
+    """
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blobs = client.list_blobs(bucket, prefix=source_prefix)
@@ -229,6 +264,25 @@ def copy_gcs_directory(bucket_name, source_prefix, destination_prefix):
 
 
 def find_subprefix_with_keyword(bucket_name, prefix, keyword):
+    """
+    Finds the first GCS subprefix under a given prefix that contains a
+    specified keyword.
+
+    Parameters
+    ----------
+    bucket_name : str
+        Name of the GCS bucket.
+    prefix : str
+        The prefix to search under.
+    keyword : str
+        Keyword to look for within the subprefixes.
+
+    Returns
+    -------
+    str
+        First subprefix containing the keyword.
+
+    """
     for subprefix in list_gcs_subprefixes(bucket_name, prefix):
         if keyword in subprefix:
             return subprefix
@@ -236,6 +290,20 @@ def find_subprefix_with_keyword(bucket_name, prefix, keyword):
 
 
 def list_block_paths(brain_id):
+    """
+    Lists the GCS paths to image blocks associated with a given brain ID.
+
+    Parameters
+    ----------
+    brain_id : str
+        Unique identifier for a brain dataset.
+
+    Returns
+    -------
+    img_paths : List[str]
+        List of GCS paths (gs://...) pointing to the image blocks.
+
+    """
     # Find prefix containing blocks
     bucket_name = "allen-nd-goog"
     prefix = find_subprefix_with_keyword(bucket_name, "from_aind/", brain_id)
@@ -251,6 +319,28 @@ def list_block_paths(brain_id):
     return img_paths
 
 
+def list_gcs_filenames(gcs_dict, extension):
+    """
+    Lists all files in a GCS bucket with the given extension.
+
+    Parameters
+    ----------
+    gcs_dict : dict
+        ...
+    extension : str
+        File extension of filenames to be listed.
+
+    Returns
+    -------
+    list
+        Filenames stored at "cloud" path with the given extension.
+
+    """
+    bucket = storage.Client().bucket(gcs_dict["bucket_name"])
+    blobs = bucket.list_blobs(prefix=gcs_dict["path"])
+    return [blob.name for blob in blobs if extension in blob.name]
+
+
 def list_gcs_subprefixes(bucket_name, prefix):
     """
     Lists all direct subdirectories of a given prefix in a GCS bucket.
@@ -258,9 +348,9 @@ def list_gcs_subprefixes(bucket_name, prefix):
     Parameters
     ----------
     bucket : str
-        Name of bucket to be read from.
+        Name of GCS bucket to be read from.
     prefix : str
-        Path to directory in "bucket".
+        Path to directory in the GCS bucket.
 
     Returns
     -------
@@ -287,6 +377,24 @@ def list_gcs_subprefixes(bucket_name, prefix):
 
 
 def upload_directory_to_gcs(bucket_name, source_dir, destination_dir):
+    """
+    Uploads all files from a local directory to a GCS bucket, preserving the
+    directory structure relative to the source directory.
+
+    Parameters
+    ----------
+    bucket_name : str
+        Name of the GCS bucket.
+    source_dir : str
+        Path to the local source directory to upload.
+    destination_dir : str
+        Destination prefix in the GCS bucket where files will be uploaded.
+
+    Returns
+    -------
+    None
+
+    """
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     for root, _, files in os.walk(source_dir):
