@@ -272,7 +272,7 @@ def plot_mips(img, output_path=None, vmax=None):
     Parameters
     ----------
     img : numpy.ndarray
-        Input 3D image to generate MIPs from.
+        Input image to generate MIPs from.
 
     Returns
     -------
@@ -283,7 +283,11 @@ def plot_mips(img, output_path=None, vmax=None):
     fig, axs = plt.subplots(1, 3, figsize=(10, 4))
     axs_names = ["XY", "XZ", "YZ"]
     for i in range(3):
-        mip = np.max(img, axis=i)
+        if len(img.shape) == 5:
+            mip = np.max(img[0, 0, ...], axis=i)
+        else:
+            mip = np.max(img, axis=i)
+
         axs[i].imshow(mip, vmax=vmax)
         axs[i].set_title(axs_names[i], fontsize=16)
         axs[i].set_xticks([])
@@ -456,7 +460,7 @@ def compute_cratio(img, codec, chunk_shape=(64, 64, 64)):
         Compression ratio = total uncompressed size / total compressed size
 
     """
-    img = np.ascontiguousarray(img)
+    img = np.ascontiguousarray(img, dtype=np.uint16)
     total_compressed_size = 0
     total_uncompressed_size = 0
 
@@ -476,9 +480,49 @@ def compute_cratio(img, codec, chunk_shape=(64, 64, 64)):
     return round(total_uncompressed_size / total_compressed_size, 2)
 
 
+def compute_mae(img1, img2):
+    """
+    Computes the mean absolute difference between two 3D images.
+
+    Parameters
+    ----------
+    img1 : numpy.ndarray
+        3D Image.
+    img2 : numpy.ndarray
+        3D Image.
+
+    Returns
+    -------
+    float
+        Mean absolute difference between two 3D images.
+    """
+    return np.mean(abs(img1 - img2))
+
+
+def compute_stable_lmax(img1, img2, p=99.99):
+    """
+    Computes the stable l-inf norm between two 3D images.
+
+    Parameters
+    ----------
+    img1 : numpy.ndarray
+        3D Image.
+    img2 : numpy.ndarray
+        3D Image.
+    p : float, optional
+        Percentile used to compute stable l-inf norm. Default is 99.99.
+
+    Returns
+    -------
+    float
+        Stable l-inf norm between two 3D images.
+    """
+    return np.percentile(abs(img1 - img2), p)
+
+    
 def compute_ssim3D(img1, img2, data_range=None, window_size=16):
     """
-    Compute structural similarity (SSIM) between two 3D images.
+    Computes the structural similarity (SSIM) between two 3D images.
 
     Parameters
     ----------
@@ -496,7 +540,6 @@ def compute_ssim3D(img1, img2, data_range=None, window_size=16):
     -------
     float
         SSIM between the two input images.
-
     """
     if img1.shape != img2.shape:
         raise ValueError("Input images must have the same dimensions")
@@ -539,7 +582,6 @@ def get_nbs(voxel, shape):
     -------
     List[Tuple[int]]
         Voxel coordinates of the neighboring voxels.
-
     """
     x, y, z = voxel
     nbs = []
@@ -573,7 +615,6 @@ def is_inbounds(voxel, shape):
     bool
         Indication of whether the given voxel is within the bounds of the
         grid.
-
     """
     x, y, z = voxel
     height, width, depth = shape
