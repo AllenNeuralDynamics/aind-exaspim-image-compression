@@ -159,7 +159,7 @@ class TrainDataset(Dataset):
         sample_foreground = random.random() < self.foreground_sampling_rate
         if sample_foreground and len(self.foreground[brain_id]) > 0:
             idx = random.randint(0, len(self.foreground[brain_id]) - 1)
-            shift = np.random.randint(0, 32, size=3)
+            shift = 0 # temp - np.random.randint(0, 32, size=3)
             return tuple(self.foreground[brain_id][idx] + shift)
         else:
             voxel = list()
@@ -177,6 +177,9 @@ class TrainDataset(Dataset):
         for i in range(3):
             xyz_arr[:, i] = xyz_arr[:, i] / self.anisotropy[i]
         return np.flip(xyz_arr, axis=1).astype(int)
+
+    def update_foreground_sampling_rate(self, foreground_sampling_rate):
+        self.foreground_sampling_rate = foreground_sampling_rate
 
 
 class ValidateDataset(Dataset):
@@ -437,7 +440,7 @@ def init_datasets(
     patch_shape,
     n_validate_examples,
     foreground_sampling_rate=0.5,
-    method="n2v",
+    method="bm4d",
     swc_dict=None
 ):
     # Initializations
@@ -458,7 +461,8 @@ def init_datasets(
 
     # Load data
     for brain_id in tqdm(brain_ids, desc="Load Data"):
-        img_path = img_paths[brain_id] + str(0)
+        img_path = img_util.get_img_prefix(brain_id, img_paths_json)
+        img_path += str(0)
         if swc_dict:
             swc_pointer = deepcopy(swc_dict)
             swc_pointer["path"] += f"/{brain_id}/world"
