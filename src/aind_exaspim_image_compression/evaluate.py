@@ -4,7 +4,7 @@ Created on Tue June 3 12:00:00 2025
 @author: Anna Grim
 @email: anna.grim@alleninstitute.org
 
-Code for evaluating a denoising model on an image dataset.
+Code for evaluating a denoising model.
 
 """
 
@@ -20,7 +20,7 @@ from aind_exaspim_image_compression.inference import predict, stitch
 from aind_exaspim_image_compression.utils import img_util, util
 
 
-class Evaluator:
+class SupervisedEvaluator:
     def __init__(self, img_paths, model, output_dir):
         # Instance attributes
         self.codec = blosc.Blosc(cname="zstd", clevel=6, shuffle=blosc.SHUFFLE)
@@ -52,7 +52,7 @@ class Evaluator:
             self.noise_imgs[block_id] = img
 
             output_path = os.path.join(noise_dir, block_id)
-            img_util.plot_mips(img[0, 0, ...], output_path=output_path)
+            img_util.plot_mips(img, output_path=output_path)
 
     # --- Main ---
     def run(self, model_path):
@@ -63,14 +63,13 @@ class Evaluator:
         util.mkdir(results_dir)
 
         # Generate prediction
-        rows = list(self.noise_imgs.keys())
+        rows = sorted(list(self.noise_imgs.keys()))
         df = pd.DataFrame(index=rows, columns=["cratio", "ssim"])
         desc = "Denoise Blocks"
         for block_id, noise in tqdm(self.noise_imgs.items(), desc=desc):
             # Run model
             coords, preds = predict(noise, self.model, verbose=False)
             denoised = stitch(noise, coords, preds)
-            denoised = denoised.astype(np.uint16)
 
             # Compute metrics
             df.loc[block_id, "cratio"] = img_util.compute_cratio(
@@ -79,17 +78,17 @@ class Evaluator:
             df.loc[block_id, "ssim"] = img_util.compute_ssim3D(
                 noise[0, 0, ...],
                 denoised[0, 0, ...],
-                data_range=np.percentile(noise, 99.9),
+                data_range=np.max(noise),
             )
 
             # Save MIPs
             output_path = os.path.join(results_dir, block_id)
-            img_util.plot_mips(denoised[0, 0, ...], output_path=output_path)
+            img_util.plot_mips(denoised, output_path=output_path)
 
         # Save metrics
         path = os.path.join(results_dir, "results.csv")
         df.to_csv(path, index=True)
-        return model_name, df
+        return df
 
     # --- Helpers ---
     def find_img_name(self, img_path):

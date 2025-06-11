@@ -41,11 +41,10 @@ def predict(
 
     Returns
     -------
-    coords : list of tuples
+    coords : List[Tuple[int]]
         List of (i, j, k) starting coordinates of patches processed.
-    preds : list of numpy.ndarray
+    preds : List[numpy.ndarray]
         List of predicted patches (3D arrays) matching the patch size.
-
     """
     # Initializations
     batch_coords, batch_inputs, mn_mx = list(), list(), list()
@@ -74,7 +73,7 @@ def predict(
         # If batch is full or it's the last patch
         if len(batch_inputs) == batch_size or idx == len(coords) - 1:
             # Run model
-            input_tensor = to_tensor(np.stack(batch_inputs))
+            input_tensor = batch_to_tensor(np.stack(batch_inputs))
             with torch.no_grad():
                 output_tensor = model(input_tensor)
 
@@ -90,6 +89,33 @@ def predict(
             batch_inputs.clear()
             mn_mx.clear()
     return coords, preds
+
+
+def predict_patch(patch, model):
+    """
+    Denoised a single 3D patch using the provided model.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        PyTorch model used for prediction.
+    patch : numpy.ndarray
+        3D input patch to denoise.
+
+    Returns
+    -------
+    numpy.ndarray
+        Denoised 3D patch with the same shape as input patch.
+    """
+    # Run model
+    mn, mx = np.percentile(patch, 5), np.percentile(patch, 99.9)
+    patch = to_tensor((patch - mn) / max(mx, 1))
+    with torch.no_grad():
+        output_tensor = model(patch)
+
+    # Process output
+    pred = np.array(output_tensor.cpu())
+    return np.maximum(pred[0, 0, ...] * mx + mn, 0).astype(int)
 
 
 def stitch(img, coords, preds, patch_size=64, trim=5):
@@ -116,28 +142,22 @@ def stitch(img, coords, preds, patch_size=64, trim=5):
     numpy.ndarray
         Reconstructed image with patches stitched and overlapping areas
         averaged.
-
     """
     denoised_accum = np.zeros_like(img, dtype=np.float32)
     weight_map = np.zeros_like(img, dtype=np.float32)
     for (i, j, k), pred in zip(coords, preds):
-        # Determine how much to trim
-        trim_start = trim
-        trim_end = patch_size - trim
-
         # Trim prediction
-        pred_trimmed = pred[
-            trim_start:trim_end, trim_start:trim_end, trim_start:trim_end
-        ]
+        start, end = trim, patch_size - trim
+        pred = pred[start:end, start:end, start:end]
 
         # Adjust insertion indices
         i_start = i + trim
         j_start = j + trim
         k_start = k + trim
 
-        i_end = i_start + pred_trimmed.shape[0]
-        j_end = j_start + pred_trimmed.shape[1]
-        k_end = k_start + pred_trimmed.shape[2]
+        i_end = i_start + pred.shape[0]
+        j_end = j_start + pred.shape[1]
+        k_end = k_start + pred.shape[2]
 
         # Clip to image bounds (for safety)
         i_end = min(i_end, img.shape[2])
@@ -150,9 +170,7 @@ def stitch(img, coords, preds, patch_size=64, trim=5):
 
         denoised_accum[
             0, 0, i_start:i_end, j_start:j_end, k_start:k_end
-        ] += pred_trimmed[
-            : i_end - i_start, : j_end - j_start, : k_end - k_start
-        ]
+        ] += pred[: i_end - i_start, : j_end - j_start, : k_end - k_start]
         weight_map[0, 0, i_start:i_end, j_start:j_end, k_start:k_end] += 1
 
     # Average accumulated
@@ -176,7 +194,6 @@ def add_padding(patch, patch_size):
     -------
     numpy.ndarray
         Zero-padded patch with shape (patch_size, patch_size, patch_size).
-
     """
     pad_width = [
         (0, patch_size - patch.shape[0]),
@@ -205,7 +222,6 @@ def generate_coords(img, patch_size, overlap):
     coords : List[Tuple[int]]
         List of (depth_start, height_start, width_start) coordinates for image
         patches.
-
     """
     coords = list()
     stride = patch_size - overlap
@@ -218,20 +234,37 @@ def generate_coords(img, patch_size, overlap):
 
 def to_tensor(arr):
     """
-    Converts a NumPy array to a PyTorch tensor with an added channel dimension,
+    Converts a NumPy array containing to a PyTorch tensor and moves it to the
+    GPU.
+
+    Parameters
+    ----------
+    arr : numpy.ndarray
+        Array to be converted.
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor on GPU, with shape (1, 1, depth, height, width).
+    """
+    while(len(arr.shape)) < 5:
+        arr = arr[np.newaxis, ...]
+    return torch.tensor(arr).to("cuda", dtype=torch.float)
+
+
+def batch_to_tensor(arr):
+    """
+    Converts a NumPy array containing a batch of inputs to a PyTorch tensor
     and moves it to the GPU.
 
     Parameters
     ----------
     arr : numpy.ndarray
-        Input array to be converted.
+        Array to be converted, with shape (batch_size, depth, height, width).
 
     Returns
     -------
     torch.Tensor
-        Input array as a float tensor on the CUDA device, with shape
-        (batch_size, 1, ...).
-
+        Tensor on GPU, with shape (batch_size, 1, depth, height, width).
     """
-    dtype = torch.float
-    return torch.tensor(arr[:, np.newaxis, ...]).to("cuda", dtype=dtype)
+    return to_tensor(arr[:, np.newaxis, ...])
