@@ -247,7 +247,7 @@ def to_tensor(arr):
     torch.Tensor
         Tensor on GPU, with shape (1, 1, depth, height, width).
     """
-    while(len(arr.shape)) < 5:
+    while (len(arr.shape)) < 5:
         arr = arr[np.newaxis, ...]
     return torch.tensor(arr).to("cuda", dtype=torch.float)
 
