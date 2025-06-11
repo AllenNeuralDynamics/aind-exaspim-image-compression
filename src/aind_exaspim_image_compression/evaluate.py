@@ -16,7 +16,6 @@ import ast
 import numpy as np
 import os
 import pandas as pd
-import tifffile
 import torch
 
 from aind_exaspim_image_compression.machine_learning import data_handling
@@ -165,9 +164,6 @@ class UnsupervisedEvaluator:
             noise = input_noise[5:-5, 5:-5, 5:-5]
             denoised_gt = np.maximum(bm4d(noise, 10), 0).astype(int)
             denoised = predict_patch(input_noise, self.model)[5:-5, 5:-5, 5:-5]
-            tifffile.imwrite("noise.tiff", noise)
-            tifffile.imwrite("denoised.tiff", denoised.astype(float))
-            tifffile.imwrite("denoised_gt.tiff", denoised_gt.astype(float))
  
             # Compute metrics
             metrics["cratio"].append(compute_cratio(denoised, self.codec))
