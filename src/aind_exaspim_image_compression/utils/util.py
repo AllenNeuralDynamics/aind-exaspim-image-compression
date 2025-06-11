@@ -33,7 +33,6 @@ def mkdir(path, delete=False):
     Returns
     -------
     None
-
     """
     if delete:
         rmdir(path)
@@ -53,7 +52,6 @@ def rmdir(path):
     Returns
     -------
     None
-
     """
     if os.path.exists(path):
         shutil.rmtree(path)
@@ -75,7 +73,6 @@ def list_dir(directory, extension=None):
     -------
     List[str]
         Filenames in the given directory.
-
     """
     if extension is None:
         return [f for f in os.listdir(directory)]
@@ -96,7 +93,6 @@ def list_subdirectory_names(directory_path):
     -------
     subdir_names : List[str]
         List of the names of subdirectories.
-
     """
     subdir_names = list()
     for d in os.listdir(directory_path):
@@ -145,7 +141,6 @@ def read_txt(path):
     -------
     str
         Contents of txt file.
-
     """
     with open(path, "r") as f:
         return f.read().splitlines()
@@ -164,7 +159,6 @@ def read_json(path):
     -------
     str
         Contents of JSON file.
-
     """
     with open(path, "r") as file:
         return json.load(file)
@@ -184,7 +178,6 @@ def write_json(path, my_dict):
     Returns
     -------
     None
-
     """
     with open(path, "w") as file:
         json.dump(my_dict, file, indent=4)
@@ -204,7 +197,6 @@ def write_list(path, my_list):
     Returns
     -------
     None
-
     """
     with open(path, "w") as file:
         for item in my_list:
@@ -228,7 +220,6 @@ def copy_gcs_file(bucket_name, source_path, destination_path):
     Returns
     -------
     None
-
     """
     client = storage.Client()
     bucket = client.bucket(bucket_name)
@@ -253,7 +244,6 @@ def copy_gcs_directory(bucket_name, source_prefix, destination_prefix):
     Returns
     -------
     None
-
     """
     client = storage.Client()
     bucket = client.bucket(bucket_name)
@@ -281,7 +271,6 @@ def find_subprefix_with_keyword(bucket_name, prefix, keyword):
     -------
     str
         First subprefix containing the keyword.
-
     """
     for subprefix in list_gcs_subprefixes(bucket_name, prefix):
         if keyword in subprefix:
@@ -302,7 +291,6 @@ def list_block_paths(brain_id):
     -------
     img_paths : List[str]
         List of GCS paths (gs://...) pointing to the image blocks.
-
     """
     # Find prefix containing blocks
     bucket_name = "allen-nd-goog"
@@ -356,7 +344,6 @@ def list_gcs_subprefixes(bucket_name, prefix):
     -------
     subdirs : List[str]
          List of direct subdirectories.
-
     """
     # Load blobs
     storage_client = storage.Client()
@@ -393,7 +380,6 @@ def upload_directory_to_gcs(bucket_name, source_dir, destination_dir):
     Returns
     -------
     None
-
     """
     client = storage.Client()
     bucket = client.bucket(bucket_name)
@@ -428,7 +414,6 @@ def exists_in_prefix(bucket_name, prefix, name):
     -------
     bool
         Indiciation of whether a given file is in a prefix.
-
     """
     prefixes = list_s3_prefixes(bucket_name, prefix)
     return sum([1 for prefix in prefixes if name in prefix]) > 0
@@ -445,11 +430,10 @@ def list_s3_prefixes(bucket_name, prefix):
     prefix : str
         S3 prefix to search within.
 
-    Returns:
-    --------
+    Returns
+    -------
     List[str]
         List of immediate subdirectories under the specified prefix.
-
     """
     # Check prefix is valid
     if not prefix.endswith("/"):
@@ -483,7 +467,6 @@ def list_s3_bucket_prefixes(bucket_name, keyword=None):
     prefixes : List[str]
         A list of top-level prefixes (directories) in the S3 bucket. If a
         keyword is provided, only the matching prefixes are returned.
-
     """
     # Initializations
     prefixes = list()
@@ -520,7 +503,7 @@ def is_file_in_prefix(bucket_name, prefix, filename):
     Checks if a specific file exists within a given S3 prefix.
 
     Parameters
-    -----------
+    ----------
     bucket_name : str
         Name of the S3 bucket to searched.
     prefix : str
@@ -528,12 +511,11 @@ def is_file_in_prefix(bucket_name, prefix, filename):
     filename : str
         Name of the file to search for within the specified prefix.
 
-    Returns:
-    --------
+    Returns
+    -------
     bool
         Returns "True" if the file exists within the given prefix,
         otherwise "False".
-
     """
     for sub_prefix in list_s3_prefixes(bucket_name, prefix):
         if filename in sub_prefix:
@@ -557,7 +539,6 @@ def write_to_s3(local_path, bucket_name, prefix):
     Returns
     -------
     None
-
     """
     s3 = boto3.client("s3")
     s3.upload_file(local_path, bucket_name, prefix)
@@ -599,7 +580,6 @@ def time_writer(t, unit="seconds"):
         Runtime
     unit : str
         Unit of time.
-
     """
     assert unit in ["seconds", "minutes", "hours"]
     upd_unit = {"seconds": "minutes", "minutes": "hours"}

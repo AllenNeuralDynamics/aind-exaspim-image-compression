@@ -98,7 +98,6 @@ def get_patch(img, voxel, shape, from_center=True):
     -------
     numpy.ndarray
         Patch extracted from the given image.
-
     """
     # Get image patch coordiantes
     start, end = get_start_end(voxel, shape, from_center=from_center)
@@ -133,7 +132,6 @@ def calculate_offsets(img, window_shape, overlap):
     -------
     List[Tuple[int]]
         List of 3D voxel coordinates that represent the front-top-left corner.
-
     """
     # Calculate stride based on the overlap and window size
     stride = tuple(w - o for w, o in zip(window_shape, overlap))
@@ -171,7 +169,6 @@ def get_start_end(voxel, shape, from_center=True):
     ------
     Tuple[List[int]]
         Start and end indices of the image patch to be read.
-
     """
     if from_center:
         start = [voxel[i] - shape[i] // 2 for i in range(3)]
@@ -199,7 +196,6 @@ def to_physical(voxel, anisotropy):
     -------
     Tuple[int]
         Physical coordinate of "voxel".
-
     """
     voxel = voxel[::-1]
     return tuple([voxel[i] * anisotropy[i] for i in range(3)])
@@ -220,7 +216,6 @@ def to_voxels(xyz, anisotropy):
     -------
     numpy.ndarray
         Voxel coordinate.
-
     """
     voxel = xyz / np.array(anisotropy)
     return np.round(voxel).astype(int)[::-1]
@@ -245,7 +240,6 @@ def local_to_physical(local_voxel, offset, multiscale):
     -------
     numpy.ndarray
         Physical coordinate.
-
     """
     global_voxel = np.array([v + o for v, o in zip(local_voxel, offset)])
     return to_physical(global_voxel, multiscale)
@@ -277,7 +271,6 @@ def plot_mips(img, output_path=None, vmax=None):
     Returns
     -------
     None
-
     """
     vmax = vmax or np.percentile(img, 99.9)
     fig, axs = plt.subplots(1, 3, figsize=(10, 4))
@@ -317,7 +310,7 @@ def get_img_prefix(brain_id, img_prefix_path=None):
             util.write_json(img_prefix_path, prefix_lookup)
         return prefix
 
-    raise Exception(f"Image Prefixes Found - {result}")
+    raise Exception(f"Image Prefixes Found for {brain_id}- {result}")
 
 
 def find_img_prefix(brain_id):
@@ -399,7 +392,6 @@ def convert_tiff_ome_zarr(
     Returns
     -------
     None
-
     """
     # Open image
     im = tifffile.imread(in_path)
@@ -457,8 +449,7 @@ def compute_cratio(img, codec, chunk_shape=(64, 64, 64)):
     Returns
     -------
     float
-        Compression ratio = total uncompressed size / total compressed size
-
+        Compression ratio = total uncompressed size / total compressed size.
     """
     img = np.ascontiguousarray(img, dtype=np.uint16)
     total_compressed_size = 0
@@ -499,7 +490,7 @@ def compute_mae(img1, img2):
     return np.mean(abs(img1 - img2))
 
 
-def compute_stable_lmax(img1, img2, p=99.99):
+def compute_lmax(img1, img2, p=99.99):
     """
     Computes the stable l-inf norm between two 3D images.
 
@@ -519,7 +510,7 @@ def compute_stable_lmax(img1, img2, p=99.99):
     """
     return np.percentile(abs(img1 - img2), p)
 
-    
+
 def compute_ssim3D(img1, img2, data_range=None, window_size=16):
     """
     Computes the structural similarity (SSIM) between two 3D images.
@@ -545,7 +536,9 @@ def compute_ssim3D(img1, img2, data_range=None, window_size=16):
         raise ValueError("Input images must have the same dimensions")
 
     if data_range is None:
-        data_range = np.max(img1) - np.min(img1)
+        data_range1 = np.max(img1) - np.min(img1)
+        data_range2 = np.max(img2) - np.min(img2)
+        data_range = max(data_range1, data_range2)
 
     # Mean filter
     mu1 = uniform_filter(img1, window_size)
@@ -561,7 +554,7 @@ def compute_ssim3D(img1, img2, data_range=None, window_size=16):
     C2 = (0.03 * data_range) ** 2
     numerator = (2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)
     denominator = (mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2)
-    ssim_map = numerator / (denominator + 1e-6)
+    ssim_map = numerator / (np.maximum(denominator, 1e-8) + 1e-6)
     return np.mean(ssim_map)
 
 

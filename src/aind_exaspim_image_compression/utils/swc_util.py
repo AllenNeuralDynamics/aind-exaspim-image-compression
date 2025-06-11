@@ -41,7 +41,6 @@ class Reader:
     """
     Class that reads SWC files stored in a (1) local directory, (2) local ZIP
     archive, or (3) GCS directory of ZIP archives.
-
     """
 
     def __init__(self, anisotropy=(1.0, 1.0, 1.0), min_size=0):
@@ -60,7 +59,6 @@ class Reader:
         Returns
         -------
         None
-
         """
         self.anisotropy = anisotropy
         self.min_size = min_size
@@ -93,7 +91,6 @@ class Reader:
                 - "radius": radius value corresponding to each node.
                 - "xyz": coordinate corresponding to each node.
                 - "soma_nodes": nodes with soma type.
-
         """
         # Dictionary with GCS specs
         if isinstance(swc_pointer, dict):
@@ -143,7 +140,6 @@ class Reader:
         swc_dicts : Dequeue[dict]
             List of dictionaries whose keys and values are the attribute
             names and values from an SWC file.
-
         """
         with ProcessPoolExecutor(max_workers=1) as executor:
             # Assign processes
@@ -173,7 +169,6 @@ class Reader:
         result : dict
             Dictionaries whose keys and values are the attribute names and
             values from an SWC file.
-
         """
         content = util.read_txt(path)
         if len(content) > self.min_size - 10:
@@ -196,7 +191,6 @@ class Reader:
         swc_dicts : Deque[dict]
             Dictionaries whose keys and values are the attribute names and
             values from an SWC file.
-
         """
         # Initializations
         with ProcessPoolExecutor() as executor:
@@ -226,7 +220,6 @@ class Reader:
         swc_dicts : Dequeue[dict]
             List of dictionaries whose keys and values are the attribute
             names and values from an SWC file.
-
         """
         with ZipFile(zip_path, "r") as zip_file:
             swc_dicts = deque()
@@ -253,7 +246,6 @@ class Reader:
         result : dict
             Dictionaries whose keys and values are the attribute names and
             values from an SWC file.
-
         """
         content = util.read_zip(zip_file, path).splitlines()
         if len(content) > self.min_size - 10:
@@ -277,7 +269,6 @@ class Reader:
         swc_dicts : Dequeue[dict]
             List of dictionaries whose keys and values are the attribute
             names and values from an SWC file.
-
         """
         with ThreadPoolExecutor() as executor:
             # Assign threads
@@ -312,7 +303,6 @@ class Reader:
         dict
             Dictionaries whose keys and values are the attribute names and
             values from an SWC file.
-
         """
         # Initialize cloud reader
         client = storage.Client()
@@ -340,7 +330,6 @@ class Reader:
         swc_dict : dict
             Dictionaries whose keys and values are the attribute names
             and values from an SWC file.
-
         """
         # Initializations
         content, offset = self.process_content(content)
@@ -385,7 +374,6 @@ class Reader:
             line immediately after the last commented line.
         offset : List[float]
             Offset used to shift coordinates.
-
         """
         offset = [0.0, 0.0, 0.0]
         for i, line in enumerate(content):
@@ -410,7 +398,6 @@ class Reader:
         -------
         xyz : numpy.ndarray
             Coordinate of a node from an SWC file.
-
         """
         xyz = np.zeros((3))
         for i in range(3):
