@@ -69,10 +69,36 @@ def _read_tiff(img_path, storage_options=None):
 
 
 def _is_gcs_path(path):
+    """
+    Checks whether image is stored in a GCS bucket.
+
+    Parameters
+    ----------
+    img_path : str
+        Path to image.
+
+    Returns
+    -------
+    bool
+        Indication of whether image is stored in a GCS bucket.
+    """
     return path.startswith("gs://")
 
 
 def _is_s3_path(path):
+    """
+    Checks whether image is stored in an S3 bucket.
+
+    Parameters
+    ----------
+    img_path : str
+        Path to image.
+
+    Returns
+    -------
+    bool
+        Indication of whether image is stored in a S3 bucket.
+    """
     return path.startswith("s3://")
 
 
