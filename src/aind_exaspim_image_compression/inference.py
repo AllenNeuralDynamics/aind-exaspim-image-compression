@@ -48,6 +48,8 @@ def predict(
     """
     # Initializations
     batch_coords, batch_inputs, mn_mx = list(), list(), list()
+    while len(img.shape) < 5:
+        img = img[np.newaxis, ...]
     coords = generate_coords(img, patch_size, overlap)
 
     # Main
@@ -88,7 +90,7 @@ def predict(
             batch_coords.clear()
             batch_inputs.clear()
             mn_mx.clear()
-    return coords, preds
+    return stitch(img, coords, preds)
 
 
 def predict_patch(patch, model):

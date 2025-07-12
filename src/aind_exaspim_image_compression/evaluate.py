@@ -53,7 +53,7 @@ class SupervisedEvaluator:
         self.noise_cratios = dict()
         for img_path in self.img_paths:
             block_id = self.find_img_name(img_path)
-            img = img_util.read(img_path)
+            img = img_util.read(img_path)[0]
             self.noise_cratios[block_id] = compute_cratio(img, self.codec)
             self.noise_imgs[block_id] = img
 
