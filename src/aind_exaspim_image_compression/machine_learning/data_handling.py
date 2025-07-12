@@ -159,7 +159,7 @@ class TrainDataset(Dataset):
         sample_foreground = random.random() < self.foreground_sampling_rate
         if sample_foreground and len(self.foreground[brain_id]) > 0:
             idx = random.randint(0, len(self.foreground[brain_id]) - 1)
-            shift = 0 # temp - np.random.randint(0, 32, size=3)
+            shift = np.random.randint(0, 16, size=3)
             return tuple(self.foreground[brain_id][idx] + shift)
         else:
             voxel = list()
@@ -444,20 +444,13 @@ def init_datasets(
     swc_dict=None
 ):
     # Initializations
-    img_paths = util.read_json(img_paths_json)
-    if method == "n2v":
-        transform = N2VManipulate()
-    elif method == "bm4d":
-        transform = img_util.BM4D()
-    else:
-        raise ValueError(f"Method {method} is not recognized!")
-
-    val_dataset = ValidateDataset(patch_shape, transform)
+    transform = N2VManipulate() if method == "n2v" else img_util.BM4D()
     train_dataset = TrainDataset(
         patch_shape,
         transform,
         foreground_sampling_rate=foreground_sampling_rate,
     )
+    val_dataset = ValidateDataset(patch_shape, transform)
 
     # Load data
     for brain_id in tqdm(brain_ids, desc="Load Data"):
