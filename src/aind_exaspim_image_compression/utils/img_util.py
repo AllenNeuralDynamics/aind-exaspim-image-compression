@@ -9,6 +9,8 @@ Helper routines for working with images.
 """
 
 from bm4d import bm4d
+from concurrent.futures import ThreadPoolExecutor
+from itertools import product
 from numcodecs import Blosc
 from ome_zarr.writer import write_multiscale
 from scipy.ndimage import uniform_filter
@@ -69,36 +71,10 @@ def _read_tiff(img_path, storage_options=None):
 
 
 def _is_gcs_path(path):
-    """
-    Checks whether image is stored in a GCS bucket.
-
-    Parameters
-    ----------
-    img_path : str
-        Path to image.
-
-    Returns
-    -------
-    bool
-        Indication of whether image is stored in a GCS bucket.
-    """
     return path.startswith("gs://")
 
 
 def _is_s3_path(path):
-    """
-    Checks whether image is stored in an S3 bucket.
-
-    Parameters
-    ----------
-    img_path : str
-        Path to image.
-
-    Returns
-    -------
-    bool
-        Indication of whether image is stored in a S3 bucket.
-    """
     return path.startswith("s3://")
 
 
@@ -271,9 +247,9 @@ def local_to_physical(local_voxel, offset, multiscale):
     return to_physical(global_voxel, multiscale)
 
 
-# --- Custom Classes ---
+# --- Compression utils ---
 class BM4D:
-    def __init__(self, sigma=10):
+    def __init__(self, sigma=100):
         self.sigma = sigma
 
     def __call__(self, noise):
@@ -281,6 +257,112 @@ class BM4D:
         mx = max(1, mx)
         denoised = bm4d(noise, self.sigma)
         return (noise - mn) / mx, (denoised - mn) / mx, (mn, mx)
+
+
+def compute_cratio(img, codec, chunk_shape=(64, 64, 64)):
+    """
+    Computes a Zarr-style chunked compression ratio for a given image.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        Image to compute compression ratio of.
+    codec : blosc.Blosc
+        Blosc codec used to compress each chunk.
+    chunk_shape : Tuple[int]
+        Shape of chunks Zarr would use. Default is (64, 64, 64).
+
+    Returns
+    -------
+    float
+        Compression ratio = total uncompressed size / total compressed size.
+    """
+    img = np.ascontiguousarray(img, dtype=np.uint16)
+    total_compressed_size = 0
+    total_uncompressed_size = 0
+
+    z = [range(0, s, c) for s, c in zip(img.shape, chunk_shape)]
+    for z0 in z[0]:
+        for z1 in z[1]:
+            for z2 in z[2] if len(z) > 2 else [0]:
+                slice_ = img[
+                    z0: z0 + chunk_shape[0],
+                    z1: z1 + chunk_shape[1],
+                    z2: z2 + chunk_shape[2] if len(z) > 2 else slice(None),
+                ]
+                chunk = np.ascontiguousarray(slice_)
+                compressed = codec.encode(chunk)
+                total_compressed_size += len(compressed)
+                total_uncompressed_size += chunk.nbytes
+    return round(total_uncompressed_size / total_compressed_size, 2)
+
+
+def compute_cratio_jpegxl(img, codec, chunk_shape=(128, 128, 64), max_workers=32):
+    img = np.ascontiguousarray(img)
+    shape = img.shape
+    ndim = img.ndim
+
+    # Generate chunk start indices
+    chunk_ranges = [range(0, s, c) for s, c in zip(shape, chunk_shape)]
+    chunk_coords = list(product(*chunk_ranges))
+
+    def compress_patch(idx):
+        slices = tuple(slice(i, min(i + c, s)) for i, c, s in zip(idx, chunk_shape, shape))
+        patch = img[slices]
+        compressed_size = 0
+        for k in range(patch.shape[-1]):
+            slice2d = np.ascontiguousarray(patch[..., k])
+            encoded = codec.encode(slice2d)
+            compressed_size += len(encoded)
+        return patch.nbytes, compressed_size
+
+    total_uncompressed = 0
+    total_compressed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for ubytes, cbytes in pool.map(compress_patch, chunk_coords):
+            total_uncompressed += ubytes
+            total_compressed += cbytes
+
+    return round(total_uncompressed / total_compressed, 2)
+
+
+def compress_and_decompress_jpeg(img, codec, chunk_shape=(128, 128, 64), max_workers=32):
+    img = np.ascontiguousarray(img)
+    shape = img.shape
+
+    chunk_ranges = [range(0, s, c) for s, c in zip(shape, chunk_shape)]
+    chunk_coords = list(product(*chunk_ranges))
+
+    reconstructed = np.empty_like(img)
+
+    def process_patch(idx):
+        slices = tuple(slice(i, min(i + c, s)) for i, c, s in zip(idx, chunk_shape, shape))
+        patch = img[slices]
+
+        compressed_size = 0
+        decompressed_slices = []
+        for k in range(patch.shape[-1]):
+            slice2d = np.ascontiguousarray(patch[..., k])
+            encoded = codec.encode(slice2d)
+            compressed_size += len(encoded)
+
+            decoded = codec.decode(encoded)
+            decompressed_slices.append(decoded)
+
+        decompressed_patch = np.stack(decompressed_slices, axis=-1)
+        return slices, patch.nbytes, compressed_size, decompressed_patch
+
+    total_uncompressed = 0
+    total_compressed = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for slices, ubytes, cbytes, decompressed_patch in pool.map(process_patch, chunk_coords):
+            reconstructed[slices] = decompressed_patch
+            total_uncompressed += ubytes
+            total_compressed += cbytes
+
+    cratio = round(total_uncompressed / total_compressed, 2)
+    return reconstructed, cratio
 
 
 # --- Visualizations ---
@@ -419,33 +501,39 @@ def convert_tiff_ome_zarr(
     -------
     None
     """
-    # Open image
-    im = tifffile.imread(in_path)
-    while im.ndim < 5:
-        im = im[np.newaxis, ...]
+    img = tifffile.imread(in_path)
+    write_ome_zarr(img, out_path, chunks, compressor, voxel, n_levels)
 
-    # Initializations
-    pyramid = multiscale(im, windowed_mode, scale_factors=[1, 1, 2, 2, 2])[
-        :n_levels
-    ]
+
+def write_ome_zarr(
+    img,
+    out_path,
+    chunks: tuple = (1, 1, 64, 128, 128),
+    compressor: Any = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
+    voxel_size: tuple = (748, 748, 1000),
+    n_levels: int = 3,
+):
+    # Ensure 5D image (T, C, Z, Y, X)
+    while img.ndim < 5:
+        img = img[np.newaxis, ...]
+
+    # Generate multiscale pyramid
+    pyramid = multiscale(img, windowed_mode, scale_factors=[1, 1, 2, 2, 2])[:n_levels]
     pyramid = [level.data for level in pyramid]
-    z = zarr.open(
-        store=zarr.DirectoryStore(out_path, dimension_separator="/"), mode="w"
-    )
-    voxel_size = np.array([1, 1] + list(reversed(voxel_size)))
-    scales = [
-        np.concatenate((voxel_size[:2], voxel_size[2:] * 2**i))
-        for i in range(n_levels)
-    ]
-    coordinate_transformations = [
-        [{"type": "scale", "scale": scale.tolist()}] for scale in scales
-    ]
-    storage_options = {"compressor": compressor}
 
-    # Write image
+    # Prepare Zarr store
+    store = zarr.DirectoryStore(out_path, dimension_separator="/")
+    zgroup = zarr.open(store=store, mode="w")
+
+    # Voxel size scaling for each level
+    base_scale = np.array([1, 1, *reversed(voxel_size)])
+    scales = [base_scale[:2].tolist() + (base_scale[2:] * 2**i).tolist() for i in range(n_levels)]
+    coordinate_transformations = [[{"type": "scale", "scale": s}] for s in scales]
+
+    # Write to OME-Zarr
     write_multiscale(
         pyramid=pyramid,
-        group=z,
+        group=zgroup,
         chunks=chunks,
         axes=[
             {"name": "t", "type": "time", "unit": "millisecond"},
@@ -455,46 +543,8 @@ def convert_tiff_ome_zarr(
             {"name": "x", "type": "space", "unit": "micrometer"},
         ],
         coordinate_transformations=coordinate_transformations,
-        storage_options=storage_options,
+        storage_options={"compressor": compressor},
     )
-
-
-def compute_cratio(img, codec, chunk_shape=(64, 64, 64)):
-    """
-    Computes a Zarr-style chunked compression ratio for a given image.
-
-    Parameters
-    ----------
-    img : np.ndarray
-        Image to compute compression ratio of.
-    codec : blosc.Blosc
-        Blosc codec used to compress each chunk.
-    chunk_shape : Tuple[int]
-        Shape of chunks Zarr would use. Default is (64, 64, 64).
-
-    Returns
-    -------
-    float
-        Compression ratio = total uncompressed size / total compressed size.
-    """
-    img = np.ascontiguousarray(img, dtype=np.uint16)
-    total_compressed_size = 0
-    total_uncompressed_size = 0
-
-    z = [range(0, s, c) for s, c in zip(img.shape, chunk_shape)]
-    for z0 in z[0]:
-        for z1 in z[1]:
-            for z2 in z[2] if len(z) > 2 else [0]:
-                slice_ = img[
-                    z0: z0 + chunk_shape[0],
-                    z1: z1 + chunk_shape[1],
-                    z2: z2 + chunk_shape[2] if len(z) > 2 else slice(None),
-                ]
-                chunk = np.ascontiguousarray(slice_)
-                compressed = codec.encode(chunk)
-                total_compressed_size += len(compressed)
-                total_uncompressed_size += chunk.nbytes
-    return round(total_uncompressed_size / total_compressed_size, 2)
 
 
 def compute_mae(img1, img2):
