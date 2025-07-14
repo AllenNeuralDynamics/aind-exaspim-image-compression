@@ -30,6 +30,24 @@ from aind_exaspim_image_compression.utils import util
 
 # --- Image Reader ---
 def read(img_path):
+    """
+    Read an image volume from a supported path based on its extension.
+
+    Supported formats:
+    - Zarr ('.zarr') from local, GCS, or S3
+    - N5 ('.n5') from local or GCS
+    - TIFF ('.tif', '.tiff') from local or GCS
+
+    Parameters
+    ----------
+    img_path : str
+        Path to the image. Can be a local or cloud path (gs:// or s3://).
+
+    Returns
+    -------
+    np.ndarray
+        Loaded image volume as a NumPy array.
+    """
     if ".zarr" in img_path:
         return _read_zarr(img_path)
     elif ".n5" in img_path:
@@ -41,6 +59,19 @@ def read(img_path):
 
 
 def _read_zarr(img_path):
+    """
+    Read a Zarr volume from local disk, GCS, or S3.
+
+    Parameters
+    ----------
+    img_path : str
+        Path to the Zarr directory.
+
+    Returns
+    -------
+    np.ndarray
+        Loaded image volume.
+    """
     if _is_gcs_path(img_path):
         fs = gcsfs.GCSFileSystem(anon=False)
         store = zarr.storage.FSStore(img_path, fs=fs)
@@ -53,15 +84,46 @@ def _read_zarr(img_path):
 
 
 def _read_n5(img_path):
+    """
+    Read an N5 volume from local disk or GCS.
+
+    Parameters
+    ----------
+    img_path : str
+        Path to the N5 directory.
+
+    Returns
+    -------
+    np.ndarray
+        N5 group volume stored at key "volume".
+    """
     if _is_gcs_path(img_path):
         fs = gcsfs.GCSFileSystem(anon=False)
         store = zarr.n5.N5FSStore(img_path, s=fs)
+    elif _is_s3_path(img_path):
+        fs = s3fs.S3FileSystem(config_kwargs={"max_pool_connections": 50})
+        store = s3fs.S3Map(root=img_path, s3=fs)
     else:
         store = zarr.n5.N5Store(img_path)
     return zarr.open(store, mode="r")["volume"]
 
 
 def _read_tiff(img_path, storage_options=None):
+    """
+    Read a TIFF file from local disk or GCS.
+
+    Parameters
+    ----------
+    img_path : str
+        Path to the TIFF file.
+    storage_options : dict, optional
+        Additional kwargs for GCSFileSystem.
+
+    Returns
+    -------
+    np.ndarray
+        Image data from the TIFF file.
+    """
     if _is_gcs_path(img_path):
         fs = gcsfs.GCSFileSystem(**(storage_options or {}))
         with fs.open(img_path, "rb") as f:
@@ -71,10 +133,32 @@ def _read_tiff(img_path, storage_options=None):
 
 
 def _is_gcs_path(path):
+    """
+    Check if the path is a GCS path.
+
+    Parameters
+    ----------
+    path : str
+
+    Returns
+    -------
+    bool
+    """
     return path.startswith("gs://")
 
 
 def _is_s3_path(path):
+    """
+    Check if the path is an S3 path.
+
+    Parameters
+    ----------
+    path : str
+
+    Returns
+    -------
+    bool
+    """
     return path.startswith("s3://")
 
 
@@ -249,17 +333,48 @@ def local_to_physical(local_voxel, offset, multiscale):
 
 # --- Compression utils ---
 class BM4D:
-    def __init__(self, sigma=100):
+    """
+    A simple wrapper for BM4D denoising of 3D volumetric data.
+    """
+    def __init__(self, sigma=80):
+        """
+        Initialize the BM4D denoiser.
+
+        Parameters
+        ----------
+        sigma : float, optional
+            Noise standard deviation used for denoising.
+
+        Returns
+        -------
+        None
+        """
         self.sigma = sigma
 
     def __call__(self, noise):
+        """
+        Apply BM4D denoising to the input volume.
+
+        Parameters
+        ----------
+        noise : np.ndarray
+            A 3D NumPy array representing the noisy input volume.
+
+        Returns
+        -------
+        tuple
+            A 3-tuple containing:
+            - normalized input volume (np.ndarray)
+            - normalized denoised volume (np.ndarray)
+            - normalization parameters (tuple): (mn, mx)
+        """
         mn, mx = np.percentile(noise, 5), np.percentile(noise, 99.9)
         mx = max(1, mx)
         denoised = bm4d(noise, self.sigma)
         return (noise - mn) / mx, (denoised - mn) / mx, (mn, mx)
 
 
-def compute_cratio(img, codec, chunk_shape=(64, 64, 64)):
+def compute_cratio(img, codec, patch_shape=(64, 64, 64)):
     """
     Computes a Zarr-style chunked compression ratio for a given image.
 
@@ -269,7 +384,7 @@ def compute_cratio(img, codec, chunk_shape=(64, 64, 64)):
         Image to compute compression ratio of.
     codec : blosc.Blosc
         Blosc codec used to compress each chunk.
-    chunk_shape : Tuple[int]
+    patch_shape : Tuple[int]
         Shape of chunks Zarr would use. Default is (64, 64, 64).
 
     Returns
@@ -277,18 +392,23 @@ def compute_cratio(img, codec, chunk_shape=(64, 64, 64)):
     float
         Compression ratio = total uncompressed size / total compressed size.
     """
-    img = np.ascontiguousarray(img, dtype=np.uint16)
+    # Check image
+    if len(img.shape) == 5:
+        img = np.ascontiguousarray(img[0, 0], dtype=np.uint16)
+    else:
+        img = np.ascontiguousarray(img, dtype=np.uint16)
+
+    # Compute chunked cratio
     total_compressed_size = 0
     total_uncompressed_size = 0
-
-    z = [range(0, s, c) for s, c in zip(img.shape, chunk_shape)]
+    z = [range(0, s, c) for s, c in zip(img.shape, patch_shape)]
     for z0 in z[0]:
         for z1 in z[1]:
             for z2 in z[2] if len(z) > 2 else [0]:
                 slice_ = img[
-                    z0: z0 + chunk_shape[0],
-                    z1: z1 + chunk_shape[1],
-                    z2: z2 + chunk_shape[2] if len(z) > 2 else slice(None),
+                    z0: z0 + patch_shape[0],
+                    z1: z1 + patch_shape[1],
+                    z2: z2 + patch_shape[2] if len(z) > 2 else slice(None),
                 ]
                 chunk = np.ascontiguousarray(slice_)
                 compressed = codec.encode(chunk)
@@ -297,17 +417,11 @@ def compute_cratio(img, codec, chunk_shape=(64, 64, 64)):
     return round(total_uncompressed_size / total_compressed_size, 2)
 
 
-def compute_cratio_jpegxl(img, codec, chunk_shape=(128, 128, 64), max_workers=32):
-    img = np.ascontiguousarray(img)
-    shape = img.shape
-    ndim = img.ndim
-
-    # Generate chunk start indices
-    chunk_ranges = [range(0, s, c) for s, c in zip(shape, chunk_shape)]
-    chunk_coords = list(product(*chunk_ranges))
-
+def compute_cratio_jpegxl(img, codec, patch_shape=(128, 128, 64), max_workers=32):
+    # Helper routine
     def compress_patch(idx):
-        slices = tuple(slice(i, min(i + c, s)) for i, c, s in zip(idx, chunk_shape, shape))
+        iterator = zip(idx, patch_shape, img.shape)
+        slices = tuple(slice(i, min(i + c, s)) for i, c, s in iterator)
         patch = img[slices]
         compressed_size = 0
         for k in range(patch.shape[-1]):
@@ -316,27 +430,28 @@ def compute_cratio_jpegxl(img, codec, chunk_shape=(128, 128, 64), max_workers=32
             compressed_size += len(encoded)
         return patch.nbytes, compressed_size
 
+    # Generate chunk start indices
+    img = np.ascontiguousarray(img)    
+    chunk_ranges = [range(0, s, c) for s, c in zip(img.shape, patch_shape)]
+    chunk_coords = list(product(*chunk_ranges))
+
+    # Compute chunked cratio
     total_uncompressed = 0
     total_compressed = 0
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         for ubytes, cbytes in pool.map(compress_patch, chunk_coords):
             total_uncompressed += ubytes
             total_compressed += cbytes
-
     return round(total_uncompressed / total_compressed, 2)
 
 
-def compress_and_decompress_jpeg(img, codec, chunk_shape=(128, 128, 64), max_workers=32):
-    img = np.ascontiguousarray(img)
-    shape = img.shape
-
-    chunk_ranges = [range(0, s, c) for s, c in zip(shape, chunk_shape)]
-    chunk_coords = list(product(*chunk_ranges))
-
-    reconstructed = np.empty_like(img)
-
+def compress_and_decompress_jpeg(
+    img, codec, patch_shape=(128, 128, 64), max_workers=32
+):
+    # Helper routine
     def process_patch(idx):
-        slices = tuple(slice(i, min(i + c, s)) for i, c, s in zip(idx, chunk_shape, shape))
+        iterator = zip(idx, patch_shape, shape)
+        slices = tuple(slice(i, min(i + c, s)) for i, c, s in iterator)
         patch = img[slices]
 
         compressed_size = 0
@@ -352,53 +467,24 @@ def compress_and_decompress_jpeg(img, codec, chunk_shape=(128, 128, 64), max_wor
         decompressed_patch = np.stack(decompressed_slices, axis=-1)
         return slices, patch.nbytes, compressed_size, decompressed_patch
 
+    # Generate chunk start indices
+    img = np.ascontiguousarray(img)
+    chunk_ranges = [range(0, s, c) for s, c in zip(img.shape, patch_shape)]
+    chunk_coords = list(product(*chunk_ranges))
+
+    # Compute chunked ratio
+    decompressed_img = np.empty_like(img)
     total_uncompressed = 0
     total_compressed = 0
-
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        for slices, ubytes, cbytes, decompressed_patch in pool.map(process_patch, chunk_coords):
-            reconstructed[slices] = decompressed_patch
+        iterator = pool.map(process_patch, chunk_coords)
+        for slices, ubytes, cbytes, decompressed_patch in iterator:
+            decompressed_img[slices] = decompressed_patch
             total_uncompressed += ubytes
             total_compressed += cbytes
 
     cratio = round(total_uncompressed / total_compressed, 2)
-    return reconstructed, cratio
-
-
-# --- Visualizations ---
-def plot_mips(img, output_path=None, vmax=None):
-    """
-    Plots the Maximum Intensity Projections (MIPs) of a 3D image along the XY,
-    XZ, and YZ axes.
-
-    Parameters
-    ----------
-    img : numpy.ndarray
-        Input image to generate MIPs from.
-
-    Returns
-    -------
-    None
-    """
-    vmax = vmax or np.percentile(img, 99.9)
-    fig, axs = plt.subplots(1, 3, figsize=(10, 4))
-    axs_names = ["XY", "XZ", "YZ"]
-    for i in range(3):
-        if len(img.shape) == 5:
-            mip = np.max(img[0, 0, ...], axis=i)
-        else:
-            mip = np.max(img, axis=i)
-
-        axs[i].imshow(mip, vmax=vmax)
-        axs[i].set_title(axs_names[i], fontsize=16)
-        axs[i].set_xticks([])
-        axs[i].set_yticks([])
-
-    plt.tight_layout()
-    if output_path:
-        plt.savefig(output_path, dpi=200)
-    plt.show()
-    plt.close(fig)
+    return decompressed_img, cratio
 
 
 # --- Image Prefix Search ---
@@ -691,3 +777,38 @@ def is_inbounds(voxel, shape):
         return True
     else:
         return False
+
+
+def plot_mips(img, output_path=None, vmax=None):
+    """
+    Plots the Maximum Intensity Projections (MIPs) of a 3D image along the XY,
+    XZ, and YZ axes.
+
+    Parameters
+    ----------
+    img : numpy.ndarray
+        Input image to generate MIPs from.
+
+    Returns
+    -------
+    None
+    """
+    vmax = vmax or np.percentile(img, 99.9)
+    fig, axs = plt.subplots(1, 3, figsize=(10, 4))
+    axs_names = ["XY", "XZ", "YZ"]
+    for i in range(3):
+        if len(img.shape) == 5:
+            mip = np.max(img[0, 0, ...], axis=i)
+        else:
+            mip = np.max(img, axis=i)
+
+        axs[i].imshow(mip, vmax=vmax)
+        axs[i].set_title(axs_names[i], fontsize=16)
+        axs[i].set_xticks([])
+        axs[i].set_yticks([])
+
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=200)
+    plt.show()
+    plt.close(fig)
