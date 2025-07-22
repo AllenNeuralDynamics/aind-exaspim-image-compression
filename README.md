@@ -10,7 +10,7 @@
 A Python package for compressing ExaSPIM image datasets via denoising and lossy compression.
 
 <p>
-  <img src="imgs/pipeline.png" width="800" alt="pipeline">
+  <img src="imgs/pipeline.png" width="850" alt="pipeline">
   <br>
   <b> Figure: </b>Visualization of image compression pipeline.
 </p>
