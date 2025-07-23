@@ -336,7 +336,7 @@ class BM4D:
     """
     A simple wrapper for BM4D denoising of 3D volumetric data.
     """
-    def __init__(self, sigma=80):
+    def __init__(self, sigma=60):
         """
         Initialize the BM4D denoiser.
 
@@ -431,7 +431,7 @@ def compute_cratio_jpegxl(img, codec, patch_shape=(128, 128, 64), max_workers=32
         return patch.nbytes, compressed_size
 
     # Generate chunk start indices
-    img = np.ascontiguousarray(img)    
+    img = np.ascontiguousarray(img)
     chunk_ranges = [range(0, s, c) for s, c in zip(img.shape, patch_shape)]
     chunk_coords = list(product(*chunk_ranges))
 
@@ -450,7 +450,7 @@ def compress_and_decompress_jpeg(
 ):
     # Helper routine
     def process_patch(idx):
-        iterator = zip(idx, patch_shape, shape)
+        iterator = zip(idx, patch_shape, img.shape)
         slices = tuple(slice(i, min(i + c, s)) for i, c, s in iterator)
         patch = img[slices]
 
@@ -508,13 +508,20 @@ def get_img_prefix(brain_id, img_prefix_path=None):
 
 
 def find_img_prefix(brain_id):
-    # Get possible prefixes
+    # Initializations
     bucket_name = "aind-open-data"
     prefixes = util.list_s3_bucket_prefixes(
         "aind-open-data", keyword="exaspim"
     )
+
+    # Get possible prefixes
     valid_prefixes = list()
     for prefix in prefixes:
+        # Check for new naming convention
+        if util.exists_in_prefix(bucket_name, prefix, "fusion"):
+            prefix = os.path.join(prefix, "fusion")
+        
+        # Check if prefix is valid
         if is_valid_prefix(bucket_name, prefix, brain_id):
             valid_prefixes.append(
                 os.path.join("s3://aind-open-data", prefix, "fused.zarr")
@@ -529,13 +536,13 @@ def is_valid_prefix(bucket_name, prefix, brain_id):
     if not has_correct_id or is_test:
         return False
 
-    # Check inside prefix
+    # Check inside prefix - old convention
     if util.exists_in_prefix(bucket_name, prefix, "fused.zarr"):
         img_prefix = os.path.join(prefix, "fused.zarr")
-        subprefixes = util.list_s3_prefixes(bucket_name, img_prefix)
-        subprefixes = [p.split("/")[-2] for p in subprefixes]
-        for i in range(0, 8):
-            if str(i) not in subprefixes:
+        multiscales = util.list_s3_prefixes(bucket_name, img_prefix)
+        multiscales = [s.split("/")[-2] for s in multiscales]
+        for s in map(str, range(0, 8)):
+            if s not in multiscales:
                 return False
     return True
 
@@ -588,7 +595,7 @@ def convert_tiff_ome_zarr(
     None
     """
     img = tifffile.imread(in_path)
-    write_ome_zarr(img, out_path, chunks, compressor, voxel, n_levels)
+    write_ome_zarr(img, out_path, chunks, compressor, voxel_size, n_levels)
 
 
 def write_ome_zarr(
@@ -597,7 +604,7 @@ def write_ome_zarr(
     chunks: tuple = (1, 1, 64, 128, 128),
     compressor: Any = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
     voxel_size: tuple = (748, 748, 1000),
-    n_levels: int = 3,
+    n_levels: int = 1,
 ):
     # Ensure 5D image (T, C, Z, Y, X)
     while img.ndim < 5:
