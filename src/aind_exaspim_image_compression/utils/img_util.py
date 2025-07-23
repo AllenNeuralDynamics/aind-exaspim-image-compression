@@ -520,7 +520,7 @@ def find_img_prefix(brain_id):
         # Check for new naming convention
         if util.exists_in_prefix(bucket_name, prefix, "fusion"):
             prefix = os.path.join(prefix, "fusion")
-        
+
         # Check if prefix is valid
         if is_valid_prefix(bucket_name, prefix, brain_id):
             valid_prefixes.append(
