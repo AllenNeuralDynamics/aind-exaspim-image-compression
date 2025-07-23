@@ -14,14 +14,25 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     as_completed,
 )
+from numcodecs import blosc
 from tqdm import tqdm
 
 import numpy as np
 import torch
 
+from aind_exaspim_image_compression.machine_learning.unet3d import UNet
+from aind_exaspim_image_compression.utils import img_util
+
 
 def predict(
-    img, model, batch_size=32, patch_size=64, overlap=16, trim=5, verbose=True
+    img,
+    model,
+    denoised=None,
+    batch_size=32,
+    patch_size=64,
+    overlap=12,
+    trim=5,
+    verbose=True
 ):
     """
     Denoises a 3D image by processing patches in batches and running deep
@@ -44,10 +55,8 @@ def predict(
 
     Returns
     -------
-    coords : List[Tuple[int]]
-        List of (i, j, k) starting coordinates of patches processed.
-    preds : List[numpy.ndarray]
-        List of predicted patches (3D arrays) matching the patch size.
+    numpy.ndarray
+        Denoised image.
     """
     # Adjust image dimenions
     while len(img.shape) < 5:
@@ -55,7 +64,8 @@ def predict(
 
     # Initializations
     starts = generate_patch_starts(img, patch_size, overlap)
-    denoised = np.zeros_like(img, dtype=np.uint16)
+    if denoised is None:
+        denoised = np.zeros_like(img, dtype=np.uint16)
 
     # Main
     pbar = tqdm(total=len(starts), desc="Denoise") if verbose else None
@@ -74,6 +84,49 @@ def predict(
             ] = patch[: end[0] - start[0], : end[1] - start[1], : end[2] - start[2]]
         pbar.update(len(starts_i)) if verbose else None
     return denoised
+
+
+def predict_largescale(
+    img,
+    model,
+    output_path,
+    compressor,
+    batch_size=32,
+    patch_size=64,
+    overlap=16,
+    trim=5,
+    verbose=True
+):
+    # Initializations
+    denoised = img_util.init_ome_zarr(img, output_path, compressor=compressor)
+    predict(img, model, denoised=denoised)
+
+
+def predict_patch(patch, model):
+    """
+    Denoised a single 3D patch using the provided model.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        PyTorch model used for prediction.
+    patch : numpy.ndarray
+        3D input patch to denoise.
+
+    Returns
+    -------
+    numpy.ndarray
+        Denoised 3D patch with the same shape as input patch.
+    """
+    # Run model
+    mn, mx = np.percentile(patch, 5), np.percentile(patch, 99.9)
+    patch = to_tensor((patch - mn) / max(mx, 1))
+    with torch.no_grad():
+        output_tensor = model(patch)
+
+    # Process output
+    pred = np.array(output_tensor.cpu())
+    return np.maximum(pred[0, 0, ...] * mx + mn, 0).astype(np.uint16)
 
 
 def _predict_batch(img, model, starts, patch_size, trim=5):
@@ -115,37 +168,6 @@ def _predict_batch(img, model, starts, patch_size, trim=5):
             pred = np.maximum(outputs[i] * mx + mn, 0).astype(np.uint16)
             preds.append(pred[start:end, start:end, start:end])
     return preds
-
-
-def predict_largescale(img, model):
-    pass
-
-
-def predict_patch(patch, model):
-    """
-    Denoised a single 3D patch using the provided model.
-
-    Parameters
-    ----------
-    model : torch.nn.Module
-        PyTorch model used for prediction.
-    patch : numpy.ndarray
-        3D input patch to denoise.
-
-    Returns
-    -------
-    numpy.ndarray
-        Denoised 3D patch with the same shape as input patch.
-    """
-    # Run model
-    mn, mx = np.percentile(patch, 5), np.percentile(patch, 99.9)
-    patch = to_tensor((patch - mn) / max(mx, 1))
-    with torch.no_grad():
-        output_tensor = model(patch)
-
-    # Process output
-    pred = np.array(output_tensor.cpu())
-    return np.maximum(pred[0, 0, ...] * mx + mn, 0).astype(np.uint16)
 
 
 # --- Helpers ---
@@ -200,6 +222,13 @@ def generate_patch_starts(img, patch_size, overlap):
             for k in range(0, img.shape[4] - patch_size + stride, stride):
                 coords.append((i, j, k))
     return coords
+
+
+def load_model(path, device="cuda"):
+    model = UNet()
+    model.load_state_dict(torch.load(path))
+    model.eval().to(device)
+    return model
 
 
 def to_tensor(arr):
