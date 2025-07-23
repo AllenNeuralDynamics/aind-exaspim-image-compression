@@ -563,65 +563,53 @@ def find_functional_img_prefix(prefixes):
 
 
 # --- Helpers ---
-def convert_tiff_ome_zarr(
-    in_path,
-    out_path,
-    chunks: tuple = (1, 1, 64, 128, 128),
-    compressor: Any = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
-    voxel_size: tuple = (748, 748, 1000),
-    n_levels: int = 3,
+def init_ome_zarr(
+    img,
+    output_path,
+    chunks=(1, 1, 64, 128, 128),
+    compressor=Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
 ):
-    """
-    Convert a Tiff stack to an N5 dataset.
+    # Setup output store
+    store = zarr.DirectoryStore(output_path, dimension_separator="/")
+    zgroup = zarr.group(store=store)
 
-    Parameters
-    ----------
-    in_path : str
-        Path to TIFF iamge.
-    out_path : str
-        Path to write the N5.
-    chunks : Tuple[int], optional
-        Chunk shape of the N5 dataset. Default is (1, 1, 64, 128, 128).
-    compressor : Blosc, optional
-        Numcodecs compressor instance for the N5 dataset. Default is
-        Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE).
-    voxel_size : Tuple[float], optional
-        Voxel spacing of the image. Default is (748, 748, 1000).
-    n_levels : int, optional
-        Number of levels in the multiscale pyramid. Default is 3.
-
-    Returns
-    -------
-    None
-    """
-    img = tifffile.imread(in_path)
-    write_ome_zarr(img, out_path, chunks, compressor, voxel_size, n_levels)
+    # Create top-level dataset
+    output_zarr = zgroup.create_dataset(
+        name=0,
+        shape=img.shape,
+        chunks=chunks,
+        dtype=np.uint16,
+        compressor=compressor,
+        overwrite=True
+    )
+    return output_zarr
 
 
 def write_ome_zarr(
     img,
-    out_path,
-    chunks: tuple = (1, 1, 64, 128, 128),
-    compressor: Any = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
-    voxel_size: tuple = (748, 748, 1000),
-    n_levels: int = 1,
+    output_path,
+    chunks=(1, 1, 64, 128, 128),
+    compressor=Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
+    n_levels=1,
+    scale_factors=(1, 1, 2, 2, 2),
+    voxel_size=(748, 748, 1000),
 ):
     # Ensure 5D image (T, C, Z, Y, X)
     while img.ndim < 5:
         img = img[np.newaxis, ...]
 
     # Generate multiscale pyramid
-    pyramid = multiscale(img, windowed_mode, scale_factors=[1, 1, 2, 2, 2])[:n_levels]
+    pyramid = multiscale(img, windowed_mode, scale_factors=scale_factors)[:n_levels]
     pyramid = [level.data for level in pyramid]
 
     # Prepare Zarr store
-    store = zarr.DirectoryStore(out_path, dimension_separator="/")
+    store = zarr.DirectoryStore(output_path, dimension_separator="/")
     zgroup = zarr.open(store=store, mode="w")
 
     # Voxel size scaling for each level
     base_scale = np.array([1, 1, *reversed(voxel_size)])
     scales = [base_scale[:2].tolist() + (base_scale[2:] * 2**i).tolist() for i in range(n_levels)]
-    coordinate_transformations = [[{"type": "scale", "scale": s}] for s in scales]
+    coord_transforms = [[{"type": "scale", "scale": s}] for s in scales]
 
     # Write to OME-Zarr
     write_multiscale(
@@ -635,7 +623,7 @@ def write_ome_zarr(
             {"name": "y", "type": "space", "unit": "micrometer"},
             {"name": "x", "type": "space", "unit": "micrometer"},
         ],
-        coordinate_transformations=coordinate_transformations,
+        coordinate_transformations=coord_transforms,
         storage_options={"compressor": compressor},
     )
 
