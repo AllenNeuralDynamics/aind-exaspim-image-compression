@@ -164,7 +164,7 @@ class UnsupervisedEvaluator:
             noise = input_noise[5:-5, 5:-5, 5:-5]
             denoised_gt = np.maximum(bm4d(noise, 10), 0).astype(int)
             denoised = predict_patch(input_noise, self.model)[5:-5, 5:-5, 5:-5]
- 
+
             # Compute metrics
             metrics["cratio"].append(compute_cratio(denoised, self.codec))
             metrics["cratio_noise"].append(compute_cratio(noise, self.codec))

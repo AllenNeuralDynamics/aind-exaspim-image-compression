@@ -10,7 +10,10 @@ batch process them through a model on GPU, and stitch denoised patches back
 into a full 3D volume.
 
 """
-
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    as_completed,
+)
 from tqdm import tqdm
 
 import numpy as np
@@ -18,7 +21,7 @@ import torch
 
 
 def predict(
-    img, model, batch_size=32, patch_size=64, overlap=16, verbose=True
+    img, model, batch_size=32, patch_size=64, overlap=16, trim=5, verbose=True
 ):
     """
     Denoises a 3D image by processing patches in batches and running deep
@@ -46,51 +49,76 @@ def predict(
     preds : List[numpy.ndarray]
         List of predicted patches (3D arrays) matching the patch size.
     """
-    # Initializations
-    batch_coords, batch_inputs, mn_mx = list(), list(), list()
+    # Adjust image dimenions
     while len(img.shape) < 5:
         img = img[np.newaxis, ...]
-    coords = generate_coords(img, patch_size, overlap)
+
+    # Initializations
+    starts = generate_patch_starts(img, patch_size, overlap)
+    denoised = np.zeros_like(img, dtype=np.uint16)
 
     # Main
-    pbar = tqdm(total=len(coords), desc="Denoise") if verbose else None
-    preds = list()
-    for idx, (i, j, k) in enumerate(coords):
-        # Get end coord
-        i_end = min(i + patch_size, img.shape[2])
-        j_end = min(j + patch_size, img.shape[3])
-        k_end = min(k + patch_size, img.shape[4])
+    pbar = tqdm(total=len(starts), desc="Denoise") if verbose else None
+    for i in range(0, len(starts), batch_size):
+        # Run model
+        starts_i = starts[i:min(i + batch_size, len(starts))]
+        patches_i = _predict_batch(img, model, starts_i, patch_size, trim)
 
-        # Get patch
-        patch = img[0, 0, i:i_end, j:j_end, k:k_end]
+        # Store result
+        for patch, start in zip(patches_i, starts_i):
+            start = [max(s + trim, 0) for s in start]
+            end = [start[i] + patch.shape[i] for i in range(3)]
+            end = [min(e, s) for e, s in zip(end, img.shape[2:])]
+            denoised[
+                0, 0, start[0]:end[0], start[1]:end[1], start[2]:end[2]
+            ] = patch[: end[0] - start[0], : end[1] - start[1], : end[2] - start[2]]
+        pbar.update(len(starts_i)) if verbose else None
+    return denoised
+
+
+def _predict_batch(img, model, starts, patch_size, trim=5):
+    # Subroutine
+    def read_patch(i):
+        start = starts[i]
+        end = [min(s + patch_size, d) for s, d in zip(start, img.shape[2:])]
+        patch = img[0, 0, start[0]:end[0], start[1]:end[1], start[2]:end[2]]
         mn, mx = np.percentile(patch, 5), np.percentile(patch, 99.9)
-        patch = (patch - mn) / mx
-        mn_mx.append((mn, mx))
+        patch = add_padding((patch - mn) / mx, patch_size)
+        return i, patch, (mn, mx)
 
-        # Store patch
-        patch = add_padding(patch, patch_size)
-        batch_inputs.append(patch)
-        batch_coords.append((i, j, k))
+    # Main
+    with ThreadPoolExecutor() as executor:
+        # Read patches
+        threads = list()
+        for i in range(len(starts)):
+            threads.append(executor.submit(read_patch, i))
 
-        # If batch is full or it's the last patch
-        if len(batch_inputs) == batch_size or idx == len(coords) - 1:
-            # Run model
-            input_tensor = batch_to_tensor(np.stack(batch_inputs))
-            with torch.no_grad():
-                output_tensor = model(input_tensor)
+        # Compile batch
+        inputs = np.zeros((len(starts),) + (patch_size,) * 3)
+        mn_mx = len(starts) * [None]
+        for thread in as_completed(threads):
+            i, patch_i, mn_mx_i = thread.result()
+            mn_mx[i] = mn_mx_i
+            inputs[i, ...] = patch_i
 
-            # Store result
-            output_tensor = output_tensor.cpu()
-            for cnt in range(output_tensor.shape[0]):
-                mn, mx = mn_mx[cnt]
-                patch = np.array(output_tensor[cnt, 0, ...])
-                preds.append(np.maximum(patch * mx + mn, 0))
-                pbar.update(1) if verbose else None
+        # Run model
+        inputs = batch_to_tensor(inputs)
+        with torch.no_grad():
+            outputs = model(inputs)
+        outputs = np.array(outputs.cpu()).squeeze(1)
 
-            batch_coords.clear()
-            batch_inputs.clear()
-            mn_mx.clear()
-    return stitch(img, coords, preds)
+        # Store result
+        preds = list()
+        start, end = trim, patch_size - trim
+        for i in range(outputs.shape[0]):
+            mn, mx = mn_mx[i]
+            pred = np.maximum(outputs[i] * mx + mn, 0).astype(np.uint16)
+            preds.append(pred[start:end, start:end, start:end])
+    return preds
+
+
+def predict_largescale(img, model):
+    pass
 
 
 def predict_patch(patch, model):
@@ -117,67 +145,7 @@ def predict_patch(patch, model):
 
     # Process output
     pred = np.array(output_tensor.cpu())
-    return np.maximum(pred[0, 0, ...] * mx + mn, 0).astype(int)
-
-
-def stitch(img, coords, preds, patch_size=64, trim=5):
-    """
-    Stitches overlapping 3D patches back into a full denoised image by
-    averaging overlapping regions, with optional trimming of patch borders.
-
-    Parameters
-    ----------
-    img : numpy.ndarray
-        Original image array of shape (batch, channels, depth, height, width).
-    coords : List[Tuple[int]]
-        List of starting (i, j, k) coordinates for each patch.
-    preds : List[numpy.ndarray]
-        Predicted patches with shape (patch_size, patch_size, patch_size).
-    patch_size : int, optional
-        Size of each cubic patch. Default is 64.
-    trim : int, optional
-        Number of voxels to trim from each side of a patch before stitching.
-        Default is 5.
-
-    Returns
-    -------
-    numpy.ndarray
-        Reconstructed image with patches stitched and overlapping areas
-        averaged.
-    """
-    denoised_accum = np.zeros_like(img, dtype=np.float32)
-    weight_map = np.zeros_like(img, dtype=np.float32)
-    for (i, j, k), pred in zip(coords, preds):
-        # Trim prediction
-        start, end = trim, patch_size - trim
-        pred = pred[start:end, start:end, start:end]
-
-        # Adjust insertion indices
-        i_start = i + trim
-        j_start = j + trim
-        k_start = k + trim
-
-        i_end = i_start + pred.shape[0]
-        j_end = j_start + pred.shape[1]
-        k_end = k_start + pred.shape[2]
-
-        # Clip to image bounds (for safety)
-        i_end = min(i_end, img.shape[2])
-        j_end = min(j_end, img.shape[3])
-        k_end = min(k_end, img.shape[4])
-
-        i_start = max(i_start, 0)
-        j_start = max(j_start, 0)
-        k_start = max(k_start, 0)
-
-        denoised_accum[
-            0, 0, i_start:i_end, j_start:j_end, k_start:k_end
-        ] += pred[: i_end - i_start, : j_end - j_start, : k_end - k_start]
-        weight_map[0, 0, i_start:i_end, j_start:j_end, k_start:k_end] += 1
-
-    # Average accumulated
-    weight_map[weight_map == 0] = 1
-    return denoised_accum / weight_map
+    return np.maximum(pred[0, 0, ...] * mx + mn, 0).astype(np.uint16)
 
 
 # --- Helpers ---
@@ -205,7 +173,7 @@ def add_padding(patch, patch_size):
     return np.pad(patch, pad_width, mode="constant", constant_values=0)
 
 
-def generate_coords(img, patch_size, overlap):
+def generate_patch_starts(img, patch_size, overlap):
     """
     Generates starting coordinates for 3D patches extracted from an image
     tensor, based on specified patch size and overlap.
