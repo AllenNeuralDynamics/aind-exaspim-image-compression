@@ -17,6 +17,7 @@ from concurrent.futures import (
 from numcodecs import blosc
 from tqdm import tqdm
 
+import itertools
 import numpy as np
 import torch
 
@@ -63,26 +64,27 @@ def predict(
         img = img[np.newaxis, ...]
 
     # Initializations
-    starts = generate_patch_starts(img, patch_size, overlap)
+    starts_generator = generate_patch_starts(img, patch_size, overlap)
+    n_starts = count_patches(img, patch_size, overlap)
     if denoised is None:
         denoised = np.zeros_like(img, dtype=np.uint16)
 
     # Main
-    pbar = tqdm(total=len(starts), desc="Denoise") if verbose else None
-    for i in range(0, len(starts), batch_size):
+    pbar = tqdm(total=n_starts, desc="Denoise") if verbose else None
+    for i in range(0, n_starts, batch_size):
         # Run model
-        starts_i = starts[i:min(i + batch_size, len(starts))]
-        patches_i = _predict_batch(img, model, starts_i, patch_size, trim)
+        starts = list(itertools.islice(starts_generator, batch_size))
+        patches = _predict_batch(img, model, starts, patch_size, trim)
 
         # Store result
-        for patch, start in zip(patches_i, starts_i):
+        for patch, start in zip(patches, starts):
             start = [max(s + trim, 0) for s in start]
             end = [start[i] + patch.shape[i] for i in range(3)]
             end = [min(e, s) for e, s in zip(end, img.shape[2:])]
             denoised[
                 0, 0, start[0]:end[0], start[1]:end[1], start[2]:end[2]
             ] = patch[: end[0] - start[0], : end[1] - start[1], : end[2] - start[2]]
-        pbar.update(len(starts_i)) if verbose else None
+        pbar.update(len(starts)) if verbose else None
     return denoised
 
 
@@ -220,8 +222,33 @@ def generate_patch_starts(img, patch_size, overlap):
     for i in range(0, img.shape[2] - patch_size + stride, stride):
         for j in range(0, img.shape[3] - patch_size + stride, stride):
             for k in range(0, img.shape[4] - patch_size + stride, stride):
-                coords.append((i, j, k))
-    return coords
+                yield (i, j, k)
+
+
+def count_patches(img, patch_size, overlap):
+    """
+    Counts the number of patches within a 3D image for a given patch size
+    and overlap between patches.
+
+    Parameters
+    ----------
+    img : torch.Tensor or numpy.ndarray
+        Input image tensor with shape (batch, channels, depth, height, width).
+    patch_size : int
+        The size of each cubic patch along each spatial dimension.
+    overlap : int
+        Number of voxels that adjacent patches overlap.
+
+    Returns
+    -------
+    int
+        Number of patches.
+    """
+    stride = patch_size - overlap
+    d_range = range(0, img.shape[2] - patch_size + stride, stride)
+    h_range = range(0, img.shape[3] - patch_size + stride, stride)
+    w_range = range(0, img.shape[4] - patch_size + stride, stride)
+    return len(d_range) * len(h_range) * len(w_range)
 
 
 def load_model(path, device="cuda"):
