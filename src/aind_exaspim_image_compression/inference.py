@@ -10,11 +10,7 @@ batch process them through a model on GPU, and stitch denoised patches back
 into a full 3D volume.
 
 """
-from concurrent.futures import (
-    ThreadPoolExecutor,
-    as_completed,
-)
-from numcodecs import blosc
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 import itertools
@@ -95,13 +91,27 @@ def predict_largescale(
     compressor,
     batch_size=32,
     patch_size=64,
-    overlap=16,
+    overlap=12,
+    output_chunks=(1, 1, 64, 128, 128, 128),
     trim=5,
     verbose=True
 ):
-    # Initializations
-    denoised = img_util.init_ome_zarr(img, output_path, compressor=compressor)
-    predict(img, model, denoised=denoised)
+    # Initialize output image
+    denoised = img_util.init_ome_zarr(
+        img, output_path, compressor=compressor, chunks=output_chunks
+    )
+
+    # Run model
+    predict(
+        img,
+        model,
+        denoised=denoised,
+        batch_size=batch_size,
+        patch_size=patch_size,
+        overlap=overlap,
+        trim=5,
+        verbose=True
+    )
 
 
 def predict_patch(patch, model):
@@ -217,7 +227,6 @@ def generate_patch_starts(img, patch_size, overlap):
         List of (depth_start, height_start, width_start) coordinates for image
         patches.
     """
-    coords = list()
     stride = patch_size - overlap
     for i in range(0, img.shape[2] - patch_size + stride, stride):
         for j in range(0, img.shape[3] - patch_size + stride, stride):
