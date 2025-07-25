@@ -11,21 +11,17 @@ Helper routines for working with images.
 from bm4d import bm4d
 from concurrent.futures import ThreadPoolExecutor
 from itertools import product
-from numcodecs import Blosc
+from numcodecs import Blosc, register_codec
 from ome_zarr.writer import write_multiscale
 from scipy.ndimage import uniform_filter
-from typing import Any
 from xarray_multiscale import multiscale, windowed_mode
 
 import gcsfs
 import matplotlib.pyplot as plt
 import numpy as np
-import os
 import s3fs
 import tifffile
 import zarr
-
-from aind_exaspim_image_compression.utils import util
 
 
 # --- Image Reader ---
@@ -487,81 +483,6 @@ def compress_and_decompress_jpeg(
     return decompressed_img, cratio
 
 
-# --- Image Prefix Search ---
-def get_img_prefix(brain_id, img_prefix_path=None):
-    # Check prefix path
-    if img_prefix_path:
-        prefix_lookup = util.read_json(img_prefix_path)
-        if brain_id in prefix_lookup:
-            return prefix_lookup[brain_id]
-
-    # Search for prefix path
-    result = find_img_prefix(brain_id)
-    if len(result) == 1:
-        prefix = result[0] + "/"
-        if img_prefix_path:
-            prefix_lookup[brain_id] = prefix
-            util.write_json(img_prefix_path, prefix_lookup)
-        return prefix
-
-    raise Exception(f"Image Prefixes Found for {brain_id}- {result}")
-
-
-def find_img_prefix(brain_id):
-    # Initializations
-    bucket_name = "aind-open-data"
-    prefixes = util.list_s3_bucket_prefixes(
-        "aind-open-data", keyword="exaspim"
-    )
-
-    # Get possible prefixes
-    valid_prefixes = list()
-    for prefix in prefixes:
-        # Check for new naming convention
-        if util.exists_in_prefix(bucket_name, prefix, "fusion"):
-            prefix = os.path.join(prefix, "fusion")
-
-        # Check if prefix is valid
-        if is_valid_prefix(bucket_name, prefix, brain_id):
-            valid_prefixes.append(
-                os.path.join("s3://aind-open-data", prefix, "fused.zarr")
-            )
-    return find_functional_img_prefix(valid_prefixes)
-
-
-def is_valid_prefix(bucket_name, prefix, brain_id):
-    # Quick checks
-    is_test = "test" in prefix.lower()
-    has_correct_id = str(brain_id) in prefix
-    if not has_correct_id or is_test:
-        return False
-
-    # Check inside prefix - old convention
-    if util.exists_in_prefix(bucket_name, prefix, "fused.zarr"):
-        img_prefix = os.path.join(prefix, "fused.zarr")
-        multiscales = util.list_s3_prefixes(bucket_name, img_prefix)
-        multiscales = [s.split("/")[-2] for s in multiscales]
-        for s in map(str, range(0, 8)):
-            if s not in multiscales:
-                return False
-    return True
-
-
-def find_functional_img_prefix(prefixes):
-    # Filter img prefixes that fail to open
-    functional_prefixes = list()
-    for prefix in prefixes:
-        try:
-            root = os.path.join(prefix, str(0))
-            store = s3fs.S3Map(root=root, s3=s3fs.S3FileSystem(anon=True))
-            img = zarr.open(store, mode="r")
-            if np.max(img.shape) > 25000:
-                functional_prefixes.append(prefix)
-        except:
-            pass
-    return functional_prefixes
-
-
 # --- Helpers ---
 def init_ome_zarr(
     img,
@@ -570,10 +491,12 @@ def init_ome_zarr(
     compressor=Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
 ):
     # Setup output store
+    register_codec(compressor)
     store = zarr.DirectoryStore(output_path, dimension_separator="/")
     zgroup = zarr.group(store=store)
 
     # Create top-level dataset
+    print("Creating ome-zarr image with shape:", img.shape)
     output_zarr = zgroup.create_dataset(
         name=0,
         shape=img.shape,
@@ -603,6 +526,7 @@ def write_ome_zarr(
     pyramid = [level.data for level in pyramid]
 
     # Prepare Zarr store
+    register_codec(compressor)
     store = zarr.DirectoryStore(output_path, dimension_separator="/")
     zgroup = zarr.open(store=store, mode="w")
 

@@ -8,8 +8,6 @@ Helper routines for working with SmartSheets
 
 """
 
-from datetime import datetime
-
 import ast
 import pandas as pd
 
