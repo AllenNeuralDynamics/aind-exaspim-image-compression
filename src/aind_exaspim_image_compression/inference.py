@@ -10,7 +10,12 @@ batch process them through a model on GPU, and stitch denoised patches back
 into a full 3D volume.
 
 """
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    as_completed,
+)
+from numcodecs import blosc
 from tqdm import tqdm
 
 import itertools
@@ -92,26 +97,15 @@ def predict_largescale(
     batch_size=32,
     patch_size=64,
     overlap=12,
-    output_chunks=(1, 1, 64, 128, 128, 128),
+    output_chunks=(1, 1, 64, 128, 128),
     trim=5,
     verbose=True
 ):
-    # Initialize output image
+    # Initializations
     denoised = img_util.init_ome_zarr(
         img, output_path, compressor=compressor, chunks=output_chunks
     )
-
-    # Run model
-    predict(
-        img,
-        model,
-        denoised=denoised,
-        batch_size=batch_size,
-        patch_size=patch_size,
-        overlap=overlap,
-        trim=5,
-        verbose=True
-    )
+    predict(img, model, denoised=denoised)
 
 
 def predict_patch(patch, model):
@@ -131,27 +125,28 @@ def predict_patch(patch, model):
         Denoised 3D patch with the same shape as input patch.
     """
     # Run model
-    mn, mx = np.percentile(patch, 5), np.percentile(patch, 99.9)
+    mn, mx = np.percentile(patch, [5, 99.9])
     patch = to_tensor((patch - mn) / max(mx, 1))
     with torch.no_grad():
         output_tensor = model(patch)
 
     # Process output
     pred = np.array(output_tensor.cpu())
-    return np.maximum(pred[0, 0, ...] * mx + mn, 0).astype(np.uint16)
+    return np.abs(pred[0, 0, ...] * mx + mn).astype(np.uint16)
 
 
 def _predict_batch(img, model, starts, patch_size, trim=5):
     # Subroutine
     def read_patch(i):
         start = starts[i]
-        end = [min(s + patch_size, d) for s, d in zip(start, img.shape[2:])]
+        end = [min(s + patch_size, d) for s, d in zip(start, (D, H, W))]
         patch = img[0, 0, start[0]:end[0], start[1]:end[1], start[2]:end[2]]
-        mn, mx = np.percentile(patch, 5), np.percentile(patch, 99.9)
-        patch = add_padding((patch - mn) / mx, patch_size)
-        return i, patch, (mn, mx)
+        mn, mx = np.percentile(patch, [5, 99.9])
+        patch = add_padding((patch - mn) / max(mx, 1), patch_size)
+        return i, patch.astype(np.float32), (mn, mx)
 
     # Main
+    D, H, W = img.shape[2:]
     with ThreadPoolExecutor() as executor:
         # Read patches
         threads = list()
@@ -159,7 +154,7 @@ def _predict_batch(img, model, starts, patch_size, trim=5):
             threads.append(executor.submit(read_patch, i))
 
         # Compile batch
-        inputs = np.zeros((len(starts),) + (patch_size,) * 3)
+        inputs = np.empty((len(starts),) + (patch_size,) * 3, dtype=np.float32)
         mn_mx = len(starts) * [None]
         for thread in as_completed(threads):
             i, patch_i, mn_mx_i = thread.result()
@@ -169,16 +164,16 @@ def _predict_batch(img, model, starts, patch_size, trim=5):
         # Run model
         inputs = batch_to_tensor(inputs)
         with torch.no_grad():
-            outputs = model(inputs)
-        outputs = np.array(outputs.cpu()).squeeze(1)
+            outputs = model(inputs).cpu().squeeze(1).numpy()
 
-        # Store result
-        preds = list()
+        N = outputs.shape[0]
         start, end = trim, patch_size - trim
-        for i in range(outputs.shape[0]):
+        final_shape = (end - start,) * 3
+        preds = np.empty((N,) + final_shape, dtype=np.uint16)
+        for i in range(N):
             mn, mx = mn_mx[i]
-            pred = np.maximum(outputs[i] * mx + mn, 0).astype(np.uint16)
-            preds.append(pred[start:end, start:end, start:end])
+            pred = np.abs(outputs[i] * mx + mn).astype(np.uint16)
+            preds[i] = pred[start:end, start:end, start:end]
     return preds
 
 
@@ -223,16 +218,15 @@ def generate_patch_starts(img, patch_size, overlap):
 
     Returns
     -------
-    coords : List[Tuple[int]]
-        List of (depth_start, height_start, width_start) coordinates for image
-        patches.
+    generator
+        Generates starting coordinates for image patches.
     """
+    coords = list()
     stride = patch_size - overlap
     for i in range(0, img.shape[2] - patch_size + stride, stride):
         for j in range(0, img.shape[3] - patch_size + stride, stride):
             for k in range(0, img.shape[4] - patch_size + stride, stride):
                 yield (i, j, k)
-
 
 def count_patches(img, patch_size, overlap):
     """
@@ -244,7 +238,7 @@ def count_patches(img, patch_size, overlap):
     img : torch.Tensor or numpy.ndarray
         Input image tensor with shape (batch, channels, depth, height, width).
     patch_size : int
-        The size of each cubic patch along each spatial dimension.
+        Size of each cubic patch along each spatial dimension.
     overlap : int
         Number of voxels that adjacent patches overlap.
 
@@ -261,6 +255,21 @@ def count_patches(img, patch_size, overlap):
 
 
 def load_model(path, device="cuda"):
+    """
+    Loads a pretrained UNet model from a file.
+
+    Parameters
+    ----------
+    path : str
+        Path to the saved model weights (e.g., .pt or .pth file).
+    device : str, optional
+        Device to load the model onto. Default is "cuda".
+
+    Returns
+    -------
+    torch.nn.Module
+        UNet model loaded with weights and set to evaluation mode.
+    """
     model = UNet()
     model.load_state_dict(torch.load(path))
     model.eval().to(device)
