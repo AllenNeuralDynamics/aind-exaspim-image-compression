@@ -10,18 +10,23 @@ Helper routines for working with images.
 
 from bm4d import bm4d
 from concurrent.futures import ThreadPoolExecutor
+from imagecodecs.numcodecs import Jpegxl
 from itertools import product
 from numcodecs import Blosc, register_codec
 from ome_zarr.writer import write_multiscale
 from scipy.ndimage import uniform_filter
+from typing import Any
 from xarray_multiscale import multiscale, windowed_mode
 
 import gcsfs
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 import s3fs
 import tifffile
 import zarr
+
+from aind_exaspim_image_compression.utils import util
 
 
 # --- Image Reader ---
@@ -68,6 +73,7 @@ def _read_zarr(img_path):
     np.ndarray
         Loaded image volume.
     """
+    register_codec(Jpegxl)
     if _is_gcs_path(img_path):
         fs = gcsfs.GCSFileSystem(anon=False)
         store = zarr.storage.FSStore(img_path, fs=fs)
@@ -442,7 +448,7 @@ def compute_cratio_jpegxl(img, codec, patch_shape=(128, 128, 64), max_workers=32
 
 
 def compress_and_decompress_jpeg(
-    img, codec, patch_shape=(128, 128, 64), max_workers=32
+    img, codec, patch_shape=(32, 256, 256), max_workers=32
 ):
     # Helper routine
     def process_patch(idx):
@@ -491,12 +497,11 @@ def init_ome_zarr(
     compressor=Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
 ):
     # Setup output store
-    register_codec(compressor)
     store = zarr.DirectoryStore(output_path, dimension_separator="/")
     zgroup = zarr.group(store=store)
 
     # Create top-level dataset
-    print("Creating ome-zarr image with shape:", img.shape)
+    print("Creating OMEZARR Image with Shape:", img.shape)
     output_zarr = zgroup.create_dataset(
         name=0,
         shape=img.shape,
@@ -526,7 +531,6 @@ def write_ome_zarr(
     pyramid = [level.data for level in pyramid]
 
     # Prepare Zarr store
-    register_codec(compressor)
     store = zarr.DirectoryStore(output_path, dimension_separator="/")
     zgroup = zarr.open(store=store, mode="w")
 

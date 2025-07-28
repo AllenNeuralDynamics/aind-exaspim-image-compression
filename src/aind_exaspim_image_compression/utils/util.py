@@ -253,36 +253,6 @@ def copy_gcs_directory(bucket_name, source_prefix, destination_prefix):
         bucket.copy_blob(blob, bucket, new_blob_name)
 
 
-def get_gcs_directory_size(bucket_name, prefix):
-    """
-    Calculates the total size of all objects under a given prefix in a GCS
-    bucket.
-
-    Parameters
-    ----------
-    bucket_name : str
-        Name of the GCS bucket.
-    prefix : str
-        Path prefix within the bucket.
-
-    Returns
-    -------
-    float
-        Total size in gigabytes (GB) of all objects under the given prefix.
-    """
-    # Download blobs
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    blobs = client.list_blobs(bucket, prefix=prefix)
-
-    # Compute size of blobs
-    total_size = 0
-    for blob in blobs:
-        total_size += blob.size
-
-    return total_size / 1024 ** 3
-
-
 def find_subprefix_with_keyword(bucket_name, prefix, keyword):
     """
     Finds the first GCS subprefix under a given prefix that contains a
@@ -306,6 +276,29 @@ def find_subprefix_with_keyword(bucket_name, prefix, keyword):
         if keyword in subprefix:
             return subprefix
     raise Exception(f"Prefix with keyword '{keyword}' not found in {prefix}")
+
+
+def get_gcs_directory_size(bucket_name, prefix):
+    """
+    Calculate the total size of a GCS "directory" (i.e., objects under a prefix),
+    and return it in gigabytes (GB).
+
+    Parameters
+    ----------
+    bucket_name : str
+        Name of the GCS bucket.
+    prefix : str
+        GCS path prefix (e.g., 'my_folder/' to list everything under that directory).
+
+    Returns
+    -------
+    float
+        Total size in gigabytes.
+    """
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blobs = bucket.list_blobs(prefix=prefix)
+    return sum(blob.size for blob in blobs) / (1024 ** 3)
 
 
 def list_block_paths(brain_id):
@@ -427,9 +420,135 @@ def upload_directory_to_gcs(bucket_name, source_dir, destination_dir):
 
 
 # --- S3 utils ---
+def exists_in_prefix(bucket_name, prefix, name):
+    """
+    Checks if a given filename is in a prefix.
+
+    Parameters
+    ----------
+    bucket_name : str
+        Name of the S3 bucket to search.
+    prefix : str
+        S3 prefix to search within.
+    name : str
+        Filename to search for.
+
+    Returns
+    -------
+    bool
+        Indiciation of whether a given file is in a prefix.
+    """
+    prefixes = list_s3_prefixes(bucket_name, prefix)
+    return sum([1 for prefix in prefixes if name in prefix]) > 0
+
+
+def list_s3_prefixes(bucket_name, prefix):
+    """
+    Lists all immediate subdirectories of a given S3 path (prefix).
+
+    Parameters
+    -----------
+    bucket_name : str
+        Name of the S3 bucket to search.
+    prefix : str
+        S3 prefix to search within.
+
+    Returns
+    -------
+    List[str]
+        List of immediate subdirectories under the specified prefix.
+    """
+    # Check prefix is valid
+    if not prefix.endswith("/"):
+        prefix += "/"
+
+    # Call the list_objects_v2 API
+    s3 = boto3.client("s3")
+    response = s3.list_objects_v2(
+        Bucket=bucket_name, Prefix=prefix, Delimiter="/"
+    )
+    if "CommonPrefixes" in response:
+        return [cp["Prefix"] for cp in response["CommonPrefixes"]]
+    else:
+        return list()
+
+
+def list_s3_bucket_prefixes(bucket_name, keyword=None):
+    """
+    Lists all top-level prefixes (directories) in an S3 bucket, optionally
+    filtering by a keyword.
+
+    Parameters
+    -----------
+    bucket_name : str
+        Name of the S3 bucket to search.
+    keyword : str, optional
+        Keyword used to filter the prefixes. Default is None.
+
+    Returns
+    --------
+    prefixes : List[str]
+        A list of top-level prefixes (directories) in the S3 bucket. If a
+        keyword is provided, only the matching prefixes are returned.
+    """
+    # Initializations
+    prefixes = list()
+    continuation_token = None
+    s3 = boto3.client("s3")
+
+    # Main
+    keyword = keyword.lower()
+    while True:
+        # Call the list_objects_v2 API
+        list_kwargs = {"Bucket": bucket_name, "Delimiter": "/"}
+        if continuation_token:
+            list_kwargs["ContinuationToken"] = continuation_token
+        response = s3.list_objects_v2(**list_kwargs)
+
+        # Collect the top-level prefixes
+        if "CommonPrefixes" in response:
+            for prefix in response["CommonPrefixes"]:
+                if keyword and keyword in prefix["Prefix"].lower():
+                    prefixes.append(prefix["Prefix"])
+                elif keyword is None:
+                    prefixes.append(prefix["Prefix"])
+
+        # Check if there are more pages to fetch
+        if response.get("IsTruncated"):
+            continuation_token = response.get("NextContinuationToken")
+        else:
+            break
+    return prefixes
+
+
+def is_file_in_prefix(bucket_name, prefix, filename):
+    """
+    Checks if a specific file exists within a given S3 prefix.
+
+    Parameters
+    ----------
+    bucket_name : str
+        Name of the S3 bucket to searched.
+    prefix : str
+        S3 prefix (path) under which to look for the file.
+    filename : str
+        Name of the file to search for within the specified prefix.
+
+    Returns
+    -------
+    bool
+        Returns "True" if the file exists within the given prefix,
+        otherwise "False".
+    """
+    for sub_prefix in list_s3_prefixes(bucket_name, prefix):
+        if filename in sub_prefix:
+            return True
+    return False
+
+
 def write_to_s3(local_path, bucket_name, prefix):
     """
-    Writes a single file on local machine to an S3 bucket.
+    Writes a single file on local machine to an s3 bucket.
 
     Parameters
     ----------
