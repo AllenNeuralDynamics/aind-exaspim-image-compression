@@ -9,6 +9,7 @@ Routines for loading data during training and inference.
 """
 
 from abc import ABC, abstractmethod
+from careamics.transforms.n2v_manipulate import N2VManipulate
 from concurrent.futures import (
     ProcessPoolExecutor,
     ThreadPoolExecutor,
@@ -18,12 +19,71 @@ from copy import deepcopy
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+import logging
 import numpy as np
+import pytorch_lightning as L
 import random
 import torch
 
 from aind_exaspim_image_compression.utils import img_util, util
 from aind_exaspim_image_compression.utils.swc_util import Reader
+
+
+logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
+
+
+class DataModule(L.LightningDataModule):
+    def __init__(
+        self,
+        brain_ids,
+        img_paths_json,
+        swc_dir,
+        batch_size=16,
+        foreground_sampling_rate=0.5,
+        n_upds=100,
+        n_validate_examples=200,
+        patch_shape=(64, 64, 64),
+    ):
+        # Call parent class
+        super(DataModule, self).__init__()
+
+        # Instance attributes
+        self.batch_size = batch_size
+        self.brain_ids = brain_ids
+        self.foreground_sampling_rate = foreground_sampling_rate
+        self.n_upds = n_upds
+        self.n_validate_examples = n_validate_examples
+        self.patch_shape = patch_shape
+
+        # Paths
+        self.img_paths_json = img_paths_json
+        self.swc_dir = swc_dir
+
+    def prepare_data(self):
+        pass
+
+    def setup(self, stage=None):
+        if stage == "fit" or stage is None:
+            self.train_dataset, self.val_dataset = init_datasets(
+                self.brain_ids,
+                self.img_paths_json,
+                self.swc_dir,
+                self.patch_shape,
+                self.n_validate_examples,
+                self.foreground_sampling_rate,
+            )
+
+    def train_dataloader(self):
+        train_dataloader = TrainN2VDataLoader(
+            self.train_dataset, batch_size=self.batch_size, n_upds=self.n_upds
+        )
+        return train_dataloader
+
+    def val_dataloader(self):
+        val_dataloader = ValidateN2VDataLoader(
+            self.val_dataset, batch_size=self.batch_size
+        )
+        return val_dataloader
 
 
 # --- Custom Datasets ---
@@ -380,10 +440,11 @@ def init_datasets(
     patch_shape,
     n_validate_examples,
     foreground_sampling_rate=0.5,
+    method="bm4d",
     swc_dict=None
 ):
     # Initializations
-    transform = img_util.BM4D()
+    transform = N2VManipulate() if method == "n2v" else img_util.BM4D()
     train_dataset = TrainDataset(
         patch_shape,
         transform,
