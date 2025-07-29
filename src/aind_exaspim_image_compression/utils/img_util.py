@@ -491,20 +491,40 @@ def compress_and_decompress_jpeg(
 
 # --- Helpers ---
 def init_ome_zarr(
-    img,
     output_path,
+    shape,
     chunks=(1, 1, 64, 128, 128),
     compressor=Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
 ):
+    """
+    Initializes an OME-Zarr dataset on disk for a given image.
+
+    Parameters
+    ----------
+    output_path : str or Path
+        Path to the directory where the OME-Zarr dataset will be created.
+    shape : Tuple[int]
+        Shape of OME-Zarr dataset.
+    chunks : Tuple[int], optional
+        Chunk sizes for the dataset. Default is (1, 1, 64, 128, 128).
+    compressor : numcodecs.Blosc, optional
+        Compression codec used for chunk compression. Default is Blosc with
+        "zstd" compression, compression level 5, and shuffle enabled.
+
+    Returns
+    -------
+    zarr.core.Array
+        Zarr dataset object corresponding to the initialized OME-Zarr dataset.
+    """
     # Setup output store
     store = zarr.DirectoryStore(output_path, dimension_separator="/")
     zgroup = zarr.group(store=store)
 
     # Create top-level dataset
-    print("Creating OMEZARR Image with Shape:", img.shape)
+    print("Creating OMEZARR Image with Shape:", shape)
     output_zarr = zgroup.create_dataset(
         name=0,
-        shape=img.shape,
+        shape=shape,
         chunks=chunks,
         dtype=np.uint16,
         compressor=compressor,
