@@ -19,71 +19,12 @@ from copy import deepcopy
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-import logging
 import numpy as np
-import pytorch_lightning as L
 import random
 import torch
 
 from aind_exaspim_image_compression.utils import img_util, util
 from aind_exaspim_image_compression.utils.swc_util import Reader
-
-
-logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
-
-
-class DataModule(L.LightningDataModule):
-    def __init__(
-        self,
-        brain_ids,
-        img_paths_json,
-        swc_dir,
-        batch_size=16,
-        foreground_sampling_rate=0.5,
-        n_upds=100,
-        n_validate_examples=200,
-        patch_shape=(64, 64, 64),
-    ):
-        # Call parent class
-        super(DataModule, self).__init__()
-
-        # Instance attributes
-        self.batch_size = batch_size
-        self.brain_ids = brain_ids
-        self.foreground_sampling_rate = foreground_sampling_rate
-        self.n_upds = n_upds
-        self.n_validate_examples = n_validate_examples
-        self.patch_shape = patch_shape
-
-        # Paths
-        self.img_paths_json = img_paths_json
-        self.swc_dir = swc_dir
-
-    def prepare_data(self):
-        pass
-
-    def setup(self, stage=None):
-        if stage == "fit" or stage is None:
-            self.train_dataset, self.val_dataset = init_datasets(
-                self.brain_ids,
-                self.img_paths_json,
-                self.swc_dir,
-                self.patch_shape,
-                self.n_validate_examples,
-                self.foreground_sampling_rate,
-            )
-
-    def train_dataloader(self):
-        train_dataloader = TrainN2VDataLoader(
-            self.train_dataset, batch_size=self.batch_size, n_upds=self.n_upds
-        )
-        return train_dataloader
-
-    def val_dataloader(self):
-        val_dataloader = ValidateN2VDataLoader(
-            self.val_dataset, batch_size=self.batch_size
-        )
-        return val_dataloader
 
 
 # --- Custom Datasets ---
@@ -134,7 +75,7 @@ class TrainDataset(Dataset):
 
     def __len__(self):
         """
-        Counts the number of whole-brain images in dataset.
+        Counts the number of whole-brain images in the dataset.
 
         Parameters
         ----------
@@ -142,8 +83,8 @@ class TrainDataset(Dataset):
 
         Returns
         -------
-        Number of whole-brain images in dataset.
-
+        int
+            Number of whole-brain images in the dataset.
         """
         return len(self.imgs)
 
@@ -200,7 +141,7 @@ class ValidateDataset(Dataset):
 
     def __len__(self):
         """
-        Counts the number of whole-brain images in dataset.
+        Counts the number of whole-brain images in the dataset.
 
         Parameters
         ----------
@@ -208,8 +149,8 @@ class ValidateDataset(Dataset):
 
         Returns
         -------
-        Number of whole-brain images in dataset.
-
+        int
+            Number of whole-brain images in the dataset.
         """
         return len(self.ids)
 
@@ -245,15 +186,40 @@ class DataLoader(ABC):
     """
     DataLoader that uses multithreading to fetch image patches from the cloud
     to form batches.
-
     """
 
     def __init__(self, dataset, batch_size=16):
+        """
+        Instantiates a DataLoader object.
+
+        Parameters
+        ----------
+        dataset : torch.utils.data.Dataset
+            Dataset to iterated over.
+        batch_size : int
+            Number of examples in each batch.
+
+        Returns
+        -------
+        None
+        """
         self.dataset = dataset
         self.batch_size = batch_size
         self.patch_shape = dataset.patch_shape
 
     def __iter__(self):
+        """
+        Iterates over the dataset and yields batches of examples.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        iterator
+            Yields batches of examples.
+        """
         for idx in self._get_iterator():
             yield self._load_batch(idx)
 
@@ -270,7 +236,6 @@ class TrainN2VDataLoader(DataLoader):
     """
     DataLoader that uses multithreading to fetch image patches from the cloud
     to form batches to train Noise2Void (N2V).
-
     """
 
     def __init__(self, dataset, batch_size=16, n_upds=100):
@@ -307,7 +272,6 @@ class TrainBM4DDataLoader(DataLoader):
     """
     DataLoader that uses multithreading to fetch image patches from the cloud
     to form batches.
-
     """
 
     def __init__(self, dataset, batch_size=8, n_upds=20):
@@ -324,7 +288,6 @@ class TrainBM4DDataLoader(DataLoader):
         Returns
         -------
         None
-
         """
         # Call parent class
         super().__init__(dataset, batch_size)
@@ -357,7 +320,6 @@ class ValidateN2VDataLoader(DataLoader):
     """
     DataLoader that uses multithreading to fetch image patches from the cloud
     to form batches.
-
     """
 
     def __init__(self, dataset, batch_size=8):
@@ -396,7 +358,6 @@ class ValidateBM4DDataLoader(DataLoader):
     """
     DataLoader that uses multiprocessing to fetch image patches from the cloud
     to form batches.
-
     """
 
     def __init__(self, dataset, batch_size=8):
@@ -475,7 +436,7 @@ def init_datasets(
 
 def to_tensor(arr):
     """
-    Converts a numpy array to a tensor.
+    Converts a numpy array to a torch tensor.
 
     Parameters
     ----------
@@ -485,7 +446,6 @@ def to_tensor(arr):
     Returns
     -------
     torch.Tensor
-        Array converted to tensor.
-
+        Array converted to a torch tensor.
     """
     return torch.tensor(arr, dtype=torch.float)
