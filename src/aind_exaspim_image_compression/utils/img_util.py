@@ -49,15 +49,20 @@ def read(img_path):
     np.ndarray
         Loaded image volume as a NumPy array.
     """
+    # Read image
     if ".zarr" in img_path:
-        return _read_zarr(img_path)
+        img = _read_zarr(img_path)
     elif ".n5" in img_path:
-        return _read_n5(img_path)
+        img = _read_n5(img_path)
     elif ".tif" in img_path or ".tiff" in img_path:
-        return _read_tiff(img_path)
+        img = _read_tiff(img_path)
     else:
         raise ValueError(f"Unsupported image format: {img_path}")
 
+    # Ensure shape is (1, 1, h, w, d)
+    while img.ndim < 5:
+        img = img[np.newaxis, ...]
+    return img
 
 def _read_zarr(img_path):
     """
@@ -521,7 +526,7 @@ def init_ome_zarr(
     zgroup = zarr.group(store=store)
 
     # Create top-level dataset
-    print("Creating OMEZARR Image with Shape:", shape)
+    print("Creating OME-ZARR Image with Shape:", shape)
     output_zarr = zgroup.create_dataset(
         name=0,
         shape=shape,
