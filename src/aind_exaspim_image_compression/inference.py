@@ -220,12 +220,12 @@ def generate_patch_starts(img, patch_size, overlap):
     generator
         Generates starting coordinates for image patches.
     """
-    coords = list()
     stride = patch_size - overlap
     for i in range(0, img.shape[2] - patch_size + stride, stride):
         for j in range(0, img.shape[3] - patch_size + stride, stride):
             for k in range(0, img.shape[4] - patch_size + stride, stride):
                 yield (i, j, k)
+
 
 def count_patches(img, patch_size, overlap):
     """

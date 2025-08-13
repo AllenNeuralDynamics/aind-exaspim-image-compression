@@ -10,11 +10,7 @@ Routines for loading data during training and inference.
 
 from abc import ABC, abstractmethod
 from aind_exaspim_dataset_utils.s3_util import get_img_prefix
-from concurrent.futures import (
-    ProcessPoolExecutor,
-    ThreadPoolExecutor,
-    as_completed,
-)
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from torch.utils.data import Dataset
 from tqdm import tqdm
@@ -48,9 +44,6 @@ class TrainDataset(Dataset):
         self.foreground_sampling_rate = foreground_sampling_rate
         self.patch_shape = patch_shape
         self.swc_reader = Reader()
-
-        # Ground truth denoising
-        
 
         # Data structures
         self.foreground = dict()

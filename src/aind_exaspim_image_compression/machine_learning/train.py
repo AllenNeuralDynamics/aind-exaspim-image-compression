@@ -71,14 +71,9 @@ class Trainer:
             val_loss, val_cratio, new_best = self.validate_model(
                 val_dataloader, epoch
             )
-            if new_best:
-                print(
-                    f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio} - New Best!"
-                )
-            else:
-                print(
-                    f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio}"
-                )
+            s = f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio}"
+            s += " - New Best!" if new_best else ""
+            print(s)
 
             # Step scheduler
             self.scheduler.step()

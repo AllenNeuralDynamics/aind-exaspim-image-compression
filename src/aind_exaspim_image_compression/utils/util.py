@@ -280,15 +280,14 @@ def find_subprefix_with_keyword(bucket_name, prefix, keyword):
 
 def get_gcs_directory_size(bucket_name, prefix):
     """
-    Calculate the total size of a GCS "directory" (i.e., objects under a prefix),
-    and return it in gigabytes (GB).
+    Calculate the total size of a GCS directory and return it in gigabytes.
 
     Parameters
     ----------
     bucket_name : str
         Name of the GCS bucket.
     prefix : str
-        GCS path prefix (e.g., 'my_folder/' to list everything under that directory).
+        GCS path prefix.
 
     Returns
     -------

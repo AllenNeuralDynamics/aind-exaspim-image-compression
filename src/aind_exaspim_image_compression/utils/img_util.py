@@ -15,18 +15,14 @@ from itertools import product
 from numcodecs import Blosc, register_codec
 from ome_zarr.writer import write_multiscale
 from scipy.ndimage import uniform_filter
-from typing import Any
 from xarray_multiscale import multiscale, windowed_mode
 
 import gcsfs
 import matplotlib.pyplot as plt
 import numpy as np
-import os
 import s3fs
 import tifffile
 import zarr
-
-from aind_exaspim_image_compression.utils import util
 
 
 # --- Image Reader ---
@@ -35,9 +31,9 @@ def read(img_path):
     Read an image volume from a supported path based on its extension.
 
     Supported formats:
-    - Zarr ('.zarr') from local, GCS, or S3
-    - N5 ('.n5') from local or GCS
-    - TIFF ('.tif', '.tiff') from local or GCS
+        - Zarr ('.zarr') from local, GCS, or S3
+        - N5 ('.n5') from local or GCS
+        - TIFF ('.tif', '.tiff') from local or GCS
 
     Parameters
     ----------
@@ -46,8 +42,8 @@ def read(img_path):
 
     Returns
     -------
-    np.ndarray
-        Loaded image volume as a NumPy array.
+    ArrayLike
+        Image volume.
     """
     # Read image
     if ".zarr" in img_path:
@@ -64,6 +60,7 @@ def read(img_path):
         img = img[np.newaxis, ...]
     return img
 
+
 def _read_zarr(img_path):
     """
     Read a Zarr volume from local disk, GCS, or S3.
@@ -75,8 +72,8 @@ def _read_zarr(img_path):
 
     Returns
     -------
-    np.ndarray
-        Loaded image volume.
+    zarr.ndarray
+        Image volume.
     """
     register_codec(Jpegxl)
     if _is_gcs_path(img_path):
@@ -101,8 +98,8 @@ def _read_n5(img_path):
 
     Returns
     -------
-    np.ndarray
-        N5 group volume stored at key "volume".
+    zarr.ndarray
+        Image volume.
     """
     if _is_gcs_path(img_path):
         fs = gcsfs.GCSFileSystem(anon=False)
@@ -129,7 +126,7 @@ def _read_tiff(img_path, storage_options=None):
     Returns
     -------
     np.ndarray
-        Image data from the TIFF file.
+        Image volume.
     """
     if _is_gcs_path(img_path):
         fs = gcsfs.GCSFileSystem(**(storage_options or {}))
@@ -150,6 +147,7 @@ def _is_gcs_path(path):
     Returns
     -------
     bool
+        Indication of whether the path is a GCS path.
     """
     return path.startswith("gs://")
 
@@ -165,12 +163,13 @@ def _is_s3_path(path):
     Returns
     -------
     bool
+        Indication of whether the path is an S3 path.
     """
     return path.startswith("s3://")
 
 
 # --- Read Patches ---
-def get_patch(img, voxel, shape, from_center=True):
+def get_patch(img, voxel, shape, is_center=True):
     """
     Extracts a patch from an image based on the given voxel coordinate and
     patch shape.
@@ -183,7 +182,7 @@ def get_patch(img, voxel, shape, from_center=True):
         Voxel coordinate used to extract patch.
     shape : Tuple[int]
         Shape of the image patch to extract.
-    from_center : bool, optional
+    is_center : bool, optional
         Indicates whether the given voxel is the center or top, left, front
         corner of the patch to be extracted.
 
@@ -193,7 +192,7 @@ def get_patch(img, voxel, shape, from_center=True):
         Patch extracted from the given image.
     """
     # Get image patch coordiantes
-    start, end = get_start_end(voxel, shape, from_center=from_center)
+    start, end = get_start_end(voxel, shape, is_center=is_center)
     valid_start = any([s >= 0 for s in start])
     valid_end = any([e < img.shape[i + 2] for i, e in enumerate(end)])
 
@@ -224,7 +223,7 @@ def calculate_offsets(img, window_shape, overlap):
     Returns
     -------
     List[Tuple[int]]
-        List of 3D voxel coordinates that represent the front-top-left corner.
+        3D voxel coordinates that represent the front-top-left corner.
     """
     # Calculate stride based on the overlap and window size
     stride = tuple(w - o for w, o in zip(window_shape, overlap))
@@ -243,7 +242,7 @@ def calculate_offsets(img, window_shape, overlap):
     return coords
 
 
-def get_start_end(voxel, shape, from_center=True):
+def get_start_end(voxel, shape, is_center=True):
     """
     Gets the start and end indices of the image patch to be read.
 
@@ -254,7 +253,7 @@ def get_start_end(voxel, shape, from_center=True):
         corner of the patch to be read.
     shape : Tuple[int]
         Shape of the image patch to be read.
-    from_center : bool, optional
+    is_center : bool, optional
         Indication of whether the provided coordinates represent the center of
         the patch or the front-top-left corner. Default is True.
 
@@ -263,12 +262,8 @@ def get_start_end(voxel, shape, from_center=True):
     Tuple[List[int]]
         Start and end indices of the image patch to be read.
     """
-    if from_center:
-        start = [voxel[i] - shape[i] // 2 for i in range(3)]
-        end = [voxel[i] + shape[i] // 2 for i in range(3)]
-    else:
-        start = voxel
-        end = [voxel[i] + shape[i] for i in range(3)]
+    start = [v - d // 2 for v, d in zip(voxel, shape)] if is_center else voxel
+    end = [voxel[i] + shape[i] // 2 for i in range(3)]
     return start, end
 
 
