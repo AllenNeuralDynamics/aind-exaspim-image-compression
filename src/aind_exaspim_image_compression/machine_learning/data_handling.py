@@ -1,5 +1,5 @@
 """
-Created on Thu Dec 5 14:00:00 2024
+Created on Jan 3 12:30:00 2025
 
 @author: Anna Grim
 @email: anna.grim@alleninstitute.org
@@ -9,7 +9,7 @@ Routines for loading data during training and inference.
 """
 
 from abc import ABC, abstractmethod
-from careamics.transforms.n2v_manipulate import N2VManipulate
+from aind_exaspim_dataset_utils.s3_util import get_img_prefix
 from concurrent.futures import (
     ProcessPoolExecutor,
     ThreadPoolExecutor,
@@ -24,15 +24,16 @@ import random
 import torch
 
 from aind_exaspim_image_compression.utils import img_util, util
+from aind_exaspim_image_compression.utils.img_util import BM4D
 from aind_exaspim_image_compression.utils.swc_util import Reader
 
 
 # --- Custom Datasets ---
 class TrainDataset(Dataset):
+
     def __init__(
         self,
         patch_shape,
-        transform,
         anisotropy=(0.748, 0.748, 1.0),
         boundary_buffer=4000,
         foreground_sampling_rate=0.5,
@@ -43,15 +44,19 @@ class TrainDataset(Dataset):
         # Class attributes
         self.anisotropy = anisotropy
         self.boundary_buffer = boundary_buffer
+        self.denoise_bm4d = BM4D()
         self.foreground_sampling_rate = foreground_sampling_rate
         self.patch_shape = patch_shape
         self.swc_reader = Reader()
-        self.transform = transform
+
+        # Ground truth denoising
+        
 
         # Data structures
         self.foreground = dict()
         self.imgs = dict()
 
+    # --- Ingest data ---
     def ingest_img(self, brain_id, img_path, swc_pointer):
         self.foreground[brain_id] = self.ingest_swcs(swc_pointer)
         self.imgs[brain_id] = img_util.read(img_path)
@@ -73,25 +78,11 @@ class TrainDataset(Dataset):
                 return foreground
         return set()
 
-    def __len__(self):
-        """
-        Counts the number of whole-brain images in the dataset.
-
-        Parameters
-        ----------
-        None
-
-        Returns
-        -------
-        int
-            Number of whole-brain images in the dataset.
-        """
-        return len(self.imgs)
-
+    # --- Core Routines ---
     def __getitem__(self, dummy_input):
         brain_id = self.sample_brain()
         voxel = self.sample_voxel(brain_id)
-        return self.transform(self.get_patch(brain_id, voxel))
+        return self.denoise_bm4d(self.get_patch(brain_id, voxel))
 
     def sample_brain(self):
         return util.sample_once(self.imgs.keys())
@@ -110,6 +101,21 @@ class TrainDataset(Dataset):
             return tuple(voxel)
 
     # --- Helpers ---
+    def __len__(self):
+        """
+        Counts the number of whole-brain images in the dataset.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        int
+            Number of whole-brain images in the dataset.
+        """
+        return len(self.imgs)
+
     def get_patch(self, brain_id, voxel):
         s, e = img_util.get_start_end(voxel, self.patch_shape)
         return self.imgs[brain_id][0, 0, s[0]: e[0], s[1]: e[1], s[2]: e[2]]
@@ -124,13 +130,14 @@ class TrainDataset(Dataset):
 
 
 class ValidateDataset(Dataset):
-    def __init__(self, patch_shape, transform):
+
+    def __init__(self, patch_shape):
         # Call parent class
         super(ValidateDataset, self).__init__()
 
         # Instance attributes
         self.patch_shape = patch_shape
-        self.transform = transform
+        self.denoise_bm4d = BM4D()
 
         # Data structures
         self.ids = list()
@@ -159,7 +166,7 @@ class ValidateDataset(Dataset):
 
     def ingest_example(self, brain_id, voxel):
         # Get clean image
-        noise, denoised, mn_mx = self.transform(
+        noise, denoised, mn_mx = self.denoise_bm4d(
             self.get_patch(brain_id, voxel)
         )
 
@@ -203,6 +210,7 @@ class DataLoader(ABC):
         -------
         None
         """
+        # Instance attributes
         self.dataset = dataset
         self.batch_size = batch_size
         self.patch_shape = dataset.patch_shape
@@ -232,43 +240,7 @@ class DataLoader(ABC):
         pass
 
 
-class TrainN2VDataLoader(DataLoader):
-    """
-    DataLoader that uses multithreading to fetch image patches from the cloud
-    to form batches to train Noise2Void (N2V).
-    """
-
-    def __init__(self, dataset, batch_size=16, n_upds=100):
-        # Call parent class
-        super().__init__(dataset, batch_size)
-
-        # Instance attributes
-        self.n_upds = n_upds
-
-    def _get_iterator(self):
-        return range(self.n_upds)
-
-    def _load_batch(self, dummy_input):
-        with ThreadPoolExecutor() as executor:
-            # Assign threads
-            threads = list()
-            for _ in range(self.batch_size):
-                threads.append(executor.submit(self.dataset.__getitem__, -1))
-
-            # Process results
-            shape = (self.batch_size, 1,) + self.patch_shape
-            masked_patches = np.zeros(shape)
-            patches = np.zeros(shape)
-            masks = np.zeros(shape)
-            for i, thread in enumerate(as_completed(threads)):
-                masked_patch, patch, mask = thread.result()
-                masked_patches[i, 0, ...] = masked_patch
-                patches[i, 0, ...] = patch
-                masks[i, 0, ...] = mask
-        return to_tensor(masked_patches), to_tensor(patches), to_tensor(masks)
-
-
-class TrainBM4DDataLoader(DataLoader):
+class TrainDataLoader(DataLoader):
     """
     DataLoader that uses multithreading to fetch image patches from the cloud
     to form batches.
@@ -282,8 +254,11 @@ class TrainBM4DDataLoader(DataLoader):
         ----------
         dataset : Dataset.ProposalDataset
             Instance of custom dataset.
-        batch_size : int
-            Number of samples per batch.
+        batch_size : int, optional
+            Number of samples per batch. Default is 8.
+        n_upds : int, optional
+            Number of back propagation gradient updates before validating the
+            model. Default is 20.
 
         Returns
         -------
@@ -316,45 +291,7 @@ class TrainBM4DDataLoader(DataLoader):
         return to_tensor(noise_patches), to_tensor(clean_patches), None
 
 
-class ValidateN2VDataLoader(DataLoader):
-    """
-    DataLoader that uses multithreading to fetch image patches from the cloud
-    to form batches.
-    """
-
-    def __init__(self, dataset, batch_size=8):
-        super().__init__(dataset, batch_size)
-
-    def _get_iterator(self):
-        return range(0, len(self.dataset), self.batch_size)
-
-    def _load_batch(self, start_idx):
-        # Compute batch size
-        n_remaining_examples = len(self.dataset) - start_idx
-        batch_size = min(self.batch_size, n_remaining_examples)
-
-        # Generate batch
-        with ThreadPoolExecutor() as executor:
-            # Assign threads
-            threads = list()
-            for idx_shift in range(batch_size):
-                idx = start_idx + idx_shift
-                threads.append(executor.submit(self.dataset.__getitem__, idx))
-
-            # Process results
-            shape = (batch_size, 1,) + self.patch_shape
-            masked_patches = np.zeros(shape)
-            patches = np.zeros(shape)
-            masks = np.zeros(shape)
-            for i, thread in enumerate(as_completed(threads)):
-                masked_patch, patch, mask = thread.result()
-                masked_patches[i, 0, ...] = masked_patch
-                patches[i, 0, ...] = patch
-                masks[i, 0, ...] = mask
-        return to_tensor(masked_patches), to_tensor(patches), to_tensor(masks)
-
-
-class ValidateBM4DDataLoader(DataLoader):
+class ValidateDataLoader(DataLoader):
     """
     DataLoader that uses multiprocessing to fetch image patches from the cloud
     to form batches.
@@ -399,30 +336,30 @@ def init_datasets(
     brain_ids,
     img_paths_json,
     patch_shape,
-    n_validate_examples,
     foreground_sampling_rate=0.5,
-    method="bm4d",
+    n_validate_examples=0,
     swc_dict=None
 ):
     # Initializations
-    transform = N2VManipulate() if method == "n2v" else img_util.BM4D()
     train_dataset = TrainDataset(
-        patch_shape,
-        transform,
-        foreground_sampling_rate=foreground_sampling_rate,
+        patch_shape, foreground_sampling_rate=foreground_sampling_rate,
     )
-    val_dataset = ValidateDataset(patch_shape, transform)
+    val_dataset = ValidateDataset(patch_shape)
 
     # Load data
     for brain_id in tqdm(brain_ids, desc="Load Data"):
-        img_path = img_util.get_img_prefix(brain_id, img_paths_json)
+        # Set image path
+        img_path = get_img_prefix(brain_id, img_paths_json)
         img_path += str(0)
+
+        # Set SWC path
         if swc_dict:
             swc_pointer = deepcopy(swc_dict)
             swc_pointer["path"] += f"/{brain_id}/world"
         else:
             swc_pointer = None
 
+        # Ingest data
         train_dataset.ingest_img(brain_id, img_path, swc_pointer)
         val_dataset.ingest_img(brain_id, img_path)
 
@@ -436,7 +373,7 @@ def init_datasets(
 
 def to_tensor(arr):
     """
-    Converts a numpy array to a torch tensor.
+    Converts the given numpy array to a torch tensor.
 
     Parameters
     ----------

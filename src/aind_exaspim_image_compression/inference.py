@@ -4,18 +4,13 @@ Created on Wed April 30 14:00:00 2025
 @author: Anna Grim
 @email: anna.grim@alleninstitute.org
 
-Denoising routines for 3D microscopy images using patch-based deep learning
-inference. Includes functions to extract overlapping patches, normalize and
-batch process them through a model on GPU, and stitch denoised patches back
-into a full 3D volume.
+Code for using BM4D-Net to denoise 3D micrscopy images. Includes routines to
+extract overlapping patches, normalize and batch process them through a model
+on GPU, and stitch denoised patches back into a full 3D volume.
 
 """
 
-from concurrent.futures import (
-    ThreadPoolExecutor,
-    as_completed,
-)
-from numcodecs import blosc
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 import itertools
@@ -37,8 +32,8 @@ def predict(
     verbose=True
 ):
     """
-    Denoises a 3D image by processing patches in batches and running deep
-    learning model.
+    Denoises a 3D image by tiling it into overlapping patches, forming batches
+    of patches, and processing each batch through the given model.
 
     Parameters
     ----------
@@ -52,8 +47,11 @@ def predict(
         Size of the cubic patch extracted from the image. Default is 64.
     overlap : int, optional
         Number of voxels to overlap between patches. Default is 16.
+    trim : int, optional
+        Number of voxels from the image boundary that are set to zero to
+        suppress noisy edge predictions. Default is 5.
     verbose : bool, optional
-        Whether to show a tqdm progress bar. Default is True.
+        Whether to show a progress bar. Default is True.
 
     Returns
     -------
@@ -65,7 +63,7 @@ def predict(
         img = img[np.newaxis, ...]
 
     # Initializations
-    starts_generator = generate_patch_starts(img, patch_size, overlap)
+    patch_starts_generator = generate_patch_starts(img, patch_size, overlap)
     n_starts = count_patches(img, patch_size, overlap)
     if denoised is None:
         denoised = np.zeros_like(img, dtype=np.uint16)
@@ -73,8 +71,8 @@ def predict(
     # Main
     pbar = tqdm(total=n_starts, desc="Denoise") if verbose else None
     for i in range(0, n_starts, batch_size):
-        # Run model
-        starts = list(itertools.islice(starts_generator, batch_size))
+        # Extract batch and run model
+        starts = list(itertools.islice(patch_starts_generator, batch_size))
         patches = _predict_batch(img, model, starts, patch_size, trim)
 
         # Store result
@@ -166,6 +164,7 @@ def _predict_batch(img, model, starts, patch_size, trim=5):
         with torch.no_grad():
             outputs = model(inputs).cpu().squeeze(1).numpy()
 
+        # Process results
         N = outputs.shape[0]
         start, end = trim, patch_size - trim
         final_shape = (end - start,) * 3

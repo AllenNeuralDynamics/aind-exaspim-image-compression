@@ -32,7 +32,8 @@ dependencies = [
     'torchvision',
     'tqdm',
     'xarray_multiscale',
-    'zarr'
+    'zarr',
+    "aind-exaspim-image-utils @ git+https://github.com/AllenNeuralDynamics/aind-exaspim-dataset-utils.git@main"
 ]
 
 [project.optional-dependencies]
