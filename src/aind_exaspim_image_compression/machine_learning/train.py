@@ -88,11 +88,13 @@ class Trainer:
         for epoch in range(self.max_epochs):
             # Updates
             train_loss = self.train_step(train_dataloader, epoch)
-            val_loss, val_cratio, new_best = self.validate_step(
+            val_loss, val_cratio, is_best = self.validate_step(
                 val_dataloader, epoch
             )
-            s = f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio}"
-            s += " - New Best!" if new_best else ""
+
+            # Report results
+            suffix = " - New Best!" if is_best else ""
+            s = f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio}" + suffix
             print(s)
 
             # Step scheduler
@@ -150,8 +152,8 @@ class Trainer:
 
         # Check if current model is best so far
         if loss < self.best_l1:
-            self.save_model(epoch)
             self.best_l1 = loss
+            self.save_model(epoch)
             return loss, cratio, True
         else:
             return loss, cratio, False
@@ -182,12 +184,16 @@ class Trainer:
 
     # --- Helpers ---
     def compute_cratios(self, imgs, mn_mx):
+        import tifffile
+
         cratios = list()
         imgs = np.array(imgs.detach().cpu())
         for i in range(imgs.shape[0]):
             mn, mx = tuple(mn_mx[i, :])
             img = imgs[i, 0, ...] * mx + mn
             cratios.append(img_util.compute_cratio(img, self.codec))
+            if i < 10:
+                tifffile.imwrite(f"{i}.tiff", img.astype(np.uint16))
         return cratios
 
     def save_model(self, epoch):
