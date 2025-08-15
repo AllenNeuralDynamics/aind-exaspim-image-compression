@@ -8,7 +8,6 @@ Helper routines for working with images.
 
 """
 
-from bm4d import bm4d
 from concurrent.futures import ThreadPoolExecutor
 from imagecodecs.numcodecs import Jpegxl
 from itertools import product
@@ -25,7 +24,7 @@ import tifffile
 import zarr
 
 
-# --- Image Reader ---
+# --- Readers ---
 def read(img_path):
     """
     Read an image volume from a supported path based on its extension.
@@ -334,48 +333,6 @@ def local_to_physical(local_voxel, offset, multiscale):
 
 
 # --- Compression utils ---
-class BM4D:
-    """
-    A simple wrapper for BM4D denoising of 3D volumetric data.
-    """
-    def __init__(self, sigma=50):
-        """
-        Initialize the BM4D denoiser.
-
-        Parameters
-        ----------
-        sigma : float, optional
-            Noise standard deviation used for denoising.
-
-        Returns
-        -------
-        None
-        """
-        self.sigma = sigma
-
-    def __call__(self, noise):
-        """
-        Apply BM4D denoising to the input volume.
-
-        Parameters
-        ----------
-        noise : np.ndarray
-            A 3D NumPy array representing the noisy input volume.
-
-        Returns
-        -------
-        tuple
-            A 3-tuple containing:
-            - normalized input volume (np.ndarray)
-            - normalized denoised volume (np.ndarray)
-            - normalization parameters (tuple): (mn, mx)
-        """
-        mn, mx = np.percentile(noise, 5), np.percentile(noise, 99.9)
-        mx = max(1, mx)
-        denoised = bm4d(noise, self.sigma)
-        return (noise - mn) / mx, (denoised - mn) / mx, (mn, mx)
-
-
 def compute_cratio(img, codec, patch_shape=(64, 64, 64)):
     """
     Computes a Zarr-style chunked compression ratio for a given image.
@@ -410,7 +367,7 @@ def compute_cratio(img, codec, patch_shape=(64, 64, 64)):
                 slice_ = img[
                     z0: z0 + patch_shape[0],
                     z1: z1 + patch_shape[1],
-                    z2: z2 + patch_shape[2] if len(z) > 2 else slice(None),
+                    z2: z2 + patch_shape[2],
                 ]
                 chunk = np.ascontiguousarray(slice_)
                 compressed = codec.encode(chunk)
@@ -475,18 +432,18 @@ def compress_and_decompress_jpeg(
     chunk_coords = list(product(*chunk_ranges))
 
     # Compute chunked ratio
-    decompressed_img = np.empty_like(img)
+    img_decompressed = np.empty_like(img)
     total_uncompressed = 0
     total_compressed = 0
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         iterator = pool.map(process_patch, chunk_coords)
         for slices, ubytes, cbytes, decompressed_patch in iterator:
-            decompressed_img[slices] = decompressed_patch
+            img_decompressed[slices] = decompressed_patch
             total_uncompressed += ubytes
             total_compressed += cbytes
 
     cratio = round(total_uncompressed / total_compressed, 2)
-    return decompressed_img, cratio
+    return img_decompressed, cratio
 
 
 # --- Helpers ---

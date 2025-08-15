@@ -9,6 +9,7 @@ Routines for loading data during training and inference.
 """
 
 from aind_exaspim_dataset_utils.s3_util import get_img_prefix
+from bm4d import bm4d
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from torch.utils.data import Dataset
@@ -19,7 +20,6 @@ import random
 import torch
 
 from aind_exaspim_image_compression.utils import img_util, util
-from aind_exaspim_image_compression.utils.img_util import BM4D
 from aind_exaspim_image_compression.utils.swc_util import Reader
 
 
@@ -38,9 +38,9 @@ class TrainDataset(Dataset):
         patch_shape,
         anisotropy=(0.748, 0.748, 1.0),
         boundary_buffer=4000,
-        foreground_sampling_rate=0.5,
-        n_examples_per_epoch=100,
-        sigma=50,
+        foreground_sampling_rate=0.2,
+        n_examples_per_epoch=200,
+        sigma_bm4d=50,
     ):
         # Call parent class
         super(TrainDataset, self).__init__()
@@ -48,10 +48,10 @@ class TrainDataset(Dataset):
         # Class attributes
         self.anisotropy = anisotropy
         self.boundary_buffer = boundary_buffer
-        self.denoise_bm4d = BM4D(sigma=sigma)
         self.foreground_sampling_rate = foreground_sampling_rate
         self.n_examples_per_epoch = n_examples_per_epoch
         self.patch_shape = patch_shape
+        self.sigma_bm4d = sigma_bm4d
         self.swc_reader = Reader()
 
         # Data structures
@@ -82,35 +82,61 @@ class TrainDataset(Dataset):
 
     # --- Core Routines ---
     def __getitem__(self, dummy_input):
+        # Sample image patch
         brain_id = self.sample_brain()
         voxel = self.sample_voxel(brain_id)
-        return self.denoise_bm4d(self.get_patch(brain_id, voxel))
+        noise = self.get_patch(brain_id, voxel)
+        mn, mx = np.percentile(noise, 5), np.percentile(noise, 99.9)
+
+        # Denoise image patch
+        denoised = bm4d(noise, self.sigma_bm4d)
+
+        # Normalize image patches
+        noise = (noise - mn) / max(mx, 1)
+        denoised = (denoised - mn) / max(mx, 1)
+        return noise, denoised, (mn, mx)
 
     def sample_brain(self):
+        """
+        Samples a brain ID from the loaded images.
+
+        Returns
+        -------
+        brain_id : str
+            Unique identifier of the sampled brain.
+        """
         return util.sample_once(self.imgs.keys())
 
     def sample_voxel(self, brain_id):
-        sample_foreground = random.random() < self.foreground_sampling_rate
-        if sample_foreground and len(self.foreground[brain_id]) > 0:
+        if random.random() < self.foreground_sampling_rate:
+            return self.sample_foreground_voxel(brain_id)
+        else:
+            return self.sample_interior_voxel(brain_id)
+
+    def sample_foreground_voxel(self, brain_id):
+        if len(self.foreground[brain_id]) > 0:
             idx = random.randint(0, len(self.foreground[brain_id]) - 1)
             shift = np.random.randint(0, 16, size=3)
             return tuple(self.foreground[brain_id][idx] + shift)
         else:
-            voxel = list()
-            for s in self.imgs[brain_id].shape[2::]:
-                upper = s - self.boundary_buffer
-                voxel.append(random.randint(self.boundary_buffer, upper))
-            return tuple(voxel)
+            return self.sample_interior_voxel(brain_id)
+
+    def sample_interior_voxel(self, brain_id):
+        voxel = list()
+        for s in self.imgs[brain_id].shape[2::]:
+            upper = s - self.boundary_buffer
+            voxel.append(random.randint(self.boundary_buffer, upper))
+        return tuple(voxel)
 
     # --- Helpers ---
     def __len__(self):
         """
-        Counts the number of whole-brain images in the dataset.
+        Gets the number of training examples used in each epoch.
 
         Returns
         -------
         int
-            Number of whole-brain images in the dataset.
+            Number of training examples used in each epoch.
         """
         return self.n_examples_per_epoch
 
@@ -129,16 +155,26 @@ class TrainDataset(Dataset):
 
 class ValidateDataset(Dataset):
 
-    def __init__(self, patch_shape):
+    def __init__(self, patch_shape, sigma_bm4d=50):
+        """
+        Instantiates a ValidateDataset object.
+
+        Parameters
+        ----------
+        patch_shape : Tuple[int]
+            Shape of image patches to be extracted.
+        sigma_bm4d : float
+            Smoothing parameter used in the BM4D denoising algorithm.
+        """
         # Call parent class
         super(ValidateDataset, self).__init__()
 
         # Instance attributes
         self.patch_shape = patch_shape
-        self.denoise_bm4d = BM4D()
+        self.sigma_bm4d = sigma_bm4d
 
         # Data structures
-        self.ids = list()
+        self.example_ids = list()
         self.imgs = dict()
         self.denoised = list()
         self.noise = list()
@@ -146,40 +182,78 @@ class ValidateDataset(Dataset):
 
     def __len__(self):
         """
-        Counts the number of whole-brain images in the dataset.
+        Counts the number of examples in the dataset.
 
         Returns
         -------
         int
-            Number of whole-brain images in the dataset.
+            Number of examples in the dataset.
         """
-        return len(self.ids)
+        return len(self.example_ids)
 
     def ingest_brain(self, brain_id, img_path):
+        """
+        Loads a brain image and stores it in the internal image dictionary.
+
+        Parameters
+        ----------
+        brain_id : hashable
+            Unique identifier for the brain corresponding to the image.
+        img_path : str or Path
+            Path to whole-brain image to be read.
+        """
         self.imgs[brain_id] = img_util.read(img_path)
 
     def ingest_example(self, brain_id, voxel):
-        # Get clean image
-        noise, denoised, mn_mx = self.denoise_bm4d(
-            self.get_patch(brain_id, voxel)
-        )
+        """
+        Extracts, denoises, normalizes, and stores an image patch from a brain
+        volume.
+
+        Parameters
+        ----------
+        brain_id : hashable
+            Unique identifier of the brain from which to extract the patch.
+        voxel : Tuple[int]
+            Voxel coordinates of the patch center in the brain volume.
+        """
+        # Get image patches
+        noise = self.get_patch(brain_id, voxel)
+        mn, mx = np.percentile(noise, 5), np.percentile(noise, 99.9)
+        denoised = bm4d(noise, self.sigma_bm4d)
+
+        # Normalize image patches
+        noise = (noise - mn) / max(mx, 1)
+        denoised = (denoised - mn) / max(mx, 1)
 
         # Store results
-        self.ids.append((brain_id, voxel))
-        self.denoised.append(denoised)
+        self.example_ids.append((brain_id, voxel))
         self.noise.append(noise)
-        self.mn_mxs.append(mn_mx)
+        self.denoised.append(denoised)
+        self.mn_mxs.append((mn, mx))
 
     def __getitem__(self, idx):
+        """
+        Retrieves a single example from the dataset.
+
+        Parameters
+        ----------
+        idx : int
+            Index of the sample to retrieve.
+
+        Returns
+        -------
+        tuple
+            A tuple containing:
+            - noise (ndarray): Noisy image patch at the given index.
+            - denoised (ndarray): Corresponding denoised image patch.
+            - mn_mx (tuple or ndarray): Minimum and maximum values used for
+              normalization of the image patches.
+        """
         return self.noise[idx], self.denoised[idx], self.mn_mxs[idx]
 
-    # --- Helpers ---
     def get_patch(self, brain_id, voxel):
         s, e = img_util.get_start_end(voxel, self.patch_shape)
-        patch = self.imgs[brain_id][
-            0, 0, s[0]: e[0], s[1]: e[1], s[2]: e[2]
-        ]
-        return patch
+        return self.imgs[brain_id][0, 0, s[0]: e[0], s[1]: e[1], s[2]: e[2]]
 
 
 # --- Custom Dataloader ---
@@ -252,6 +326,7 @@ def init_datasets(
     foreground_sampling_rate=0.5,
     n_train_examples_per_epoch=100,
     n_validate_examples=0,
+    sigma_bm4d=50,
     swc_dict=None
 ):
     # Initializations
@@ -259,6 +334,7 @@ def init_datasets(
         patch_shape,
         foreground_sampling_rate=foreground_sampling_rate,
         n_examples_per_epoch=n_train_examples_per_epoch,
+        sigma_bm4d=sigma_bm4d
     )
     val_dataset = ValidateDataset(patch_shape)
 
