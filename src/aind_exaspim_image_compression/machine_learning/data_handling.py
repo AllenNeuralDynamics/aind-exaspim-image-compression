@@ -32,7 +32,7 @@ class TrainDataset(Dataset):
         patch_shape,
         anisotropy=(0.748, 0.748, 1.0),
         boundary_buffer=4000,
-        foreground_sampling_rate=0.5,
+        foreground_sampling_rate=0.25,
     ):
         # Call parent class
         super(TrainDataset, self).__init__()
@@ -98,10 +98,6 @@ class TrainDataset(Dataset):
         """
         Counts the number of whole-brain images in the dataset.
 
-        Parameters
-        ----------
-        None
-
         Returns
         -------
         int
@@ -142,10 +138,6 @@ class ValidateDataset(Dataset):
     def __len__(self):
         """
         Counts the number of whole-brain images in the dataset.
-
-        Parameters
-        ----------
-        None
 
         Returns
         -------
@@ -212,10 +204,6 @@ class DataLoader(ABC):
         """
         Iterates over the dataset and yields batches of examples.
 
-        Parameters
-        ----------
-        None
-
         Returns
         -------
         iterator
@@ -252,10 +240,6 @@ class TrainDataLoader(DataLoader):
         n_upds : int, optional
             Number of back propagation gradient updates before validating the
             model. Default is 20.
-
-        Returns
-        -------
-        None
         """
         # Call parent class
         super().__init__(dataset, batch_size)
