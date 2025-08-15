@@ -338,7 +338,7 @@ class BM4D:
     """
     A simple wrapper for BM4D denoising of 3D volumetric data.
     """
-    def __init__(self, sigma=60):
+    def __init__(self, sigma=50):
         """
         Initialize the BM4D denoiser.
 

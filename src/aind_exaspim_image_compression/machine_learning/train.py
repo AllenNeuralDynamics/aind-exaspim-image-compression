@@ -21,8 +21,8 @@ import torch.optim as optim
 
 from aind_exaspim_image_compression.machine_learning.unet3d import UNet
 from aind_exaspim_image_compression.machine_learning.data_handling import (
-    TrainBM4DDataLoader,
-    ValidateBM4DDataLoader,
+    TrainDataLoader,
+    ValidateDataLoader,
 )
 from aind_exaspim_image_compression.utils import img_util, util
 
@@ -55,10 +55,10 @@ class Trainer:
     def run(self, train_dataset, val_dataset, n_upds=25):
         # Initializations
         print("Experiment:", os.path.basename(os.path.normpath(self.log_dir)))
-        train_dataloader = TrainBM4DDataLoader(
+        train_dataloader = TrainDataLoader(
             train_dataset, batch_size=self.batch_size, n_upds=n_upds
         )
-        val_dataloader = ValidateBM4DDataLoader(
+        val_dataloader = ValidateDataLoader(
             val_dataset,
             batch_size=self.batch_size,
         )

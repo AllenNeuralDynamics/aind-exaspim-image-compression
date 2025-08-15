@@ -28,12 +28,13 @@ dependencies = [
     'scikit-image',
     'scikit-learn',
     'scipy',
+    'tensorboard',
     'torch',
     'torchvision',
     'tqdm',
     'xarray_multiscale',
     'zarr',
-    "aind-exaspim-image-utils @ git+https://github.com/AllenNeuralDynamics/aind-exaspim-dataset-utils.git@main"
+    "aind-exaspim-dataset-utils @ git+https://github.com/AllenNeuralDynamics/aind-exaspim-dataset-utils.git@main"
 ]
 
 [project.optional-dependencies]
