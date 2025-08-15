@@ -8,7 +8,6 @@ Routines for loading data during training and inference.
 
 """
 
-from abc import ABC, abstractmethod
 from aind_exaspim_dataset_utils.s3_util import get_img_prefix
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
@@ -40,6 +39,7 @@ class TrainDataset(Dataset):
         anisotropy=(0.748, 0.748, 1.0),
         boundary_buffer=4000,
         foreground_sampling_rate=0.5,
+        n_examples_per_epoch=100,
         sigma=50,
     ):
         # Call parent class
@@ -50,6 +50,7 @@ class TrainDataset(Dataset):
         self.boundary_buffer = boundary_buffer
         self.denoise_bm4d = BM4D(sigma=sigma)
         self.foreground_sampling_rate = foreground_sampling_rate
+        self.n_examples_per_epoch = n_examples_per_epoch
         self.patch_shape = patch_shape
         self.swc_reader = Reader()
 
@@ -111,7 +112,7 @@ class TrainDataset(Dataset):
         int
             Number of whole-brain images in the dataset.
         """
-        return len(self.imgs)
+        return self.n_examples_per_epoch
 
     def get_patch(self, brain_id, voxel):
         s, e = img_util.get_start_end(voxel, self.patch_shape)
@@ -181,8 +182,8 @@ class ValidateDataset(Dataset):
         return patch
 
 
-# --- Custom Dataloaders ---
-class DataLoader(ABC):
+# --- Custom Dataloader ---
+class DataLoader:
     """
     DataLoader that uses multithreading to fetch image patches from the cloud
     to form batches.
@@ -213,76 +214,8 @@ class DataLoader(ABC):
         iterator
             Yields batches of examples.
         """
-        for idx in self._get_iterator():
+        for idx in range(0, len(self.dataset), self.batch_size):
             yield self._load_batch(idx)
-
-    @abstractmethod
-    def _get_iterator(self):
-        pass
-
-    @abstractmethod
-    def _load_batch(self, idx):
-        pass
-
-
-class TrainDataLoader(DataLoader):
-    """
-    DataLoader that uses multithreading to fetch image patches from the cloud
-    to form batches.
-    """
-
-    def __init__(self, dataset, batch_size=8, n_upds=20):
-        """
-        Constructs a multithreaded data loader.
-
-        Parameters
-        ----------
-        dataset : Dataset.ProposalDataset
-            Instance of custom dataset.
-        batch_size : int, optional
-            Number of samples per batch. Default is 8.
-        n_upds : int, optional
-            Number of back propagation gradient updates before validating the
-            model. Default is 20.
-        """
-        # Call parent class
-        super().__init__(dataset, batch_size)
-
-        # Instance attributes
-        self.n_upds = n_upds
-
-    def _get_iterator(self):
-        return range(self.n_upds)
-
-    def _load_batch(self, dummy_input):
-        with ProcessPoolExecutor() as executor:
-            # Assign processes
-            processes = list()
-            for _ in range(self.batch_size):
-                processes.append(executor.submit(self.dataset.__getitem__, -1))
-
-            # Process results
-            shape = (self.batch_size, 1,) + self.patch_shape
-            noise_patches = np.zeros(shape)
-            clean_patches = np.zeros(shape)
-            for i, process in enumerate(as_completed(processes)):
-                noise, clean, _ = process.result()
-                noise_patches[i, 0, ...] = noise
-                clean_patches[i, 0, ...] = clean
-        return to_tensor(noise_patches), to_tensor(clean_patches), None
-
-
-class ValidateDataLoader(DataLoader):
-    """
-    DataLoader that uses multiprocessing to fetch image patches from the cloud
-    to form batches.
-    """
-
-    def __init__(self, dataset, batch_size=8):
-        super().__init__(dataset, batch_size)
-
-    def _get_iterator(self):
-        return range(0, len(self.dataset), self.batch_size)
 
     def _load_batch(self, start_idx):
         # Compute batch size
@@ -293,8 +226,7 @@ class ValidateDataLoader(DataLoader):
         with ProcessPoolExecutor() as executor:
             # Assign processs
             processes = list()
-            for idx_shift in range(batch_size):
-                idx = start_idx + idx_shift
+            for idx in range(start_idx, start_idx + batch_size):
                 processes.append(
                     executor.submit(self.dataset.__getitem__, idx)
                 )
@@ -302,14 +234,14 @@ class ValidateDataLoader(DataLoader):
             # Process results
             shape = (batch_size, 1,) + self.patch_shape
             noise_patches = np.zeros(shape)
-            clean_patches = np.zeros(shape)
+            denoised_patches = np.zeros(shape)
             mn_mxs = np.zeros((self.batch_size, 2))
             for i, process in enumerate(as_completed(processes)):
-                noise, clean, mn_mx = process.result()
+                noise, denoised, mn_mx = process.result()
                 noise_patches[i, 0, ...] = noise
-                clean_patches[i, 0, ...] = clean
+                denoised_patches[i, 0, ...] = denoised
                 mn_mxs[i, :] = mn_mx
-        return to_tensor(noise_patches), to_tensor(clean_patches), mn_mxs
+        return to_tensor(noise_patches), to_tensor(denoised_patches), mn_mxs
 
 
 # --- Helpers ---
@@ -318,22 +250,22 @@ def init_datasets(
     img_paths_json,
     patch_shape,
     foreground_sampling_rate=0.5,
+    n_train_examples_per_epoch=100,
     n_validate_examples=0,
     swc_dict=None
 ):
     # Initializations
     train_dataset = TrainDataset(
-        patch_shape, foreground_sampling_rate=foreground_sampling_rate,
+        patch_shape,
+        foreground_sampling_rate=foreground_sampling_rate,
+        n_examples_per_epoch=n_train_examples_per_epoch,
     )
     val_dataset = ValidateDataset(patch_shape)
 
     # Load data
     for brain_id in tqdm(brain_ids, desc="Load Data"):
-        # Set image path
-        img_path = get_img_prefix(brain_id, img_paths_json)
-        img_path += str(0)
-
-        # Set SWC path
+        # Set paths
+        img_path = get_img_prefix(brain_id, img_paths_json) + str(0)
         if swc_dict:
             swc_pointer = deepcopy(swc_dict)
             swc_pointer["path"] += f"/{brain_id}/world"
@@ -354,7 +286,7 @@ def init_datasets(
 
 def to_tensor(arr):
     """
-    Converts the given numpy array to a torch tensor.
+    Converts the given NumPy array to a torch tensor.
 
     Parameters
     ----------
