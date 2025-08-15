@@ -26,13 +26,21 @@ from aind_exaspim_image_compression.utils.swc_util import Reader
 
 # --- Custom Datasets ---
 class TrainDataset(Dataset):
+    """
+    A PyTorch Dataset for sampling 3D patches from whole-brain images and
+    applying the BM4D denoising algorithm. The dataset's __getitem__ method
+    returns both the original and denoised patches. Optionally, the patch
+    sampling maybe biased toward foreground regions by using the voxel
+    coordinates from SWC files that represent neuron tracings.
+    """
 
     def __init__(
         self,
         patch_shape,
         anisotropy=(0.748, 0.748, 1.0),
         boundary_buffer=4000,
-        foreground_sampling_rate=0.25,
+        foreground_sampling_rate=0.5,
+        sigma=50,
     ):
         # Call parent class
         super(TrainDataset, self).__init__()
@@ -40,7 +48,7 @@ class TrainDataset(Dataset):
         # Class attributes
         self.anisotropy = anisotropy
         self.boundary_buffer = boundary_buffer
-        self.denoise_bm4d = BM4D()
+        self.denoise_bm4d = BM4D(sigma=sigma)
         self.foreground_sampling_rate = foreground_sampling_rate
         self.patch_shape = patch_shape
         self.swc_reader = Reader()
@@ -50,11 +58,11 @@ class TrainDataset(Dataset):
         self.imgs = dict()
 
     # --- Ingest data ---
-    def ingest_img(self, brain_id, img_path, swc_pointer):
-        self.foreground[brain_id] = self.ingest_swcs(swc_pointer)
+    def ingest_brain(self, brain_id, img_path, swc_pointer):
+        self.foreground[brain_id] = self.load_swcs(swc_pointer)
         self.imgs[brain_id] = img_util.read(img_path)
 
-    def ingest_swcs(self, swc_pointer):
+    def load_swcs(self, swc_pointer):
         if swc_pointer:
             # Initializations
             swc_dicts = self.swc_reader.read(swc_pointer)
@@ -146,7 +154,7 @@ class ValidateDataset(Dataset):
         """
         return len(self.ids)
 
-    def ingest_img(self, brain_id, img_path):
+    def ingest_brain(self, brain_id, img_path):
         self.imgs[brain_id] = img_util.read(img_path)
 
     def ingest_example(self, brain_id, voxel):
@@ -190,10 +198,6 @@ class DataLoader(ABC):
             Dataset to iterated over.
         batch_size : int
             Number of examples in each batch.
-
-        Returns
-        -------
-        None
         """
         # Instance attributes
         self.dataset = dataset
@@ -337,8 +341,8 @@ def init_datasets(
             swc_pointer = None
 
         # Ingest data
-        train_dataset.ingest_img(brain_id, img_path, swc_pointer)
-        val_dataset.ingest_img(brain_id, img_path)
+        train_dataset.ingest_brain(brain_id, img_path, swc_pointer)
+        val_dataset.ingest_brain(brain_id, img_path)
 
     # Generate validation examples
     for _ in range(n_validate_examples):

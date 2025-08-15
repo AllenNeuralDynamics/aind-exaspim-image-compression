@@ -191,12 +191,12 @@ def get_patch(img, voxel, shape, is_center=True):
     numpy.ndarray
         Patch extracted from the given image.
     """
-    # Get image patch coordiantes
+    # Get patch coordinates
     start, end = get_start_end(voxel, shape, is_center=is_center)
     valid_start = any([s >= 0 for s in start])
     valid_end = any([e < img.shape[i + 2] for i, e in enumerate(end)])
 
-    # Get image patch
+    # Read patch
     if valid_start and valid_end:
         return img[
             0, 0, start[0]: end[0], start[1]: end[1], start[2]: end[2]
@@ -383,7 +383,7 @@ def compute_cratio(img, codec, patch_shape=(64, 64, 64)):
     Parameters
     ----------
     img : np.ndarray
-        Image to compute compression ratio of.
+        Image to compute the compression ratio of.
     codec : blosc.Blosc
         Blosc codec used to compress each chunk.
     patch_shape : Tuple[int]
