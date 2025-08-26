@@ -29,6 +29,7 @@ dependencies = [
     'scikit-learn',
     'scipy',
     'tensorboard',
+    'tensorstore',
     'torch',
     'torchvision',
     'tqdm',

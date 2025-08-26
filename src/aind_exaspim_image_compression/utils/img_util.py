@@ -27,7 +27,7 @@ import zarr
 # --- Readers ---
 def read(img_path):
     """
-    Read an image volume from a supported path based on its extension.
+    Reads an image volume from a supported path based on its extension.
 
     Supported formats:
         - Zarr ('.zarr') from local, GCS, or S3
@@ -37,7 +37,7 @@ def read(img_path):
     Parameters
     ----------
     img_path : str
-        Path to the image. Can be a local or cloud path (gs:// or s3://).
+        Path to image. Can be a local or cloud path (gs:// or s3://).
 
     Returns
     -------
@@ -62,12 +62,12 @@ def read(img_path):
 
 def _read_zarr(img_path):
     """
-    Read a Zarr volume from local disk, GCS, or S3.
+    Reads a Zarr volume from local disk, GCS, or S3.
 
     Parameters
     ----------
     img_path : str
-        Path to the Zarr directory.
+        Path to Zarr directory.
 
     Returns
     -------
@@ -88,16 +88,16 @@ def _read_zarr(img_path):
 
 def _read_n5(img_path):
     """
-    Read an N5 volume from local disk or GCS.
+    Reads an N5 volume from local disk or GCS.
 
     Parameters
     ----------
     img_path : str
-        Path to the N5 directory.
+        Path to N5 directory.
 
     Returns
     -------
-    zarr.ndarray
+    zarr.core.Array
         Image volume.
     """
     if _is_gcs_path(img_path):
@@ -113,12 +113,12 @@ def _read_n5(img_path):
 
 def _read_tiff(img_path, storage_options=None):
     """
-    Read a TIFF file from local disk or GCS.
+    Reads a TIFF file from local disk or GCS.
 
     Parameters
     ----------
     img_path : str
-        Path to the TIFF file.
+        Path to TIFF file.
     storage_options : dict, optional
         Additional kwargs for GCSFileSystem.
 
@@ -137,7 +137,7 @@ def _read_tiff(img_path, storage_options=None):
 
 def _is_gcs_path(path):
     """
-    Check if the path is a GCS path.
+    Checks if the path is a GCS path.
 
     Parameters
     ----------
@@ -153,7 +153,7 @@ def _is_gcs_path(path):
 
 def _is_s3_path(path):
     """
-    Check if the path is an S3 path.
+    Checks if the path is an S3 path.
 
     Parameters
     ----------
@@ -548,6 +548,26 @@ def plot_slices(img, output_path=None, vmax=None):
 
 
 # --- Helpers ---
+def get_slices(center, shape):
+    """
+    Gets the start and end indices of the chunk to be read.
+
+    Parameters
+    ----------
+    center : tuple
+        Center of image patch to be read.
+    shape : Tuple[int]
+        Shape of image patch to be read.
+
+    Return
+    ------
+    Tuple[slice]
+        Slice objects used to index into the image.
+    """
+    start = [c - d // 2 for c, d in zip(center, shape)]
+    return tuple(slice(s, s + d) for s, d in zip(start, shape))
+
+
 def init_ome_zarr(
     output_path,
     shape,
