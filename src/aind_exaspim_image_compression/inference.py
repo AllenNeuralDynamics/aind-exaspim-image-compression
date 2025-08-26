@@ -123,7 +123,7 @@ def predict_patch(patch, model, normalization_percentiles=[5, 99.9]):
         Denoised 3D patch with the same shape as input patch.
     """
     # Run model
-    assert len(normalization_percentiles) == 2, "Must provide two percentiles" 
+    assert len(normalization_percentiles) == 2, "Must provide two percentiles"
     mn, mx = np.percentile(patch, normalization_percentiles)
     patch = to_tensor((patch - mn) / max(mx, 1))
     with torch.no_grad():
@@ -134,13 +134,20 @@ def predict_patch(patch, model, normalization_percentiles=[5, 99.9]):
     return np.abs(pred[0, 0, ...] * mx + mn).astype(np.uint16)
 
 
-def _predict_batch(img, model, starts, patch_size, trim=5):
+def _predict_batch(
+    img,
+    model,
+    starts,
+    patch_size,
+    normalization_percentiles=[5, 99.9],
+    trim=5,
+):
     # Subroutine
     def read_patch(i):
         start = starts[i]
         end = [min(s + patch_size, d) for s, d in zip(start, (D, H, W))]
         patch = img[0, 0, start[0]:end[0], start[1]:end[1], start[2]:end[2]]
-        mn, mx = np.percentile(patch, [5, 99.9])
+        mn, mx = np.percentile(patch, normalization_percentiles)
         patch = add_padding((patch - mn) / max(mx, 1), patch_size)
         return i, patch.astype(np.float32), (mn, mx)
 
