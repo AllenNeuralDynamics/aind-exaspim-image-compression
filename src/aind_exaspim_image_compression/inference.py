@@ -106,7 +106,7 @@ def predict_largescale(
     predict(img, model, denoised=denoised)
 
 
-def predict_patch(patch, model):
+def predict_patch(patch, model, normalization_percentiles=[5, 99.9]):
     """
     Denoised a single 3D patch using the provided model.
 
@@ -123,7 +123,8 @@ def predict_patch(patch, model):
         Denoised 3D patch with the same shape as input patch.
     """
     # Run model
-    mn, mx = np.percentile(patch, [5, 99.9])
+    assert len(normalization_percentiles) == 2, "Must provide two percentiles" 
+    mn, mx = np.percentile(patch, normalization_percentiles)
     patch = to_tensor((patch - mn) / max(mx, 1))
     with torch.no_grad():
         output_tensor = model(patch)
@@ -171,7 +172,7 @@ def _predict_batch(img, model, starts, patch_size, trim=5):
         preds = np.empty((N,) + final_shape, dtype=np.uint16)
         for i in range(N):
             mn, mx = mn_mx[i]
-            pred = np.abs(outputs[i] * mx + mn).astype(np.uint16)
+            pred = np.clip(outputs[i] * mx + mn, 0, None).astype(np.uint16)
             preds[i] = pred[start:end, start:end, start:end]
     return preds
 

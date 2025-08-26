@@ -86,7 +86,7 @@ class Trainer:
         # Main
         self.best_l1 = np.inf
         for epoch in range(self.max_epochs):
-            # Updates
+            # Train-Validate
             train_loss = self.train_step(train_dataloader, epoch)
             val_loss, val_cratio, is_best = self.validate_step(
                 val_dataloader, epoch
