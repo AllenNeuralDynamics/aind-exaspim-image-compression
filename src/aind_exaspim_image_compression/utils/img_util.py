@@ -446,6 +446,107 @@ def compress_and_decompress_jpeg(
     return img_decompressed, cratio
 
 
+# --- Plotting ---
+def plot_histogram(img, bins=256, max_value=np.inf, output_path=None):
+    """
+    Plots a histogram of voxel intensities for a 3D image.
+
+    Parameters
+    ----------
+    img : numpy.ndarray
+        Input 3D image array.
+    bins : int, optional
+        Number of histogram bins. Default is 256.
+    max_value : float, optional
+        Threshold for filtering image intensities in the histogram. Default is
+        np.inf.
+    output_path : str, optional
+        If provided, saves the histogram figure. Default is None.
+    """
+    plt.figure(figsize=(6, 4))
+    plt.hist(img[img < max_value].ravel(), bins=bins, alpha=0.7)
+    plt.title("Intensity Histogram", fontsize=14)
+    plt.xlabel("Intensity")
+    plt.ylabel("Log Frequency")
+    plt.yscale("log")
+    plt.tight_layout()
+
+    if output_path:
+        plt.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.show()
+
+
+def plot_mips(img, output_path=None, vmax=None):
+    """
+    Plots the Maximum Intensity Projections (MIPs) of a 3D image along the XY,
+    XZ, and YZ axes.
+
+    Parameters
+    ----------
+    img : numpy.ndarray
+        Input image to generate MIPs from.
+
+    Returns
+    -------
+    None
+    """
+    vmax = vmax or np.percentile(img, 99.9)
+    fig, axs = plt.subplots(1, 3, figsize=(10, 4))
+    axs_names = ["XY", "XZ", "YZ"]
+    for i in range(3):
+        if len(img.shape) == 5:
+            mip = np.max(img[0, 0, ...], axis=i)
+        else:
+            mip = np.max(img, axis=i)
+
+        axs[i].imshow(mip, vmax=vmax)
+        axs[i].set_title(axs_names[i], fontsize=16)
+        axs[i].set_xticks([])
+        axs[i].set_yticks([])
+
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=200)
+    plt.show()
+    plt.close(fig)
+
+
+def plot_slices(img, output_path=None, vmax=None):
+    """
+    Plots the middle slice of a 3D image along the XY, XZ, and YZ axes.
+
+    Parameters
+    ----------
+    img : numpy.ndarray
+        Image to generate MIPs from.
+    """
+    # Get middle slice
+    shape = img.shape[2:] if len(img.shape) == 5 else img.shape
+    zc, yc, xc = (s // 2 for s in shape)
+    slices = [
+        img[zc, :, :],   # XY plane
+        img[:, yc, :],   # XZ plane
+        img[:, :, xc]    # YZ plane
+    ]
+
+    # Plot
+    vmax = vmax or np.percentile(img, 99.9)
+    fig, axs = plt.subplots(1, 3, figsize=(10, 4))
+    axs_names = ["XY", "XZ", "YZ"]
+    for i in range(3):
+        axs[i].imshow(slices[i], vmax=vmax)
+        axs[i].set_title(axs_names[i], fontsize=16)
+        axs[i].set_xticks([])
+        axs[i].set_yticks([])
+
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=200)
+
+    plt.show()
+    plt.close(fig)
+
+
 # --- Helpers ---
 def init_ome_zarr(
     output_path,
@@ -677,38 +778,3 @@ def is_inbounds(voxel, shape):
         return True
     else:
         return False
-
-
-def plot_mips(img, output_path=None, vmax=None):
-    """
-    Plots the Maximum Intensity Projections (MIPs) of a 3D image along the XY,
-    XZ, and YZ axes.
-
-    Parameters
-    ----------
-    img : numpy.ndarray
-        Input image to generate MIPs from.
-
-    Returns
-    -------
-    None
-    """
-    vmax = vmax or np.percentile(img, 99.9)
-    fig, axs = plt.subplots(1, 3, figsize=(10, 4))
-    axs_names = ["XY", "XZ", "YZ"]
-    for i in range(3):
-        if len(img.shape) == 5:
-            mip = np.max(img[0, 0, ...], axis=i)
-        else:
-            mip = np.max(img, axis=i)
-
-        axs[i].imshow(mip, vmax=vmax)
-        axs[i].set_title(axs_names[i], fontsize=16)
-        axs[i].set_xticks([])
-        axs[i].set_yticks([])
-
-    plt.tight_layout()
-    if output_path:
-        plt.savefig(output_path, dpi=200)
-    plt.show()
-    plt.close(fig)
