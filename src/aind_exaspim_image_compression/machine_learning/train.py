@@ -184,16 +184,12 @@ class Trainer:
 
     # --- Helpers ---
     def compute_cratios(self, imgs, mn_mx):
-        import tifffile
-
         cratios = list()
         imgs = np.array(imgs.detach().cpu())
         for i in range(imgs.shape[0]):
             mn, mx = tuple(mn_mx[i, :])
-            img = imgs[i, 0, ...] * mx + mn
+            img = imgs[i, 0, ...] * (mx - mn) + mn
             cratios.append(img_util.compute_cratio(img, self.codec))
-            if i < 10:
-                tifffile.imwrite(f"{i}.tiff", img.astype(np.uint16))
         return cratios
 
     def save_model(self, epoch):
