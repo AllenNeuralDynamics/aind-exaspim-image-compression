@@ -44,7 +44,7 @@ class TrainDataset(Dataset):
         min_brightness=200,
         n_examples_per_epoch=300,
         normalization_percentiles=[0.5, 99.9],
-        sigma_bm4d=30,
+        sigma_bm4d=10,
     ):
         # Call parent class
         super(TrainDataset, self).__init__()
@@ -73,7 +73,7 @@ class TrainDataset(Dataset):
 
         Parameters
         ----------
-        brain_id : hashable
+        brain_id : str
             Unique identifier for the brain corresponding to the image.
         img_path : str or Path
             Path to whole-brain image to be read.
@@ -143,7 +143,7 @@ class TrainDataset(Dataset):
                 return skeletons
         return None
 
-    # --- Core Routines ---
+    # --- Sample Image Patches ---
     def __getitem__(self, dummy_input):
         # Sample image patch
         brain_id = self.sample_brain()
@@ -166,37 +166,148 @@ class TrainDataset(Dataset):
         Returns
         -------
         brain_id : str
-            Unique identifier of the sampled brain.
+            Unique identifier of the sampled whole-brain.
         """
         return util.sample_once(self.imgs.keys())
 
     def sample_voxel(self, brain_id):
+        """
+        Samples a voxel from a brain volume, either foreground or interior.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the sampled whole-brain.
+
+        Returns
+        -------
+        Tuple[int]
+            Voxel coordinate chosen according to the foreground or interior
+            sampling strategy.
+        """
         if random.random() < self.foreground_sampling_rate:
             return self.sample_foreground_voxel(brain_id)
         else:
             return self.sample_interior_voxel(brain_id)
 
     def sample_foreground_voxel(self, brain_id):
+        """
+        Samples a voxel likely to be part of the foreground of a neuron.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of a whole-brain.
+
+        Returns
+        -------
+        tuple of int
+            Voxel coordinate representing a likely foreground location.
+        """
         if self.skeletons[brain_id] is not None and np.random.random() > 0.5:
             return self.sample_skeleton_voxel(brain_id)
-        else: # self.segmentations[brain_id] is not None:
+        elif self.segmentations[brain_id] is not None:
             return self.sample_segmentation_voxel(brain_id)
+        else:
+            return self.sample_bright_voxel(brain_id)
 
-        #else:
-        #    return self.sample_bright_voxel(brain_id)
+    def sample_bright_voxel(self, brain_id):
+        """
+        Samples a voxel coordinate whose surrounding image patch is
+        sufficiently bright.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of a whole-brain.
+
+        Returns
+        -------
+        Tuple[int]
+            Voxel coordinate whose patch is sufficiently bright or is the
+            highest observed brightness after 32 attempts.
+        """
+        cnt = 0
+        brightest_voxel = (0, 0, 0)
+        max_brightness = 0
+        while max_brightness < self.min_brightness:
+            # Read random image patch
+            voxel = self.sample_interior_voxel(brain_id)
+            img_patch = self.read_patch(brain_id, voxel)
+
+            # Check if image patch is bright enough
+            brightness = np.max(img_patch)
+            if brightness > max_brightness:
+                brightest_voxel = voxel
+                max_brightness = brightness
+
+            # Check number of tries
+            cnt += 1
+            if cnt > 32:
+                break
+        return brightest_voxel
+
+    def sample_interior_voxel(self, brain_id):
+        """
+        Samples a random voxel coordinate from the interior of a 3D image
+        volume, avoiding boundary regions.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of a whole-brain.
+
+        Returns
+        -------
+        Tuple[int]
+            Voxel coordinate sampled uniformly at random within the valid
+            interior region of the image volume.
+        """
+        voxel = list()
+        for s in self.imgs[brain_id].shape[2::]:
+            upper = s - self.boundary_buffer
+            voxel.append(random.randint(self.boundary_buffer, upper))
+        return tuple(voxel)
 
     def sample_skeleton_voxel(self, brain_id):
-        idx = random.randint(0, len(self.foreground[brain_id]) - 1)
+        """
+        Samples a voxel coordinate near a skeleton point.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of a whole-brain.
+
+        Returns
+        -------
+        Tuple[int]
+            Voxel coordinate near a skeleton point.
+        """
+        idx = random.randint(0, len(self.skeletons[brain_id]) - 1)
         shift = np.random.randint(0, 16, size=3)
-        return tuple(self.foreground[brain_id][idx] + shift)
+        return tuple(self.skeletons[brain_id][idx] + shift)
 
     def sample_segmentation_voxel(self, brain_id):
-        while self.segmentations[brain_id] is None:
-            brain_id = self.sample_brain()
+        """
+        Sample a voxel coordinate whose corresponding segmentation patch
+        contains a sufficiently large object.
 
+        Parameters
+        ----------
+        brain_id : str
+            Identifier for the image volume which must be a key in
+            "self.segmentations".
+
+        Returns
+        -------
+        Tuple[int]
+            Voxel coordinate whose patch contains a sufficiently large object
+            or had the largest object after 32 attempts.
+        """
         cnt = 0
-        best_voxel, max_volume = None, 0
-        while max_volume < 4000:
+        best_voxel = (0, 0, 0)
+        max_volume = 0
+        while max_volume < 3000:
             # Read random image patch
             voxel = self.sample_interior_voxel(brain_id)
             labels_patch = self.read_precomputed_patch(brain_id, voxel)
@@ -213,42 +324,7 @@ class TrainDataset(Dataset):
                 cnt += 1
                 if cnt > 32:
                     break
-
-        print("Brain_ID:", brain_id)
-        print("Largest Volume:", max_volume)
-        print("Voxel:", best_voxel)
-        print("# Attempts:", cnt)
         return best_voxel
-
-    def sample_bright_voxel(self, brain_id):
-        cnt = 0
-        brightest_voxel, max_brightness = None, 0
-        while max_brightness < self.min_brightness:
-            # Read random image patch
-            voxel = self.sample_interior_voxel(brain_id)
-            img_patch = self.read_patch(brain_id, voxel)
-
-            # Check if image patch is bright enough
-            brightness = np.max(img_patch)
-            if brightness > max_brightness:
-                brightest_voxel = voxel
-                max_brightness = brightness
-
-            # Check number of tries
-            cnt += 1
-            if cnt > 32:
-                break
-        print("Brain_ID:", brain_id)
-        print("Max Brightness:", max_brightness)
-        print("# Attempts:", cnt)
-        return brightest_voxel
-
-    def sample_interior_voxel(self, brain_id):
-        voxel = list()
-        for s in self.imgs[brain_id].shape[2::]:
-            upper = s - self.boundary_buffer
-            voxel.append(random.randint(self.boundary_buffer, upper))
-        return tuple(voxel)
 
     # --- Helpers ---
     def __len__(self):
@@ -325,7 +401,7 @@ class ValidateDataset(Dataset):
         self,
         patch_shape,
         normalization_percentiles=[0.5, 99.9],
-        sigma_bm4d=30,
+        sigma_bm4d=10,
     ):
         """
         Instantiates a ValidateDataset object.
@@ -422,8 +498,8 @@ class ValidateDataset(Dataset):
             A tuple containing:
             - noise (ndarray): Noisy image patch at the given index.
             - denoised (ndarray): Corresponding denoised image patch.
-            - mn_mx (tuple or ndarray): Minimum and maximum values used for
-              normalization of the image patches.
+            - mn_mx (tuple): Minimum and maximum values used for normalization
+              of the image patches.
         """
         return self.noise[idx], self.denoised[idx], self.mn_mxs[idx]
 
@@ -503,7 +579,7 @@ def init_datasets(
     n_train_examples_per_epoch=100,
     n_validate_examples=0,
     segmentation_prefixes_path=None,
-    sigma_bm4d=16,
+    sigma_bm4d=10,
     swc_pointers=None
 ):
     # Initializations
