@@ -15,6 +15,7 @@ from copy import deepcopy
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+import fastremap
 import numpy as np
 import random
 import tensorstore as ts
@@ -178,10 +179,11 @@ class TrainDataset(Dataset):
     def sample_foreground_voxel(self, brain_id):
         if self.skeletons[brain_id] is not None and np.random.random() > 0.5:
             return self.sample_skeleton_voxel(brain_id)
-        #elif self.segmentations[brain_id] is not None:
-        #    return self.sample_segmentation_voxel(brain_id)
-        else:
-            return self.sample_bright_voxel(brain_id)
+        else: # self.segmentations[brain_id] is not None:
+            return self.sample_segmentation_voxel(brain_id)
+
+        #else:
+        #    return self.sample_bright_voxel(brain_id)
 
     def sample_skeleton_voxel(self, brain_id):
         idx = random.randint(0, len(self.foreground[brain_id]) - 1)
@@ -189,33 +191,56 @@ class TrainDataset(Dataset):
         return tuple(self.foreground[brain_id][idx] + shift)
 
     def sample_segmentation_voxel(self, brain_id):
+        while self.segmentations[brain_id] is None:
+            brain_id = self.sample_brain()
+
         cnt = 0
-        while cnt < 32:
+        best_voxel, max_volume = None, 0
+        while max_volume < 4000:
             # Read random image patch
             voxel = self.sample_interior_voxel(brain_id)
             labels_patch = self.read_precomputed_patch(brain_id, voxel)
 
             # Check if labels patch has large enough object
-            # --> call fastremap
-            # --> find largest object
-        return voxel
+            vals, cnts = fastremap.unique(labels_patch, return_counts=True)
+            if len(cnts) > 1:
+                volume = np.max(cnts[1:])
+                if volume > max_volume:
+                    best_voxel = voxel
+                    max_volume = volume
+
+                # Check number of tries
+                cnt += 1
+                if cnt > 32:
+                    break
+
+        print("Brain_ID:", brain_id)
+        print("Largest Volume:", max_volume)
+        print("Voxel:", best_voxel)
+        print("# Attempts:", cnt)
+        return best_voxel
 
     def sample_bright_voxel(self, brain_id):
         cnt = 0
         brightest_voxel, max_brightness = None, 0
-        while cnt < 32:
+        while max_brightness < self.min_brightness:
             # Read random image patch
             voxel = self.sample_interior_voxel(brain_id)
             img_patch = self.read_patch(brain_id, voxel)
 
             # Check if image patch is bright enough
             brightness = np.max(img_patch)
-            if brightness >= self.min_brightness:
-                return voxel
-            elif brightness > max_brightness:
+            if brightness > max_brightness:
                 brightest_voxel = voxel
                 max_brightness = brightness
+
+            # Check number of tries
             cnt += 1
+            if cnt > 32:
+                break
+        print("Brain_ID:", brain_id)
+        print("Max Brightness:", max_brightness)
+        print("# Attempts:", cnt)
         return brightest_voxel
 
     def sample_interior_voxel(self, brain_id):
@@ -238,21 +263,57 @@ class TrainDataset(Dataset):
         return self.n_examples_per_epoch
 
     def read_patch(self, brain_id, center):
+        """
+        Reads an image patch from a Zarr array.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the sampled brain.
+        center : Tuple[int]
+            Center of image patch to be read.
+
+        Returns
+        -------
+        numpy.ndarray
+            Image patch.
+        """
         s = img_util.get_slices(center, self.patch_shape)
         return self.imgs[brain_id][(0, 0, *s)]
 
     def read_precomputed_patch(self, brain_id, center):
         """
-        Reads an image patch from a precomputed array.
+        Reads an image patch from a Precomputed array.
 
         Parameters
         ----------
-        ...
+        brain_id : str
+            Unique identifier of the sampled brain.
+        center : Tuple[int]
+            Center of image patch to be read.
+
+        Returns
+        -------
+        numpy.ndarray
+            Image patch.
         """
         s = img_util.get_slices(center, self.patch_shape)
-        return self.segmentations[brain_id][(0, 0, *s)].read().result()
+        return self.segmentations[brain_id][s].read().result()
 
     def to_voxels(self, xyz_arr):
+        """
+        Converts 3D points from physical to voxel coordinates.
+
+        Parameters
+        ----------
+        xyz_arr : numpy.ndarray
+            Array with shape (n, 3) that contains 3D points.
+
+        Returns
+        -------
+        numpy.ndarray
+            3D Points converted to voxel coordinates.
+        """
         for i in range(3):
             xyz_arr[:, i] = xyz_arr[:, i] / self.anisotropy[i]
         return np.flip(xyz_arr, axis=1).astype(int)
@@ -442,7 +503,7 @@ def init_datasets(
     n_train_examples_per_epoch=100,
     n_validate_examples=0,
     segmentation_prefixes_path=None,
-    sigma_bm4d=30,
+    sigma_bm4d=16,
     swc_pointers=None
 ):
     # Initializations
