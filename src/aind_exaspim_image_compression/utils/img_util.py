@@ -14,7 +14,8 @@ from itertools import product
 from numcodecs import Blosc, register_codec
 from ome_zarr.writer import write_multiscale
 from scipy.ndimage import uniform_filter
-from xarray_multiscale import multiscale, windowed_mode
+from xarray_multiscale import multiscale
+from xarray_multiscale.reducers import windowed_mode
 
 import gcsfs
 import matplotlib.pyplot as plt
