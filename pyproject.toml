@@ -22,6 +22,7 @@ dependencies = [
     'fastremap',
     'gcsfs',
     'google-cloud-storage',
+    'imagecodecs',
     'interrogate',
     'ome-zarr',
     'pandas',
