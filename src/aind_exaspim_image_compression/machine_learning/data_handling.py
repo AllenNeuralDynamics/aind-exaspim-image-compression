@@ -145,18 +145,16 @@ class TrainDataset(Dataset):
 
     # --- Sample Image Patches ---
     def __getitem__(self, dummy_input):
-        # Sample image patch
+        # Get image patches
         brain_id = self.sample_brain()
         voxel = self.sample_voxel(brain_id)
         noise = self.read_patch(brain_id, voxel)
         mn, mx = np.percentile(noise, self.normalization_percentiles)
-
-        # Denoise image patch
         denoised = bm4d(noise, self.sigma_bm4d)
 
         # Normalize image patches
-        noise = (noise - mn) / max(mx - mn, 1)
-        denoised = (denoised - mn) / max(mx - mn, 1)
+        noise = np.clip((noise - mn) / max(mx - mn, 1), 0, 10)
+        denoised = np.clip((denoised - mn) / max(mx - mn, 1), 0, 10)
         return noise, denoised, (mn, mx)
 
     def sample_brain(self):
@@ -474,8 +472,8 @@ class ValidateDataset(Dataset):
         denoised = bm4d(noise, self.sigma_bm4d)
 
         # Normalize image patches
-        noise = (noise - mn) / max(mx - mn, 1)
-        denoised = (denoised - mn) / max(mx - mn, 1)
+        noise = np.clip((noise - mn) / max(mx - mn, 1), 0, 10)
+        denoised = np.clip((denoised - mn) / max(mx - mn, 1), 0, 10)
 
         # Store results
         self.example_ids.append((brain_id, voxel))
