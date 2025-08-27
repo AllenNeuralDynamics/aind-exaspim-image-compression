@@ -25,7 +25,7 @@ dependencies = [
     'interrogate',
     'ome-zarr',
     'pandas',
-    's3fs',
+    's3fs==2025.7.0',
     'scikit-image',
     'scikit-learn',
     'scipy',
@@ -34,7 +34,7 @@ dependencies = [
     'torch',
     'torchvision',
     'tqdm',
-    'xarray_multiscale',
+    'xarray_multiscale==1.2.0',
     'zarr',
     "aind-exaspim-dataset-utils @ git+https://github.com/AllenNeuralDynamics/aind-exaspim-dataset-utils.git@main"
 ]
