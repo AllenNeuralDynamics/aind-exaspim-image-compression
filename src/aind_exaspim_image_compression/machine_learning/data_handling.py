@@ -145,6 +145,28 @@ class TrainDataset(Dataset):
 
     # --- Sample Image Patches ---
     def __getitem__(self, dummy_input):
+        """
+        Return a pair of noisy and BM4D-denoised image patches, normalized 
+        according to percentile-based scaling.
+
+        Parameters
+        ----------
+        dummy_input : Any
+            Dummy argument required by PyTorch's `Dataset` interface for indexing.
+            Not used in the patch sampling procedure.
+
+        Returns
+        -------
+        tuple
+            A tuple containing:
+            - noise : np.ndarray
+                Noisy image patch, normalized and clipped.
+            denoised : np.ndarray
+                Denoised image patch, normalized and clipped using the same
+                scale as the noisy patch.
+            (mn, mx) : Tuple[float]
+                Lower and upper percentiles used for normalization.
+        """
         # Get image patches
         brain_id = self.sample_brain()
         voxel = self.sample_voxel(brain_id)
