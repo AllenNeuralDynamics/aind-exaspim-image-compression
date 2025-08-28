@@ -15,6 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import numpy as np
 import os
+import tifffile
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -30,6 +31,7 @@ class Trainer:
         self,
         output_dir,
         batch_size=8,
+        device="cuda:0",
         lr=1e-3,
         max_epochs=200,
     ):
@@ -42,10 +44,12 @@ class Trainer:
             Directory that model checkpoints and tensorboard are written to.
         batch_size : int, optional
             Number of samples per batch during training. Default is 32.
-        lr : float
-            Learning rate.
-        max_epochs : int
-            Maximum number of training epochs.
+        device : str, optional
+            GPU device that model is trained on. Default is "cuda:0".
+        lr : float, optional
+            Learning rate. Default is 1e-3.
+        max_epochs : int, optional
+            Maximum number of training epochs. Default is 200.
         """
         # Initializations
         exp_name = "session-" + datetime.today().strftime("%Y%m%d_%H%M")
@@ -133,6 +137,24 @@ class Trainer:
         return np.mean(losses)
 
     def validate_step(self, val_dataloader, epoch):
+        """
+        Validates the model over the provided DataLoader.
+
+        Parameters
+        ----------
+        val_dataloader : torch.utils.data.DataLoader
+            DataLoader for the validation dataset.
+        epoch : int
+            Current training epoch.
+
+        Returns
+        -------
+        tuple
+            A tuple containing the following:
+            - float: Average loss over the validation dataset.
+            - float: Average compression ratio over the validation dataset.
+            - bool: Indication of whether the model is the best so far.
+        """
         losses = list()
         cratios = list()
         with torch.no_grad():
@@ -190,7 +212,22 @@ class Trainer:
             mn, mx = tuple(mn_mx[i, :])
             img = imgs[i, 0, ...] * (mx - mn) + mn
             cratios.append(img_util.compute_cratio(img, self.codec))
+            if i < 10:
+                tifffile.imwrite(f"{i}.tiff", img)
         return cratios
+
+    def load_pretrained_weights(self, model_path):
+        """
+        Loads a pretrained model weights from a checkpoint file.
+    
+        Parameters
+        ----------
+        model_path : str
+            Path to the checkpoint file containing the saved weights.
+        """
+        self.model.load_state_dict(
+            torch.load(model_path, map_location=device)
+        )
 
     def save_model(self, epoch):
         """
@@ -202,6 +239,6 @@ class Trainer:
             Current training epoch.
         """
         date = datetime.today().strftime("%Y%m%d")
-        filename = f"BM4DNet-{date}-{epoch}-{round(self.best_l1, 4)}.pth"
+        filename = f"BM4DNet-{date}-{epoch}-{self.best_l1:.4f}.pth"
         path = os.path.join(self.log_dir, filename)
         torch.save(self.model.state_dict(), path)
