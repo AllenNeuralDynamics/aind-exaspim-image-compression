@@ -58,6 +58,7 @@ class Trainer:
 
         # Instance attributes
         self.batch_size = batch_size
+        self.device = device
         self.max_epochs = max_epochs
         self.log_dir = log_dir
 
@@ -226,7 +227,7 @@ class Trainer:
             Path to the checkpoint file containing the saved weights.
         """
         self.model.load_state_dict(
-            torch.load(model_path, map_location=device)
+            torch.load(model_path, map_location=self.device)
         )
 
     def save_model(self, epoch):
