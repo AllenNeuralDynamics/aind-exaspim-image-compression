@@ -146,7 +146,7 @@ class TrainDataset(Dataset):
     # --- Sample Image Patches ---
     def __getitem__(self, dummy_input):
         """
-        Return a pair of noisy and BM4D-denoised image patches, normalized 
+        Return a pair of noisy and BM4D-denoised image patches, normalized
         according to percentile-based scaling.
 
         Parameters

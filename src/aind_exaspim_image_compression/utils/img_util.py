@@ -80,7 +80,7 @@ def _read_zarr(img_path):
         fs = gcsfs.GCSFileSystem(anon=False)
         store = zarr.storage.FSStore(img_path, fs=fs)
     elif _is_s3_path(img_path):
-        fs = s3fs.S3FileSystem(config_kwargs={"max_pool_connections": 50})
+        fs = s3fs.S3FileSystem(anon=True)
         store = s3fs.S3Map(root=img_path, s3=fs)
     else:
         store = zarr.DirectoryStore(img_path)
