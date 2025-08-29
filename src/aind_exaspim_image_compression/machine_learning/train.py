@@ -220,7 +220,7 @@ class Trainer:
     def load_pretrained_weights(self, model_path):
         """
         Loads a pretrained model weights from a checkpoint file.
-    
+
         Parameters
         ----------
         model_path : str
