@@ -41,7 +41,7 @@ class TrainDataset(Dataset):
         self,
         patch_shape,
         anisotropy=(0.748, 0.748, 1.0),
-        boundary_buffer=6000,
+        boundary_buffer=5000,
         foreground_sampling_rate=0.2,
         min_brightness=200,
         n_examples_per_epoch=300,
