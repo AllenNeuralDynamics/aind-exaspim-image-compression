@@ -47,7 +47,7 @@ class UNet(nn.Module):
             If True, use trilinear interpolation for upsampling in decoder
             blocks; otherwise, use transposed convolutions. Default is True.
         use_relu : bool, optional
-            If True, use ReLU activations in `DoubleConv` blocks; otherwise,
+            If True, use ReLU activations in DoubleConv blocks; otherwise,
             use LeakyReLU. Default is True.
         """
         # Call parent class
