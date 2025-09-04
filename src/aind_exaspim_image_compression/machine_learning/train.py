@@ -64,7 +64,7 @@ class Trainer:
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
         self.criterion = nn.L1Loss()
-        self.model = UNet(use_relu=False).to("cuda")
+        self.model = UNet().to("cuda")
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=25)
         self.writer = SummaryWriter(log_dir=log_dir)
