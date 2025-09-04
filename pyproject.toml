@@ -24,6 +24,7 @@ dependencies = [
     'google-cloud-storage',
     'imagecodecs',
     'interrogate',
+    'matplotlib',
     'ome-zarr',
     'pandas',
     's3fs==2025.7.0',
