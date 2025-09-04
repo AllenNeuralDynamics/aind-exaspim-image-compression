@@ -10,7 +10,7 @@ on GPU, and stitch denoised patches back into a full 3D volume.
 
 """
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
 import itertools
@@ -26,6 +26,7 @@ def predict(
     model,
     denoised=None,
     batch_size=32,
+    normalization_percentiles=(0.5, 99.9),
     patch_size=64,
     overlap=12,
     trim=5,
@@ -43,6 +44,9 @@ def predict(
         PyTorch model to perform prediction on patches.
     batch_size : int, optional
         Number of patches to process in a batch. Default is 32.
+    normalization_percentiles : Tuple[int], optional
+        Lower and upper percentiles used for normalization. Default is
+        (0.5, 99.9).
     patch_size : int, optional
         Size of the cubic patch extracted from the image. Default is 64.
     overlap : int, optional
@@ -62,18 +66,23 @@ def predict(
     while len(img.shape) < 5:
         img = img[np.newaxis, ...]
 
+    # Normalize image
+    mn, mx = np.percentile(img, normalization_percentiles)
+    print("Normalization Factors:", mn, mx)
+    img = np.clip((img - mn) / (mx - mn), 0, 10)
+
     # Initializations
     patch_starts_generator = generate_patch_starts(img, patch_size, overlap)
     n_starts = count_patches(img, patch_size, overlap)
     if denoised is None:
-        denoised = np.zeros_like(img, dtype=np.uint16)
+        denoised = np.zeros_like(img)
 
     # Main
     pbar = tqdm(total=n_starts, desc="Denoise") if verbose else None
     for i in range(0, n_starts, batch_size):
         # Extract batch and run model
         starts = list(itertools.islice(patch_starts_generator, batch_size))
-        patches = _predict_batch(img, model, starts, patch_size, trim)
+        patches = _predict_batch(img, model, starts, patch_size, trim=trim)
 
         # Store result
         for patch, start in zip(patches, starts):
@@ -84,7 +93,7 @@ def predict(
                 0, 0, start[0]:end[0], start[1]:end[1], start[2]:end[2]
             ] = patch[: end[0] - start[0], : end[1] - start[1], : end[2] - start[2]]
         pbar.update(len(starts)) if verbose else None
-    return denoised
+    return np.clip(denoised * (mx - mn) + mn, 0, None).astype(np.uint16)
 
 
 def predict_largescale(
@@ -93,6 +102,7 @@ def predict_largescale(
     output_path,
     compressor,
     batch_size=32,
+    normalization_percentiles=(0.5, 99.9),
     patch_size=64,
     overlap=12,
     output_chunks=(1, 1, 64, 128, 128),
@@ -106,16 +116,19 @@ def predict_largescale(
     predict(img, model, denoised=denoised)
 
 
-def predict_patch(patch, model, normalization_percentiles=[5, 99.9]):
+def predict_patch(patch, model, normalization_percentiles=(0.5, 99.9)):
     """
-    Denoised a single 3D patch using the provided model.
+    Denoises a single 3D patch using the provided model.
 
     Parameters
     ----------
-    model : torch.nn.Module
-        PyTorch model used for prediction.
     patch : numpy.ndarray
         3D input patch to denoise.
+    model : torch.nn.Module
+        PyTorch model used for prediction.
+    normalization_percentiles : Tuple[int], optional
+        Lower and upper percentiles used for normalization. Default is
+        (0.5, 99.9).
 
     Returns
     -------
@@ -125,63 +138,37 @@ def predict_patch(patch, model, normalization_percentiles=[5, 99.9]):
     # Run model
     assert len(normalization_percentiles) == 2, "Must provide two percentiles"
     mn, mx = np.percentile(patch, normalization_percentiles)
-    patch = to_tensor((patch - mn) / max(mx, 1))
+    patch = to_tensor(np.clip((patch - mn) / max(mx - mn, 1), 0, 10))
     with torch.no_grad():
         output_tensor = model(patch)
 
     # Process output
     pred = np.array(output_tensor.cpu())
-    return np.abs(pred[0, 0, ...] * mx + mn).astype(np.uint16)
+    return np.clip(pred[0, 0, ...] * (mx - mn) + mn, 0, None).astype(np.uint16)
 
 
-def _predict_batch(
-    img,
-    model,
-    starts,
-    patch_size,
-    normalization_percentiles=[5, 99.9],
-    trim=5,
-):
+def _predict_batch(img, model, starts, patch_size, trim=5):
     # Subroutine
-    def read_patch(i):
-        start = starts[i]
+    def get_patch(idx):
+        start = starts[idx]
         end = [min(s + patch_size, d) for s, d in zip(start, (D, H, W))]
         patch = img[0, 0, start[0]:end[0], start[1]:end[1], start[2]:end[2]]
-        mn, mx = np.percentile(patch, normalization_percentiles)
-        patch = add_padding((patch - mn) / max(mx, 1), patch_size)
-        return i, patch.astype(np.float32), (mn, mx)
+        return idx, add_padding(patch, patch_size).astype(np.float32)
 
-    # Main
+    # Parallel patch loading
     D, H, W = img.shape[2:]
     with ThreadPoolExecutor() as executor:
-        # Read patches
-        threads = list()
-        for i in range(len(starts)):
-            threads.append(executor.submit(read_patch, i))
+        results = list(executor.map(get_patch, range(len(starts))))
 
-        # Compile batch
-        inputs = np.empty((len(starts),) + (patch_size,) * 3, dtype=np.float32)
-        mn_mx = len(starts) * [None]
-        for thread in as_completed(threads):
-            i, patch_i, mn_mx_i = thread.result()
-            mn_mx[i] = mn_mx_i
-            inputs[i, ...] = patch_i
+    # Reassemble in correct order
+    results.sort(key=lambda x: x[0])  # keep consistent ordering
+    inputs = np.stack([r[1] for r in results], axis=0)
 
-        # Run model
-        inputs = batch_to_tensor(inputs)
-        with torch.no_grad():
-            outputs = model(inputs).cpu().squeeze(1).numpy()
-
-        # Process results
-        N = outputs.shape[0]
-        start, end = trim, patch_size - trim
-        final_shape = (end - start,) * 3
-        preds = np.empty((N,) + final_shape, dtype=np.uint16)
-        for i in range(N):
-            mn, mx = mn_mx[i]
-            pred = np.clip(outputs[i] * mx + mn, 0, None).astype(np.uint16)
-            preds[i] = pred[start:end, start:end, start:end]
-    return preds
+    # Run model
+    inputs = batch_to_tensor(inputs)
+    with torch.no_grad():
+        outputs = model(inputs).cpu().squeeze(1).numpy()
+    return outputs[:, trim:-trim, trim:-trim, trim:-trim]
 
 
 # --- Helpers ---
@@ -217,15 +204,16 @@ def generate_patch_starts(img, patch_size, overlap):
     Parameters
     ----------
     img : torch.Tensor or numpy.ndarray
-        Input image tensor with shape (batch, channels, depth, height, width).
+        Image with shape (1, 1, depth, height, width).
     patch_size : int
-        The size of each cubic patch along each spatial dimension.
+        Size of each cubic patch along each spatial dimension. This code
+        assumes that the patch shape is a cube.
     overlap : int
         Number of voxels that adjacent patches overlap.
 
     Returns
     -------
-    generator
+    iterator
         Generates starting coordinates for image patches.
     """
     stride = patch_size - overlap
@@ -296,7 +284,7 @@ def to_tensor(arr):
     Returns
     -------
     torch.Tensor
-        Tensor on GPU, with shape (1, 1, depth, height, width).
+        Tensor on GPU with shape (1, 1, depth, height, width).
     """
     while (len(arr.shape)) < 5:
         arr = arr[np.newaxis, ...]
@@ -316,6 +304,6 @@ def batch_to_tensor(arr):
     Returns
     -------
     torch.Tensor
-        Tensor on GPU, with shape (batch_size, 1, depth, height, width).
+        Tensor on GPU with shape (batch_size, 1, depth, height, width).
     """
     return to_tensor(arr[:, np.newaxis, ...])

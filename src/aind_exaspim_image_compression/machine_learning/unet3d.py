@@ -34,7 +34,7 @@ class UNet(nn.Module):
         Final 1x1x1 convolution mapping features to the output channel.
     """
 
-    def __init__(self, width_multiplier=1, trilinear=True, use_relu=True):
+    def __init__(self, width_multiplier=1, trilinear=True):
         """
         Instantiates a UNet object.
 
@@ -46,9 +46,6 @@ class UNet(nn.Module):
         trilinear : bool, optional
             If True, use trilinear interpolation for upsampling in decoder
             blocks; otherwise, use transposed convolutions. Default is True.
-        use_relu : bool, optional
-            If True, use ReLU activations in DoubleConv blocks; otherwise,
-            use LeakyReLU. Default is True.
         """
         # Call parent class
         super(UNet, self).__init__()
@@ -62,7 +59,7 @@ class UNet(nn.Module):
         self.trilinear = trilinear
 
         # Contracting layers
-        self.inc = DoubleConv(1, self.channels[0], use_relu=use_relu)
+        self.inc = DoubleConv(1, self.channels[0])
         self.down1 = Down(self.channels[0], self.channels[1])
         self.down2 = Down(self.channels[1], self.channels[2])
         self.down3 = Down(self.channels[2], self.channels[3])
@@ -118,9 +115,7 @@ class DoubleConv(nn.Module):
         activations.
     """
 
-    def __init__(
-        self, in_channels, out_channels, mid_channels=None, use_relu=True
-    ):
+    def __init__(self, in_channels, out_channels, mid_channels=None):
         """
         Instantiates a DoubleConv object.
 
@@ -133,9 +128,6 @@ class DoubleConv(nn.Module):
         mid_channels : int, optional
             Number of channels in the intermediate convolution. Default is
             None.
-        use_relu : bool, optional
-            If True, use ReLU activations; otherwise use LeakyReLU. Default
-            is True.
         """
         # Call parent class
         super().__init__()
@@ -144,20 +136,14 @@ class DoubleConv(nn.Module):
         if not mid_channels:
             mid_channels = out_channels
 
-        # Set nonlinear activation
-        if use_relu:
-            activation = nn.ReLU(inplace=True)
-        else:
-            activation = nn.LeakyReLU(negative_slope=0.01, inplace=True)
-
         # Instance attributes
         self.double_conv = nn.Sequential(
             nn.Conv3d(in_channels, mid_channels, kernel_size=3, padding=1),
             nn.BatchNorm3d(mid_channels),
-            activation,
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
             nn.Conv3d(mid_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm3d(out_channels),
-            activation
+            nn.LeakyReLU(negative_slope=0.01, inplace=True)
         )
 
     def forward(self, x):

@@ -33,8 +33,10 @@ class TrainDataset(Dataset):
     A PyTorch Dataset for sampling 3D patches from whole-brain images and
     applying the BM4D denoising algorithm. The dataset's __getitem__ method
     returns both the original and denoised patches. Optionally, the patch
-    sampling maybe biased toward foreground regions by using the voxel
-    coordinates from SWC files that represent neuron tracings.
+    sampling maybe biased toward foreground regions.
+
+    Attributes
+    ----------
     """
 
     def __init__(
@@ -150,7 +152,7 @@ class TrainDataset(Dataset):
     # --- Sample Image Patches ---
     def __getitem__(self, dummy_input):
         """
-        Return a pair of noisy and BM4D-denoised image patches, normalized
+        Returns a pair of noisy and BM4D-denoised image patches, normalized
         according to percentile-based scaling.
 
         Parameters
@@ -163,12 +165,12 @@ class TrainDataset(Dataset):
         -------
         tuple
             A tuple containing:
-            - noise : np.ndarray
+            - noise : numpy.ndarray
                 Noisy image patch, normalized and clipped.
-            denoised : np.ndarray
+            - denoised : numpy.ndarray
                 Denoised image patch, normalized and clipped using the same
                 scale as the noisy patch.
-            (mn, mx) : Tuple[float]
+            - (mn, mx) : Tuple[float]
                 Lower and upper percentiles used for normalization.
         """
         # Get image patches
@@ -225,7 +227,7 @@ class TrainDataset(Dataset):
 
         Returns
         -------
-        tuple of int
+        Tuple[int]
             Voxel coordinate representing a likely foreground location.
         """
         if self.skeletons[brain_id] is not None and np.random.random() > 0.5:
@@ -460,10 +462,10 @@ class ValidateDataset(Dataset):
             Shape of image patches to be extracted.
         normalization_percentiles : List[float], optional
             Upper and lower percentiles used to normalize the input image.
-            Default is [0.5, 99.5].
+            Default is [0.5, 99.9].
         sigma_bm4d : float, optional
             Smoothing parameter used in the BM4D denoising algorithm. Default
-            is 30.
+            is 10.
         """
         # Call parent class
         super(ValidateDataset, self).__init__()
@@ -571,8 +573,8 @@ class DataLoader:
         ----------
         dataset : torch.utils.data.Dataset
             Dataset to iterated over.
-        batch_size : int
-            Number of examples in each batch.
+        batch_size : int, optional
+            Number of examples in each batch. Default is 16.
         """
         # Instance attributes
         self.dataset = dataset
