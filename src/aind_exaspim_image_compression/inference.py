@@ -62,13 +62,11 @@ def predict(
     numpy.ndarray
         Denoised image.
     """
-    # Adjust image dimenions
+    # Preprocess image
     while len(img.shape) < 5:
         img = img[np.newaxis, ...]
 
-    # Normalize image
     mn, mx = np.percentile(img, normalization_percentiles)
-    print("Normalization Factors:", mn, mx)
     img = np.clip((img - mn) / (mx - mn), 0, 10)
 
     # Initializations
