@@ -362,7 +362,7 @@ class TrainDataset(Dataset):
                 for thread in as_completed(pending.keys()):
                     voxel = pending.pop(thread)
                     img_patch = thread.result()
-                    brightness = np.sum(img_patch > 200)
+                    brightness = np.sum(img_patch > 300)
                     if brightness > 200:
                         brightest_voxel = voxel
                         max_brightness = brightness
