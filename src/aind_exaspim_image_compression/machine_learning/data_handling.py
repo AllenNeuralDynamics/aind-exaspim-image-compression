@@ -47,8 +47,8 @@ class TrainDataset(Dataset):
         foreground_sampling_rate=0.2,
         min_brightness=200,
         n_examples_per_epoch=300,
-        normalization_percentiles=[0.5, 99.9],
-        prefetch_foreground_sampling=16,
+        normalization_percentiles=(0.5, 99.9),
+        prefetch_foreground_sampling=12,
         sigma_bm4d=10,
     ):
         # Call parent class
@@ -328,7 +328,7 @@ class TrainDataset(Dataset):
                 break
         return best_voxel
 
-    def sample_bright_voxel(self, brain_id, prefetch=8):
+    def sample_bright_voxel(self, brain_id):
         """
         Samples a voxel coordinate whose surrounding image patch is
         sufficiently bright.
@@ -351,7 +351,7 @@ class TrainDataset(Dataset):
             with ThreadPoolExecutor() as executor:
                 # Read random image patches
                 pending = dict()
-                for _ in range(prefetch):
+                for _ in range(self.prefetch_foreground_sampling):
                     voxel = self.sample_interior_voxel(brain_id)
                     thread = executor.submit(
                         self.read_patch, brain_id, voxel
@@ -362,8 +362,8 @@ class TrainDataset(Dataset):
                 for thread in as_completed(pending.keys()):
                     voxel = pending.pop(thread)
                     img_patch = thread.result()
-                    brightness = np.sum(img_patch > 300)
-                    if brightness > 200:
+                    brightness = np.sum(img_patch > 500)
+                    if brightness > 100:
                         brightest_voxel = voxel
                         max_brightness = brightness
 
