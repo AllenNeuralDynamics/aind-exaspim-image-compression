@@ -181,8 +181,8 @@ class TrainDataset(Dataset):
         denoised = bm4d(noise, self.sigma_bm4d)
 
         # Normalize image patches
-        noise = np.clip((noise - mn) / max(mx - mn, 1), 0, 10)
-        denoised = np.clip((denoised - mn) / max(mx - mn, 1), 0, 10)
+        noise = np.clip((noise - mn) / max(mx - mn, 1), 0, 5)
+        denoised = np.clip((denoised - mn) / max(mx - mn, 1), 0, 5)
         return noise, denoised, (mn, mx)
 
     def sample_brain(self):
@@ -524,8 +524,8 @@ class ValidateDataset(Dataset):
         denoised = bm4d(noise, self.sigma_bm4d)
 
         # Normalize image patches
-        noise = np.clip((noise - mn) / max(mx - mn, 1), 0, 10)
-        denoised = np.clip((denoised - mn) / max(mx - mn, 1), 0, 10)
+        noise = np.clip((noise - mn) / max(mx - mn, 1), 0, 5)
+        denoised = np.clip((denoised - mn) / max(mx - mn, 1), 0, 5)
 
         # Store results
         self.example_ids.append((brain_id, voxel))
