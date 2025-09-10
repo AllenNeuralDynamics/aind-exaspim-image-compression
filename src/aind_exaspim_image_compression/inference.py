@@ -264,8 +264,8 @@ def load_model(path, device="cuda"):
         UNet model loaded with weights and set to evaluation mode.
     """
     model = UNet()
-    model.load_state_dict(torch.load(path))
-    model.eval().to(device)
+    model.load_state_dict(torch.load(path, map_location=device))
+    model.eval()
     return model
 
 
