@@ -59,15 +59,15 @@ def predict(
 
     Returns
     -------
-    numpy.ndarray
+    denoised : numpy.ndarray
         Denoised image.
     """
     # Preprocess image
+    mn, mx = np.percentile(img, normalization_percentiles)
+    img = (img - mn) / (mx - mn + 1e-5)
+    img = np.clip(img, 0, 5)
     while len(img.shape) < 5:
         img = img[np.newaxis, ...]
-
-    mn, mx = np.percentile(img, normalization_percentiles)
-    img = np.clip((img - mn) / (mx - mn), 0, 10)
 
     # Initializations
     patch_starts_generator = generate_patch_starts(img, patch_size, overlap)
@@ -91,7 +91,10 @@ def predict(
                 0, 0, start[0]:end[0], start[1]:end[1], start[2]:end[2]
             ] = patch[: end[0] - start[0], : end[1] - start[1], : end[2] - start[2]]
         pbar.update(len(starts)) if verbose else None
-    return np.clip(denoised * (mx - mn) + mn, 0, None).astype(np.uint16)
+
+    # Postprocess image
+    denoised = np.clip(denoised * (mx - mn) + mn, 0, 2**16 - 1)
+    return denoised.astype(np.uint16)
 
 
 def predict_largescale(
@@ -133,16 +136,22 @@ def predict_patch(patch, model, normalization_percentiles=(0.5, 99.9)):
     numpy.ndarray
         Denoised 3D patch with the same shape as input patch.
     """
-    # Run model
-    assert len(normalization_percentiles) == 2, "Must provide two percentiles"
+    # Preprocess image
     mn, mx = np.percentile(patch, normalization_percentiles)
-    patch = to_tensor(np.clip((patch - mn) / max(mx - mn, 1), 0, 10))
+    patch = (patch - mn) / (mx - mn + 1e-5)
+    patch = np.clip(patch, 0, 5)
+    while len(img.shape) < 5:
+        img = img[np.newaxis, ...]
+
+    # Run model
+    patch = to_tensor(patch)
     with torch.no_grad():
-        output_tensor = model(patch)
+        pred = model(patch)
 
     # Process output
-    pred = np.array(output_tensor.cpu())
-    return np.clip(pred[0, 0, ...] * (mx - mn) + mn, 0, None).astype(np.uint16)
+    pred = np.array(pred.cpu())
+    pred = np.clip(pred[0, 0, ...] * (mx - mn) + mn, 0, 2**16 - 1)
+    return pred.astype(np.uint16)
 
 
 def _predict_batch(img, model, starts, patch_size, trim=5):
@@ -211,7 +220,7 @@ def generate_patch_starts(img, patch_size, overlap):
 
     Returns
     -------
-    iterator
+    Iterator[Tuple[int]]
         Generates starting coordinates for image patches.
     """
     stride = patch_size - overlap
