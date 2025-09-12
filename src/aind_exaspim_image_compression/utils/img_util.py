@@ -143,6 +143,7 @@ def _is_gcs_path(path):
     Parameters
     ----------
     path : str
+        Path to an object.
 
     Returns
     -------
@@ -159,6 +160,7 @@ def _is_s3_path(path):
     Parameters
     ----------
     path : str
+        Path to an object.
 
     Returns
     -------
