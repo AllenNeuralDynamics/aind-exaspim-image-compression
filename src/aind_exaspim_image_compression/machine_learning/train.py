@@ -34,6 +34,7 @@ class Trainer:
         device="cuda:0",
         lr=1e-3,
         max_epochs=200,
+        model=None
     ):
         """
         Instantiates a Trainer object.
@@ -50,6 +51,8 @@ class Trainer:
             Learning rate. Default is 1e-3.
         max_epochs : int, optional
             Maximum number of training epochs. Default is 200.
+        model : None or nn.Module, optional
+            Model to be trained on the given datasets. Default is None.
         """
         # Initializations
         exp_name = "session-" + datetime.today().strftime("%Y%m%d_%H%M")
@@ -64,10 +67,14 @@ class Trainer:
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
         self.criterion = nn.L1Loss()
-        self.model = UNet().to("cuda")
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=25)
         self.writer = SummaryWriter(log_dir=log_dir)
+
+        if model is None:
+            self.model = UNet().to("cuda")
+        else:
+            self.model = model
 
     # --- Core Routines ---
     def run(self, train_dataset, val_dataset):
