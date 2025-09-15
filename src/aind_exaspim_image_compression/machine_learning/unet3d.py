@@ -138,10 +138,10 @@ class DoubleConv(nn.Module):
 
         # Instance attributes
         self.double_conv = nn.Sequential(
-            nn.Conv3d(in_channels, mid_channels, kernel_size=3, padding=1),
+            nn.Conv3d(in_channels, mid_channels, kernel_size=4, padding=1),
             nn.BatchNorm3d(mid_channels),
             nn.LeakyReLU(negative_slope=0.01, inplace=True),
-            nn.Conv3d(mid_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv3d(mid_channels, out_channels, kernel_size=4, padding=1),
             nn.BatchNorm3d(out_channels),
             nn.LeakyReLU(negative_slope=0.01, inplace=True)
         )
