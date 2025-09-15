@@ -8,6 +8,7 @@ Code used to train neural network to denoise images.
 
 """
 
+from contextlib import nullcontext
 from datetime import datetime
 from numcodecs import blosc
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -34,7 +35,8 @@ class Trainer:
         device="cuda:0",
         lr=1e-3,
         max_epochs=200,
-        model=None
+        model=None,
+        use_amp=True,
     ):
         """
         Instantiates a Trainer object.
@@ -53,6 +55,8 @@ class Trainer:
             Maximum number of training epochs. Default is 200.
         model : None or nn.Module, optional
             Model to be trained on the given datasets. Default is None.
+        use_amp : bool, optional
+            Indication of whether to use mixed precision. Default is True.
         """
         # Initializations
         exp_name = "session-" + datetime.today().strftime("%Y%m%d_%H%M")
@@ -63,18 +67,19 @@ class Trainer:
         self.batch_size = batch_size
         self.device = device
         self.max_epochs = max_epochs
-        self.log_dir = log_dir
+        self.log_dir = log_dir         
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
         self.criterion = nn.L1Loss()
+        self.model = model.to(device) if model else UNet().to(device)
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=25)
         self.writer = SummaryWriter(log_dir=log_dir)
 
-        if model is None:
-            self.model = UNet().to("cuda")
+        if use_amp:
+            self.autocast = torch.autocast(device_type="cuda", dtype=torch.float16)
         else:
-            self.model = model
+            self.autocast = nullcontext()
 
     # --- Core Routines ---
     def run(self, train_dataset, val_dataset):
@@ -176,7 +181,7 @@ class Trainer:
                 losses.append(loss.detach().cpu())
 
         # Log results
-        loss, cratio = np.mean(losses), np.mean(cratios)
+        loss, cratio = np.mean(losses), np.median(cratios)
         self.writer.add_scalar("val_loss", loss, epoch)
         self.writer.add_scalar("val_cratio", cratio, epoch)
 
@@ -206,11 +211,12 @@ class Trainer:
         loss : torch.Tensor
             Computed loss value.
         """
-        x = x.to("cuda")
-        y = y.to("cuda")
-        hat_y = self.model(x)
-        loss = self.criterion(hat_y, y)
-        return hat_y, loss
+        with self.autocast:
+            x = x.to("cuda")
+            y = y.to("cuda")
+            hat_y = self.model(x)
+            loss = self.criterion(hat_y, y)
+            return hat_y, loss
 
     # --- Helpers ---
     def compute_cratios(self, imgs, mn_mx):
