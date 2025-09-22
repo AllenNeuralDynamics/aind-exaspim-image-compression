@@ -1,3 +1,4 @@
+
 """
 Created on Fri Aug 14 15:00:00 2025
 
@@ -115,7 +116,7 @@ class DoubleConv(nn.Module):
         activations.
     """
 
-    def __init__(self, in_channels, out_channels, mid_channels=None):
+    def __init__(self, in_channels, out_channels, kernel_size=3, mid_channels=None):
         """
         Instantiates a DoubleConv object.
 
@@ -125,6 +126,8 @@ class DoubleConv(nn.Module):
             Number of input channels to this module.
         out_channels : int
             Number of output channels produced by this module.
+        kernel_size : int, optional
+            Size of kernel used in convolutional layers. Default is 3.
         mid_channels : int, optional
             Number of channels in the intermediate convolution. Default is
             None.
@@ -138,10 +141,10 @@ class DoubleConv(nn.Module):
 
         # Instance attributes
         self.double_conv = nn.Sequential(
-            nn.Conv3d(in_channels, mid_channels, kernel_size=4, padding=1),
+            nn.Conv3d(in_channels, mid_channels, kernel_size=kernel_size, padding=1),
             nn.BatchNorm3d(mid_channels),
             nn.LeakyReLU(negative_slope=0.01, inplace=True),
-            nn.Conv3d(mid_channels, out_channels, kernel_size=4, padding=1),
+            nn.Conv3d(mid_channels, out_channels, kernel_size=kernel_size, padding=1),
             nn.BatchNorm3d(out_channels),
             nn.LeakyReLU(negative_slope=0.01, inplace=True)
         )
