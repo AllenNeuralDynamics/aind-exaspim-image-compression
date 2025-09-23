@@ -67,7 +67,7 @@ class Trainer:
         self.batch_size = batch_size
         self.device = device
         self.max_epochs = max_epochs
-        self.log_dir = log_dir         
+        self.log_dir = log_dir
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
         self.criterion = nn.L1Loss()
@@ -162,11 +162,12 @@ class Trainer:
 
         Returns
         -------
-        tuple
-            A tuple containing the following:
-            - float: Average loss over the validation dataset.
-            - float: Average compression ratio over the validation dataset.
-            - bool: Indication of whether the model is the best so far.
+        loss : float
+            Average loss over the validation dataset.
+        cratio : float
+            Average compression ratio over the validation dataset.
+        is_best : bool
+            Indication of whether the model is the best so far.
         """
         losses = list()
         cratios = list()
@@ -186,12 +187,11 @@ class Trainer:
         self.writer.add_scalar("val_cratio", cratio, epoch)
 
         # Check if current model is best so far
-        if loss < self.best_l1:
+        is_best = True if loss < self.best_l1 else False
+        if is_best:
             self.best_l1 = loss
             self.save_model(epoch)
-            return loss, cratio, True
-        else:
-            return loss, cratio, False
+        return loss, cratio, is_best
 
     def forward_pass(self, x, y):
         """
@@ -224,7 +224,7 @@ class Trainer:
         imgs = np.array(imgs.detach().cpu())
         for i in range(imgs.shape[0]):
             mn, mx = tuple(mn_mx[i, :])
-            img = imgs[i, 0, ...] * (mx - mn) + mn
+            img = np.clip(imgs[i, 0, ...] * (mx - mn) + mn, 0, 2**16 - 1)
             cratios.append(img_util.compute_cratio(img, self.codec))
             if i < 10:
                 tifffile.imwrite(f"{i}.tiff", img)

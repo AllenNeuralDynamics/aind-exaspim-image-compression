@@ -42,7 +42,7 @@ def read(img_path):
 
     Returns
     -------
-    ArrayLike
+    img : ArrayLike
         Image volume.
     """
     # Read image
@@ -125,7 +125,7 @@ def _read_tiff(img_path, storage_options=None):
 
     Returns
     -------
-    np.ndarray
+    numpy.ndarray
         Image volume.
     """
     if _is_gcs_path(img_path):
@@ -143,7 +143,7 @@ def _is_gcs_path(path):
     Parameters
     ----------
     path : str
-        Path to an object.
+        Path to be checked.
 
     Returns
     -------
@@ -160,7 +160,7 @@ def _is_s3_path(path):
     Parameters
     ----------
     path : str
-        Path to an object.
+        Path to be checked.
 
     Returns
     -------
@@ -185,7 +185,7 @@ def get_patch(img, voxel, shape, is_center=True):
     shape : Tuple[int]
         Shape of the image patch to extract.
     is_center : bool, optional
-        Indicates whether the given voxel is the center or top, left, front
+        Indicates whether the given voxel is the center or front-top-left
         corner of the patch to be extracted.
 
     Returns
@@ -194,6 +194,7 @@ def get_patch(img, voxel, shape, is_center=True):
         Patch extracted from the given image.
     """
     # Get patch coordinates
+    assert len(img.shape) == 5, "Error: Image must have shape TxCxDxHxW!"
     start, end = get_start_end(voxel, shape, is_center=is_center)
     valid_start = any([s >= 0 for s in start])
     valid_end = any([e < img.shape[i + 2] for i, e in enumerate(end)])
@@ -205,43 +206,6 @@ def get_patch(img, voxel, shape, is_center=True):
         ]
     else:
         return np.ones(shape)
-
-
-def calculate_offsets(img, window_shape, overlap):
-    """
-    Generates a list of 3D coordinates representing the front-top-left corner
-    by sliding a window over a 3D image, given a specified window size and
-    overlap between adjacent windows.
-
-    Parameters
-    ----------
-    img : zarr.core.Array
-        Input 3D image.
-    window_shape : Tuple[int]
-        Shape of the sliding window.
-    overlap : Tuple[int]
-        Overlap between adjacent sliding windows.
-
-    Returns
-    -------
-    List[Tuple[int]]
-        3D voxel coordinates that represent the front-top-left corner.
-    """
-    # Calculate stride based on the overlap and window size
-    stride = tuple(w - o for w, o in zip(window_shape, overlap))
-    i_stride, j_stride, k_stride = stride
-
-    # Get dimensions of the window
-    _, _, i_dim, j_dim, k_dim = img.shape
-    i_win, j_win, k_win = window_shape
-
-    # Loop over the  with the sliding window
-    coords = []
-    for i in range(0, i_dim - i_win + 1, i_stride):
-        for j in range(0, j_dim - j_win + 1, j_stride):
-            for k in range(0, k_dim - k_win + 1, k_stride):
-                coords.append((i, j, k))
-    return coords
 
 
 def get_start_end(voxel, shape, is_center=True):
@@ -278,9 +242,9 @@ def to_physical(voxel, anisotropy):
     ----------
     voxel : ArrayLike
         Voxel coordinate to be converted.
-    multiscale
-        Level in the image pyramid that the voxel coordinate must index into.
-
+    anisotropy : Tuple[float]
+        Image to physical coordinates scaling factors to account for the
+        anisotropy of the microscope.
 
     Returns
     -------
@@ -299,8 +263,9 @@ def to_voxels(xyz, anisotropy):
     ----------
     xyz : ArrayLike
         Physical coordinate to be converted to a voxel coordinate.
-    multiscale : int
-        Level in the image pyramid that the voxel coordinate must index into.
+    anisotropy : Tuple[float]
+        Image to physical coordinates scaling factors to account for the
+        anisotropy of the microscope.
 
     Returns
     -------
@@ -488,10 +453,11 @@ def plot_mips(img, output_path=None, vmax=None):
     ----------
     img : numpy.ndarray
         Input image to generate MIPs from.
-
-    Returns
-    -------
-    None
+    output_path : None or str, optional
+        Path that plot is saved to if provided. Default is None.
+    vmax : None or float, optional
+        Brightness intensity used as upper limit of the colormap. Default is
+        None.
     """
     vmax = vmax or np.percentile(img, 99.9)
     fig, axs = plt.subplots(1, 3, figsize=(10, 4))
@@ -522,6 +488,11 @@ def plot_slices(img, output_path=None, vmax=None):
     ----------
     img : numpy.ndarray
         Image to generate MIPs from.
+    output_path : None or str, optional
+        Path that plot is saved to if provided. Default is None.
+    vmax : None or float, optional
+        Brightness intensity used as upper limit of the colormap. Default is
+        None.
     """
     # Get middle slice
     shape = img.shape[2:] if len(img.shape) == 5 else img.shape

@@ -44,12 +44,12 @@ class TrainDataset(Dataset):
         patch_shape,
         anisotropy=(0.748, 0.748, 1.0),
         boundary_buffer=5000,
-        foreground_sampling_rate=0.2,
+        foreground_sampling_rate=0.3,
         min_brightness=200,
         n_examples_per_epoch=300,
         normalization_percentiles=(0.5, 99.9),
-        prefetch_foreground_sampling=12,
-        sigma_bm4d=10,
+        prefetch_foreground_sampling=16,
+        sigma_bm4d=16,
     ):
         # Call parent class
         super(TrainDataset, self).__init__()
@@ -290,9 +290,9 @@ class TrainDataset(Dataset):
 
         Returns
         -------
-        Tuple[int]
+        best_voxel : Tuple[int]
             Voxel coordinate whose patch contains a sufficiently large object
-            or had the largest object after 32 attempts.
+            or had the largest object after 5 * self.prefetch attempts.
         """
         cnt = 0
         best_voxel = self.sample_interior_voxel(brain_id)
@@ -330,8 +330,7 @@ class TrainDataset(Dataset):
 
     def sample_bright_voxel(self, brain_id):
         """
-        Samples a voxel coordinate whose surrounding image patch is
-        sufficiently bright.
+        Samples a voxel coordinate whose image patch is sufficiently bright.
 
         Parameters
         ----------
@@ -340,9 +339,9 @@ class TrainDataset(Dataset):
 
         Returns
         -------
-        Tuple[int]
+        brightest_voxel : Tuple[int]
             Voxel coordinate whose patch is sufficiently bright or is the
-            highest observed brightness after 32 attempts.
+            highest observed brightness after 5 * self.prefetch attempts.
         """
         cnt = 0
         brightest_voxel = self.sample_interior_voxel(brain_id)
@@ -544,12 +543,13 @@ class ValidateDataset(Dataset):
 
         Returns
         -------
-        tuple
-            A tuple containing:
-            - noise (ndarray): Noisy image patch at the given index.
-            - denoised (ndarray): Corresponding denoised image patch.
-            - mn_mx (tuple): Minimum and maximum values used for normalization
-              of the image patches.
+        noise : numpy.ndarray
+            Noisy image patch at the given index.
+        denoised : numpy.ndarray
+            Corresponding denoised image patch.
+        mn_mx : Tuple[int]
+            Minimum and maximum values used for normalization of the image
+            patches.
         """
         return self.noise[idx], self.denoised[idx], self.mn_mxs[idx]
 
@@ -563,6 +563,15 @@ class DataLoader:
     """
     DataLoader that uses multithreading to fetch image patches from the cloud
     to form batches.
+
+    Attributes
+    ----------
+    dataset : torch.utils.data.Dataset
+        Dataset to iterated over.
+    batch_size : int
+        Number of examples in each batch.
+    patch_shape : Tuple[int]
+        Shape of image patch expected by the model.
     """
 
     def __init__(self, dataset, batch_size=16):
@@ -629,7 +638,7 @@ def init_datasets(
     n_train_examples_per_epoch=100,
     n_validate_examples=0,
     segmentation_prefixes_path=None,
-    sigma_bm4d=10,
+    sigma_bm4d=16,
     swc_pointers=None
 ):
     # Initializations
