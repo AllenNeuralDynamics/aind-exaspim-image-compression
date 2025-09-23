@@ -18,13 +18,11 @@ import numpy as np
 import torch
 
 from aind_exaspim_image_compression.machine_learning.unet3d import UNet
-from aind_exaspim_image_compression.utils import img_util
 
 
 def predict(
     img,
     model,
-    denoised=None,
     batch_size=32,
     normalization_percentiles=(0.5, 99.9),
     patch_size=64,
@@ -64,7 +62,7 @@ def predict(
     """
     # Preprocess image
     mn, mx = np.percentile(img, normalization_percentiles)
-    img = (img - mn) / (mx - mn + 1e-5)
+    img = (img - mn) / (mx - mn + 1e-8)
     img = np.clip(img, 0, 5)
     while len(img.shape) < 5:
         img = img[np.newaxis, ...]
@@ -72,49 +70,39 @@ def predict(
     # Initializations
     patch_starts_generator = generate_patch_starts(img, patch_size, overlap)
     n_starts = count_patches(img, patch_size, overlap)
-    if denoised is None:
-        denoised = np.zeros_like(img)
+    pbar = tqdm(total=n_starts, desc="Denoise") if verbose else None
 
     # Main
-    pbar = tqdm(total=n_starts, desc="Denoise") if verbose else None
-    for i in range(0, n_starts, batch_size):
+    accum_pred = np.zeros(img.shape[2:])
+    accum_wgt = np.zeros(img.shape[2:])
+    for _ in range(0, n_starts, batch_size):
         # Extract batch and run model
         starts = list(itertools.islice(patch_starts_generator, batch_size))
         patches = _predict_batch(img, model, starts, patch_size, trim=trim)
 
-        # Store result
+        # Add batch predictions to result
         for patch, start in zip(patches, starts):
-            start = [max(s + trim, 0) for s in start]
-            end = [start[i] + patch.shape[i] for i in range(3)]
-            end = [min(e, s) for e, s in zip(end, img.shape[2:])]
-            denoised[
-                0, 0, start[0]:end[0], start[1]:end[1], start[2]:end[2]
-            ] = patch[: end[0] - start[0], : end[1] - start[1], : end[2] - start[2]]
+            # Compute start and end coordinates
+            s = [max(si + trim, 0) for si in start]
+            e = [
+                min(si + pi, di)
+                for si, pi, di in zip(s, patch.shape, img.shape[2:])
+            ]
+
+            # Create slices
+            pred_slices = tuple(slice(si, ei) for si, ei in zip(s, e))
+            patch_slices = tuple(slice(0, ei - si) for si, ei in zip(s, e))
+
+            # Add patch prediction to result
+            accum_pred[pred_slices] += patch[patch_slices]
+            accum_wgt[pred_slices] += 1
+
         pbar.update(len(starts)) if verbose else None
 
-    # Postprocess image
+    # Postprocess prediction
+    denoised = accum_pred[:, ...] / (accum_wgt + 1e-8)
     denoised = np.clip(denoised * (mx - mn) + mn, 0, 2**16 - 1)
     return denoised.astype(np.uint16)
-
-
-def predict_largescale(
-    img,
-    model,
-    output_path,
-    compressor,
-    batch_size=32,
-    normalization_percentiles=(0.5, 99.9),
-    patch_size=64,
-    overlap=12,
-    output_chunks=(1, 1, 64, 128, 128),
-    trim=5,
-    verbose=True
-):
-    # Initializations
-    denoised = img_util.init_ome_zarr(
-        img, output_path, compressor=compressor, chunks=output_chunks
-    )
-    predict(img, model, denoised=denoised)
 
 
 def predict_patch(patch, model, normalization_percentiles=(0.5, 99.9)):
@@ -133,15 +121,15 @@ def predict_patch(patch, model, normalization_percentiles=(0.5, 99.9)):
 
     Returns
     -------
-    numpy.ndarray
+    pred : numpy.ndarray
         Denoised 3D patch with the same shape as input patch.
     """
     # Preprocess image
     mn, mx = np.percentile(patch, normalization_percentiles)
-    patch = (patch - mn) / (mx - mn + 1e-5)
+    patch = (patch - mn) / (mx - mn + 1e-8)
     patch = np.clip(patch, 0, 5)
-    while len(img.shape) < 5:
-        img = img[np.newaxis, ...]
+    while len(patch.shape) < 5:
+        patch = patch[np.newaxis, ...]
 
     # Run model
     patch = to_tensor(patch)
@@ -269,7 +257,7 @@ def load_model(path, device="cuda"):
 
     Returns
     -------
-    torch.nn.Module
+    model : torch.nn.Module
         UNet model loaded with weights and set to evaluation mode.
     """
     model = UNet()
