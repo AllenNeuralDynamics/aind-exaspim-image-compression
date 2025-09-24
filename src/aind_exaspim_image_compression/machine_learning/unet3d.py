@@ -1,4 +1,3 @@
-
 """
 Created on Fri Aug 14 15:00:00 2025
 
@@ -193,7 +192,14 @@ class Down(nn.Module):
 
         # Instance attributes
         self.maxpool_conv = nn.Sequential(
-            nn.MaxPool3d(2), DoubleConv(in_channels, out_channels)
+            nn.Conv3d(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1
+            ),
+            DoubleConv(out_channels, out_channels)
         )
 
     def forward(self, x):
@@ -273,7 +279,7 @@ class Up(nn.Module):
 
         Returns
         -------
-        torch.Tensor
+        x : torch.Tensor
             Output tensor after upsampling, concatenation with the skip
             connection, and double convolution. The output shape is
             (B, out_channels, D, H2, W2).
@@ -287,7 +293,8 @@ class Up(nn.Module):
             [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2],
         )
         x = torch.cat([x2, x1], dim=1)
-        return self.conv(x)
+        x = self.conv(x)
+        return x
 
 
 class OutConv(nn.Module):
