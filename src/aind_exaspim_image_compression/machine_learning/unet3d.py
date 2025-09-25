@@ -51,7 +51,7 @@ class UNet(nn.Module):
         super(UNet, self).__init__()
 
         # Initializations
-        _channels = (32, 64, 128, 256, 512)
+        _channels = (32, 64, 128, 256)
         factor = 2 if trilinear else 1
 
         # Instance attributes
@@ -62,14 +62,12 @@ class UNet(nn.Module):
         self.inc = DoubleConv(1, self.channels[0])
         self.down1 = Down(self.channels[0], self.channels[1])
         self.down2 = Down(self.channels[1], self.channels[2])
-        self.down3 = Down(self.channels[2], self.channels[3])
-        self.down4 = Down(self.channels[3], self.channels[4] // factor)
+        self.down3 = Down(self.channels[2], self.channels[3] // factor)
 
         # Expanding layers
-        self.up1 = Up(self.channels[4], self.channels[3] // factor, trilinear)
-        self.up2 = Up(self.channels[3], self.channels[2] // factor, trilinear)
-        self.up3 = Up(self.channels[2], self.channels[1] // factor, trilinear)
-        self.up4 = Up(self.channels[1], self.channels[0], trilinear)
+        self.up1 = Up(self.channels[3], self.channels[2] // factor, trilinear)
+        self.up2 = Up(self.channels[2], self.channels[1] // factor, trilinear)
+        self.up3 = Up(self.channels[1], self.channels[0], trilinear)
         self.outc = OutConv(self.channels[0], 1)
 
     def forward(self, x):
@@ -92,13 +90,11 @@ class UNet(nn.Module):
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
-        x5 = self.down4(x4)
 
         # Expanding layers
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
+        x = self.up1(x4, x3)
+        x = self.up2(x, x2)
+        x = self.up3(x, x1)
         logits = self.outc(x)
         return logits
 

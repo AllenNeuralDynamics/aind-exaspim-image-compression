@@ -31,10 +31,10 @@ class Trainer:
     def __init__(
         self,
         output_dir,
-        batch_size=8,
-        device="cuda:0",
+        batch_size=16,
+        device="cuda",
         lr=1e-3,
-        max_epochs=200,
+        max_epochs=400,
         model=None,
         use_amp=True,
     ):
@@ -46,13 +46,13 @@ class Trainer:
         output_dir : str
             Directory that model checkpoints and tensorboard are written to.
         batch_size : int, optional
-            Number of samples per batch during training. Default is 32.
+            Number of samples per batch during training. Default is 16.
         device : str, optional
-            GPU device that model is trained on. Default is "cuda:0".
+            GPU device that model is trained on. Default is "cuda".
         lr : float, optional
             Learning rate. Default is 1e-3.
         max_epochs : int, optional
-            Maximum number of training epochs. Default is 200.
+            Maximum number of training epochs. Default is 400.
         model : None or nn.Module, optional
             Model to be trained on the given datasets. Default is None.
         use_amp : bool, optional
@@ -253,6 +253,6 @@ class Trainer:
             Current training epoch.
         """
         date = datetime.today().strftime("%Y%m%d")
-        filename = f"BM4DNet-{date}-{epoch}-{self.best_l1:.4f}.pth"
+        filename = f"BM4DNet-{date}-{epoch}-{self.best_l1:.6f}.pth"
         path = os.path.join(self.log_dir, filename)
         torch.save(self.model.state_dict(), path)
