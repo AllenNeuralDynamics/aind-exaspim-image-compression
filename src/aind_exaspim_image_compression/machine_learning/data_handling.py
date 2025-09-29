@@ -476,6 +476,9 @@ class ValidateDataset(Dataset):
         normalization_percentiles : Tuple[float], optional
             Upper and lower percentiles used to normalize the input image.
             Default is (0.5, 99.5).
+        normalized_brightness_clip : float, optional
+            Brightness value used as an upper limit that normalized intensities
+            are clipped to. Default is 10.
         sigma_bm4d : float, optional
             Smoothing parameter used in the BM4D denoising algorithm. Default
             is 16.
