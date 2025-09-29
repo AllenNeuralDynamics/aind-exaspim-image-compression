@@ -25,6 +25,7 @@ def predict(
     model,
     batch_size=32,
     normalization_percentiles=(0.5, 99.9),
+    normalized_brightness_clip=7,
     patch_size=64,
     overlap=12,
     trim=5,
@@ -45,6 +46,9 @@ def predict(
     normalization_percentiles : Tuple[int], optional
         Lower and upper percentiles used for normalization. Default is
         (0.5, 99.9).
+    normalized_brightness_clip : float, optional
+        Brightness value used as an upper limit that normalized intensities
+        are clipped to. Default is 10.
     patch_size : int, optional
         Size of the cubic patch extracted from the image. Default is 64.
     overlap : int, optional
@@ -262,6 +266,7 @@ def load_model(path, device="cuda"):
     """
     model = UNet()
     model.load_state_dict(torch.load(path, map_location=device))
+    model.to(device)
     model.eval()
     return model
 
