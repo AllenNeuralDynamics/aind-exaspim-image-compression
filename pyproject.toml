@@ -19,6 +19,7 @@ dynamic = ["version"]
 dependencies = [
     'bm4d',
     'boto3',
+    'cloud-volume[crackle,seg-codecs]',
     'fastremap',
     'gcsfs',
     'google-cloud-storage',
