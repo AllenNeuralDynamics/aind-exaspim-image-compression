@@ -8,9 +8,11 @@ Helper routines for working with images.
 
 """
 
+from cloudvolume import CloudVolume
 from concurrent.futures import ThreadPoolExecutor
 from imagecodecs.numcodecs import Jpegxl
 from itertools import product
+from matplotlib.colors import ListedColormap
 from numcodecs import Blosc, register_codec
 from ome_zarr.writer import write_multiscale
 from scipy.ndimage import uniform_filter
@@ -21,8 +23,11 @@ import gcsfs
 import matplotlib.pyplot as plt
 import numpy as np
 import s3fs
+import tensorstore as ts
 import tifffile
 import zarr
+
+from aind_exaspim_image_compression.utils import util
 
 
 # --- Readers ---
@@ -46,12 +51,14 @@ def read(img_path):
         Image volume.
     """
     # Read image
-    if ".zarr" in img_path:
-        img = _read_zarr(img_path)
-    elif ".n5" in img_path:
+    if ".n5" in img_path:
         img = _read_n5(img_path)
     elif ".tif" in img_path or ".tiff" in img_path:
         img = _read_tiff(img_path)
+    elif ".zarr" in img_path:
+        img = _read_zarr(img_path)
+    elif is_neuroglancer_precomputed(img_path):
+        img = _read_neuroglancer_precompted(img_path)
     else:
         raise ValueError(f"Unsupported image format: {img_path}")
 
@@ -59,6 +66,85 @@ def read(img_path):
     while img.ndim < 5:
         img = img[np.newaxis, ...]
     return img
+
+
+def _read_n5(img_path):
+    """
+    Reads an N5 volume from local disk or GCS.
+
+    Parameters
+    ----------
+    img_path : str
+        Path to N5 directory.
+
+    Returns
+    -------
+    zarr.core.Array
+        Image volume.
+    """
+    if is_gcs_path(img_path):
+        fs = gcsfs.GCSFileSystem(anon=False)
+        store = zarr.n5.N5FSStore(img_path, s=fs)
+    elif is_s3_path(img_path):
+        fs = s3fs.S3FileSystem(config_kwargs={"max_pool_connections": 50})
+        store = s3fs.S3Map(root=img_path, s3=fs)
+    else:
+        store = zarr.n5.N5Store(img_path)
+    return zarr.open(store, mode="r")["volume"]
+
+
+def _read_neuroglancer_precompted(img_path):
+    # Extract metadata
+    bucket, path = util.parse_cloud_path(img_path)
+    driver = get_storage_driver(img_path)
+
+    # Read image
+    img = ts.open(
+        {
+            "driver": "neuroglancer_precomputed",
+            "kvstore": {
+                "driver": driver,
+                "bucket": bucket,
+                "path": path,
+                },
+            "context": {
+                "cache_pool": {"total_bytes_limit": 1000000000},
+                "cache_pool#remote": {"total_bytes_limit": 1000000000},
+                "data_copy_concurrency": {"limit": 8},
+            },
+            "recheck_cached_data": "open",
+            }
+    ).result()
+
+    # Check whether to permute axes
+    if bucket == "allen-nd-goog":
+        img = img[ts.d["channel"][0]]
+        img = img[ts.d[0].transpose[2]]
+        img = img[ts.d[0].transpose[1]]
+    return img[:].read().result()
+    
+def _read_tiff(img_path, storage_options=None):
+    """
+    Reads a TIFF file from local disk or GCS.
+
+    Parameters
+    ----------
+    img_path : str
+        Path to TIFF file.
+    storage_options : dict, optional
+        Additional kwargs for GCSFileSystem.
+
+    Returns
+    -------
+    numpy.ndarray
+        Image volume.
+    """
+    if is_gcs_path(img_path):
+        fs = gcsfs.GCSFileSystem(**(storage_options or {}))
+        with fs.open(img_path, "rb") as f:
+            return tifffile.imread(f)
+    else:
+        return tifffile.imread(img_path)
 
 
 def _read_zarr(img_path):
@@ -76,98 +162,15 @@ def _read_zarr(img_path):
         Image volume.
     """
     register_codec(Jpegxl)
-    if _is_gcs_path(img_path):
+    if is_gcs_path(img_path):
         fs = gcsfs.GCSFileSystem(anon=False)
         store = zarr.storage.FSStore(img_path, fs=fs)
-    elif _is_s3_path(img_path):
+    elif is_s3_path(img_path):
         fs = s3fs.S3FileSystem(anon=True)
         store = s3fs.S3Map(root=img_path, s3=fs)
     else:
         store = zarr.DirectoryStore(img_path)
     return zarr.open(store, mode="r")
-
-
-def _read_n5(img_path):
-    """
-    Reads an N5 volume from local disk or GCS.
-
-    Parameters
-    ----------
-    img_path : str
-        Path to N5 directory.
-
-    Returns
-    -------
-    zarr.core.Array
-        Image volume.
-    """
-    if _is_gcs_path(img_path):
-        fs = gcsfs.GCSFileSystem(anon=False)
-        store = zarr.n5.N5FSStore(img_path, s=fs)
-    elif _is_s3_path(img_path):
-        fs = s3fs.S3FileSystem(config_kwargs={"max_pool_connections": 50})
-        store = s3fs.S3Map(root=img_path, s3=fs)
-    else:
-        store = zarr.n5.N5Store(img_path)
-    return zarr.open(store, mode="r")["volume"]
-
-
-def _read_tiff(img_path, storage_options=None):
-    """
-    Reads a TIFF file from local disk or GCS.
-
-    Parameters
-    ----------
-    img_path : str
-        Path to TIFF file.
-    storage_options : dict, optional
-        Additional kwargs for GCSFileSystem.
-
-    Returns
-    -------
-    numpy.ndarray
-        Image volume.
-    """
-    if _is_gcs_path(img_path):
-        fs = gcsfs.GCSFileSystem(**(storage_options or {}))
-        with fs.open(img_path, "rb") as f:
-            return tifffile.imread(f)
-    else:
-        return tifffile.imread(img_path)
-
-
-def _is_gcs_path(path):
-    """
-    Checks if the path is a GCS path.
-
-    Parameters
-    ----------
-    path : str
-        Path to be checked.
-
-    Returns
-    -------
-    bool
-        Indication of whether the path is a GCS path.
-    """
-    return path.startswith("gs://")
-
-
-def _is_s3_path(path):
-    """
-    Checks if the path is an S3 path.
-
-    Parameters
-    ----------
-    path : str
-        Path to be checked.
-
-    Returns
-    -------
-    bool
-        Indication of whether the path is an S3 path.
-    """
-    return path.startswith("s3://")
 
 
 # --- Read Patches ---
@@ -414,7 +417,32 @@ def compress_and_decompress_jpeg(
     return img_decompressed, cratio
 
 
-# --- Plotting ---
+# --- Visualization ---
+def make_segmentation_colormap(mask, seed=42):
+    """
+    Creates a matplotlib ListedColormap for a segmentation mask. Ensures label
+    0 maps to black and all other labels get distinct random colors.
+
+    Parameters
+    ----------
+    mask : numpy.ndarray
+        Segmentation mask with integer labels. Assumes label 0 is background.
+    seed : int, optional
+        Random seed for color reproducibility. Default is 42.
+
+    Returns
+    -------
+    ListedColormap
+        Colormap with black for background and unique colors for other labels.
+    """
+    n_labels = int(mask.max()) + 1
+    rng = np.random.default_rng(seed)
+    colors = [(0, 0, 0)]
+    colors += list(rng.uniform(0.2, 1.0, size=(n_labels - 1, 3)))
+
+    return ListedColormap(colors)
+
+
 def plot_histogram(img, bins=256, max_value=np.inf, output_path=None):
     """
     Plots a histogram of voxel intensities for a 3D image.
@@ -480,6 +508,38 @@ def plot_mips(img, output_path=None, vmax=None):
     plt.close(fig)
 
 
+def plot_segmentation_mips(mask):
+    """
+    Plots maximum intensity projections (MIPs) of a segmentation mask.
+
+    Parameters
+    ----------
+    mask : numpy.ndarray
+        Segmentation mask. Can be either:
+        - 3D array (Z, Y, X), or
+        - 5D array (N, C, Z, Y, X), in which case the first sample
+          and first channel are used.
+    """
+    fig, axs = plt.subplots(1, 3, figsize=(10, 4))
+    axs_names = ["XY", "XZ", "YZ"]
+    cmap = make_segmentation_colormap(mask)
+
+    for i in range(3):
+        if len(mask.shape) == 5:
+            mip = np.max(mask[0, 0, ...], axis=i)
+        else:
+            mip = np.max(mask, axis=i)
+
+        axs[i].imshow(mip, cmap=cmap, interpolation="none")
+        axs[i].set_title(axs_names[i], fontsize=16)
+        axs[i].set_xticks([])
+        axs[i].set_yticks([])
+
+    plt.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+
 def plot_slices(img, output_path=None, vmax=None):
     """
     Plots the middle slice of a 3D image along the XY, XZ, and YZ axes.
@@ -522,6 +582,28 @@ def plot_slices(img, output_path=None, vmax=None):
 
 
 # --- Helpers ---
+def get_storage_driver(img_path):
+    """
+    Gets the storage driver needed to read the image.
+
+    Parameters
+    ----------
+    img_path : str
+        Image path to be checked.
+
+    Returns
+    -------
+    str
+        Storage driver needed to read the image.
+    """
+    if is_s3_path(img_path):
+        return "s3"
+    elif is_gcs_path(img_path):
+        return "gcs"
+    else:
+        raise ValueError(f"Unsupported path type: {img_path}")
+
+
 def get_slices(center, shape):
     """
     Gets the start and end indices of the chunk to be read.
@@ -542,47 +624,85 @@ def get_slices(center, shape):
     return tuple(slice(s, s + d) for s, d in zip(start, shape))
 
 
-def init_ome_zarr(
-    output_path,
-    shape,
-    chunks=(1, 1, 64, 128, 128),
-    compressor=Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
-):
+def is_gcs_path(path):
     """
-    Initializes an OME-Zarr dataset on disk for a given image.
+    Checks if the path is a GCS path.
 
     Parameters
     ----------
-    output_path : str or Path
-        Path to the directory where the OME-Zarr dataset will be created.
-    shape : Tuple[int]
-        Shape of OME-Zarr dataset.
-    chunks : Tuple[int], optional
-        Chunk sizes for the dataset. Default is (1, 1, 64, 128, 128).
-    compressor : numcodecs.Blosc, optional
-        Compression codec used for chunk compression. Default is Blosc with
-        "zstd" compression, compression level 5, and shuffle enabled.
+    path : str
+        Path to be checked.
 
     Returns
     -------
-    zarr.core.Array
-        Zarr dataset object corresponding to the initialized OME-Zarr dataset.
+    bool
+        Indication of whether the path is a GCS path.
     """
-    # Setup output store
-    store = zarr.DirectoryStore(output_path, dimension_separator="/")
-    zgroup = zarr.group(store=store)
+    return path.startswith("gs://")
 
-    # Create top-level dataset
-    print("Creating OME-ZARR Image with Shape:", shape)
-    output_zarr = zgroup.create_dataset(
-        name=0,
-        shape=shape,
-        chunks=chunks,
-        dtype=np.uint16,
-        compressor=compressor,
-        overwrite=True
-    )
-    return output_zarr
+
+def is_inbounds(voxel, shape):
+    """
+    Checks if a given voxel is within the bounds of a 3D grid.
+
+    Parameters
+    ----------
+    voxel : Tuple[int]
+        Voxel coordinate to be checked.
+    shape : Tuple[int]
+        Shape of the 3D grid.
+
+    Returns
+    -------
+    bool
+        Indication of whether the given voxel is within the bounds of the
+        grid.
+    """
+    x, y, z = voxel
+    height, width, depth = shape
+    if 0 <= x < height and 0 <= y < width and 0 <= z < depth:
+        return True
+    else:
+        return False
+
+
+def is_neuroglancer_precomputed(path):
+    """
+    Checks if the path points to a neuroglancer precomputed dataset.
+
+    Parameters
+    ----------
+    path : str
+        Path to be checked.
+
+    Returns
+    -------
+    bool
+        Indication of whether the path points to a neuroglancer precomputed
+        dataset.
+    """
+    try:
+        vol = CloudVolume(path)
+        return all(k in vol.info for k in ["data_type", "scales", "type"])
+    except Exception:
+        return False
+
+
+def is_s3_path(path):
+    """
+    Checks if the path is an S3 path.
+
+    Parameters
+    ----------
+    path : str
+        Path to be checked.
+
+    Returns
+    -------
+    bool
+        Indication of whether the path is an S3 path.
+    """
+    return path.startswith("s3://")
 
 
 def write_ome_zarr(
@@ -628,47 +748,7 @@ def write_ome_zarr(
     )
 
 
-def compute_mae(img1, img2):
-    """
-    Computes the mean absolute difference between two 3D images.
-
-    Parameters
-    ----------
-    img1 : numpy.ndarray
-        3D Image.
-    img2 : numpy.ndarray
-        3D Image.
-
-    Returns
-    -------
-    float
-        Mean absolute difference between two 3D images.
-    """
-    return np.mean(abs(img1 - img2))
-
-
-def compute_lmax(img1, img2, p=99.99):
-    """
-    Computes the stable l-inf norm between two 3D images.
-
-    Parameters
-    ----------
-    img1 : numpy.ndarray
-        3D Image.
-    img2 : numpy.ndarray
-        3D Image.
-    p : float, optional
-        Percentile used to compute stable l-inf norm. Default is 99.99.
-
-    Returns
-    -------
-    float
-        Stable l-inf norm between two 3D images.
-    """
-    return np.percentile(abs(img1 - img2), p)
-
-
-def compute_ssim3D(img1, img2, data_range=None, window_size=16):
+def ssim3D(img1, img2, data_range=None, window_size=16):
     """
     Computes the structural similarity (SSIM) between two 3D images.
 
@@ -713,62 +793,3 @@ def compute_ssim3D(img1, img2, data_range=None, window_size=16):
     denominator = (mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2)
     ssim_map = numerator / (np.maximum(denominator, 1e-8) + 1e-6)
     return np.mean(ssim_map)
-
-
-def get_nbs(voxel, shape):
-    """
-    Gets the neighbors of a given voxel in a 3D grid with respect to
-    26-connectivity.
-
-    Parameters
-    ----------
-    voxel : Tuple[int]
-        Voxel coordinate for which neighbors are to be found.
-    shape : Tuple[int]
-        Shape of the 3D grid. This is used to ensure that neighbors are
-        within the grid boundaries.
-
-    Returns
-    -------
-    List[Tuple[int]]
-        Voxel coordinates of the neighboring voxels.
-    """
-    x, y, z = voxel
-    nbs = []
-    for dx in [-1, 0, 1]:
-        for dy in [-1, 0, 1]:
-            for dz in [-1, 0, 1]:
-                # Skip the given voxel
-                if dx == 0 and dy == 0 and dz == 0:
-                    continue
-
-                # Add neighbor
-                nb = (x + dx, y + dy, z + dz)
-                if is_inbounds(nb, shape):
-                    nbs.append(nb)
-    return nbs
-
-
-def is_inbounds(voxel, shape):
-    """
-    Checks if a given voxel is within the bounds of a 3D grid.
-
-    Parameters
-    ----------
-    voxel : Tuple[int]
-        Voxel coordinate to be checked.
-    shape : Tuple[int]
-        Shape of the 3D grid.
-
-    Returns
-    -------
-    bool
-        Indication of whether the given voxel is within the bounds of the
-        grid.
-    """
-    x, y, z = voxel
-    height, width, depth = shape
-    if 0 <= x < height and 0 <= y < width and 0 <= z < depth:
-        return True
-    else:
-        return False
