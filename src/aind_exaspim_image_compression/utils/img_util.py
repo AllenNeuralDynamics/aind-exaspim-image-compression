@@ -122,7 +122,8 @@ def _read_neuroglancer_precompted(img_path):
         img = img[ts.d[0].transpose[2]]
         img = img[ts.d[0].transpose[1]]
     return img[:].read().result()
-    
+
+
 def _read_tiff(img_path, storage_options=None):
     """
     Reads a TIFF file from local disk or GCS.
@@ -347,7 +348,9 @@ def compute_cratio(img, codec, patch_shape=(64, 64, 64)):
     return round(total_uncompressed_size / total_compressed_size, 2)
 
 
-def compute_cratio_jpegxl(img, codec, patch_shape=(128, 128, 64), max_workers=32):
+def compute_cratio_jpegxl(
+    img, codec, patch_shape=(128, 128, 64), max_workers=32
+):
     # Helper routine
     def compress_patch(idx):
         iterator = zip(idx, patch_shape, img.shape)

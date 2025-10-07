@@ -121,6 +121,7 @@ class Reader:
             # Path to single SWC file
             if ".swc" in swc_pointer:
                 return self.read_from_path(swc_pointer)
+
         # No swcs found
         print(f"No swcs found at -{swc_pointer}-")
         return list()
