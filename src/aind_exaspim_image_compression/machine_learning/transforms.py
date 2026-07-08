@@ -1,0 +1,362 @@
+"""
+Dynamic-range-preserving intensity transforms for exaSPIM denoising and
+compression.
+
+Provides fixed, stateless forward/inverse transforms that map raw uint16
+counts to a bounded, network-friendly domain and back. Two families are
+implemented:
+
+    * ``AsinhTransform``   - HDR-style asinh compression (log-like tail).
+    * ``AnscombeTransform`` - generalized Anscombe variance-stabilizing
+      transform for Poisson-Gaussian noise (sqrt-like tail).
+
+The same transform object is meant to be used identically during training,
+validation, and inference. Neither transform applies a hard brightness clip
+below the physical sensor maximum, so bright structure keeps a distinct,
+invertible value instead of being flattened by a percentile clip.
+
+"""
+
+import numpy as np
+
+
+class IntensityTransform:
+    """
+    Abstract base class for count <-> normalized intensity transforms.
+    """
+
+    def forward(self, x):
+        """
+        Maps raw counts to the normalized (approximately [0, 1]) domain.
+
+        Parameters
+        ----------
+        x : numpy.ndarray
+            Image in raw count units.
+
+        Returns
+        -------
+        numpy.ndarray
+            Image in the normalized domain.
+        """
+        raise NotImplementedError
+
+    def inverse(self, y):
+        """
+        Maps normalized values back to raw uint16 counts.
+
+        Parameters
+        ----------
+        y : numpy.ndarray
+            Image in the normalized domain.
+
+        Returns
+        -------
+        numpy.ndarray
+            Image in raw count units, clipped to the physical range.
+        """
+        raise NotImplementedError
+
+
+class AsinhTransform(IntensityTransform):
+    """
+    HDR-style asinh intensity transform.
+
+    The transform is approximately linear for ``(x - offset) << scale`` and
+    approximately logarithmic for ``(x - offset) >> scale``, so it is
+    monotonic and invertible over the whole range with no plateau.
+
+    ``scale`` is the dynamic-range knob: larger values stay linear longer
+    (more faithful absolute range, less headroom); smaller values compress
+    the bright tail harder (more headroom).
+
+    The normalized output is only *approximately* [0, 1]: sub-background
+    voxels (``x < offset``) map to small negative values. This is intentional
+    (it preserves noise-floor symmetry) and harmless downstream. The only
+    hard bound is the physical clamp applied in ``inverse``.
+
+    Attributes
+    ----------
+    offset : float
+        Background / black-point in counts.
+    scale : float
+        Count scale of the linear-to-log knee.
+    max_count : float
+        Physical sensor maximum used as the normalization reference.
+    """
+
+    def __init__(self, offset=0.0, scale=32.0, max_count=65535.0):
+        """
+        Instantiates an AsinhTransform.
+
+        Parameters
+        ----------
+        offset : float, optional
+            Background / black-point in counts. Default is 0.0.
+        scale : float, optional
+            Count scale of the linear-to-log knee. Default is 32.0.
+        max_count : float, optional
+            Physical sensor maximum used as the normalization reference.
+            Default is 65535.0.
+        """
+        self.offset = float(offset)
+        self.scale = float(scale)
+        self.max_count = float(max_count)
+        self._norm = float(
+            np.arcsinh((self.max_count - self.offset) / self.scale)
+        )
+
+    def forward(self, x):
+        """
+        Maps raw counts to the normalized asinh domain.
+
+        Parameters
+        ----------
+        x : numpy.ndarray
+            Image in raw count units.
+
+        Returns
+        -------
+        numpy.ndarray
+            Normalized image (approximately [0, 1]), float32.
+        """
+        x = np.asarray(x, dtype=np.float32)
+        y = np.arcsinh((x - self.offset) / self.scale) / self._norm
+        return y.astype(np.float32)
+
+    def inverse(self, y):
+        """
+        Maps normalized asinh values back to raw uint16 counts.
+
+        Parameters
+        ----------
+        y : numpy.ndarray
+            Image in the normalized asinh domain.
+
+        Returns
+        -------
+        numpy.ndarray
+            Image in raw counts, clipped to [0, max_count], uint16.
+        """
+        y = np.asarray(y, dtype=np.float32)
+        counts = self.offset + self.scale * np.sinh(y * self._norm)
+        counts = np.clip(counts, 0, self.max_count)
+        return np.rint(counts).astype(np.uint16)
+
+
+class AnscombeTransform(IntensityTransform):
+    """
+    Generalized Anscombe variance-stabilizing transform.
+
+    Models the data as ``x = gain * Poisson + Normal(offset, read_noise^2)``
+    (Makitalo & Foi). The transform is sqrt-like, so it compresses the bright
+    tail more gently than asinh while making the noise approximately
+    homoscedastic. It reduces to the standard Anscombe transform
+    ``2 * sqrt(x + 3/8)`` when ``gain=1``, ``read_noise=0``, ``offset=0``.
+
+    The inverse is a closed form whose constant depends on
+    ``unbiased_inverse``: the algebraic inverse (3/8) exactly round-trips the
+    forward transform, while the asymptotically unbiased inverse (1/8) is
+    appropriate for inverting denoised (expectation) values and therefore
+    does not round-trip exactly.
+
+    Attributes
+    ----------
+    gain : float
+        Detector gain in counts per photo-electron.
+    read_noise : float
+        Gaussian read-noise standard deviation in counts.
+    offset : float
+        Dark / pedestal offset in counts.
+    max_count : float
+        Physical sensor maximum used as the normalization reference.
+    unbiased_inverse : bool
+        Whether the inverse uses the asymptotically unbiased constant.
+    """
+
+    def __init__(
+        self,
+        gain=1.0,
+        read_noise=0.0,
+        offset=0.0,
+        max_count=65535.0,
+        unbiased_inverse=True,
+    ):
+        """
+        Instantiates an AnscombeTransform.
+
+        Parameters
+        ----------
+        gain : float, optional
+            Detector gain in counts per photo-electron. Default is 1.0.
+        read_noise : float, optional
+            Gaussian read-noise standard deviation in counts. Default is 0.0.
+        offset : float, optional
+            Dark / pedestal offset in counts. Default is 0.0.
+        max_count : float, optional
+            Physical sensor maximum used as the normalization reference.
+            Default is 65535.0.
+        unbiased_inverse : bool, optional
+            If True, use the asymptotically unbiased inverse (constant 1/8),
+            appropriate for inverting denoised values. If False, use the
+            exact algebraic inverse (constant 3/8), which round-trips the
+            forward transform. Default is True.
+        """
+        self.gain = float(gain)
+        self.read_noise = float(read_noise)
+        self.offset = float(offset)
+        self.max_count = float(max_count)
+        self.unbiased_inverse = bool(unbiased_inverse)
+        self._c_inv = 1.0 / 8.0 if unbiased_inverse else 3.0 / 8.0
+        self._norm = float(
+            self._gat(np.asarray(self.max_count, dtype=np.float32))
+        )
+
+    def _gat(self, x):
+        """
+        Evaluates the unnormalized generalized Anscombe transform.
+
+        Parameters
+        ----------
+        x : numpy.ndarray
+            Image in raw count units.
+
+        Returns
+        -------
+        numpy.ndarray
+            Variance-stabilized values (before normalization).
+        """
+        arg = (
+            self.gain * (x - self.offset)
+            + (3.0 / 8.0) * self.gain ** 2
+            + self.read_noise ** 2
+        )
+        return (2.0 / self.gain) * np.sqrt(np.maximum(arg, 0.0))
+
+    def forward(self, x):
+        """
+        Maps raw counts to the normalized Anscombe domain.
+
+        Parameters
+        ----------
+        x : numpy.ndarray
+            Image in raw count units.
+
+        Returns
+        -------
+        numpy.ndarray
+            Normalized image (approximately [0, 1]), float32.
+        """
+        gat = self._gat(np.asarray(x, dtype=np.float32))
+        return (gat / self._norm).astype(np.float32)
+
+    def inverse(self, y):
+        """
+        Maps normalized Anscombe values back to raw uint16 counts.
+
+        Parameters
+        ----------
+        y : numpy.ndarray
+            Image in the normalized Anscombe domain.
+
+        Returns
+        -------
+        numpy.ndarray
+            Image in raw counts, clipped to [0, max_count], uint16.
+        """
+        d = np.clip(np.asarray(y, dtype=np.float32), 0.0, None) * self._norm
+        arg = (d * self.gain / 2.0) ** 2
+        counts = self.offset + (
+            arg - self._c_inv * self.gain ** 2 - self.read_noise ** 2
+        ) / self.gain
+        counts = np.clip(counts, 0, self.max_count)
+        return np.rint(counts).astype(np.uint16)
+
+
+def estimate_offset(sample, percentile=1.0):
+    """
+    Estimates a robust global background / black-point (counts).
+
+    Compute this once over a representative sample of the training set, then
+    freeze it into the transform config. Do not recompute per patch or per
+    inference volume.
+
+    Parameters
+    ----------
+    sample : numpy.ndarray
+        Representative sample of raw counts.
+    percentile : float, optional
+        Low percentile used as the background estimate. Default is 1.0.
+
+    Returns
+    -------
+    float
+        Estimated background offset in counts.
+    """
+    sample = np.asarray(sample, dtype=np.float32)
+    return float(np.percentile(sample, percentile))
+
+
+def build_transform(cfg):
+    """
+    Builds an intensity transform from a config dict.
+
+    Params are treated as frozen constants; any data-calibrated value must
+    already be baked into ``cfg`` (see ``calibrate_transform``) so that
+    training and inference construct the identical transform.
+
+    Parameters
+    ----------
+    cfg : dict
+        Config of the form ``{"kind": "asinh" | "anscombe",
+        "params": {...}}``.
+
+    Returns
+    -------
+    IntensityTransform
+        The constructed transform.
+
+    Raises
+    ------
+    ValueError
+        If ``cfg["kind"]`` is not a recognized transform kind.
+    """
+    kind = cfg["kind"]
+    params = cfg.get("params", {})
+    if kind == "asinh":
+        return AsinhTransform(**params)
+    if kind == "anscombe":
+        return AnscombeTransform(**params)
+    raise ValueError(f"Unknown transform kind: {kind}")
+
+
+def calibrate_transform(cfg, sample):
+    """
+    Freezes data-driven params into a transform config, once, globally.
+
+    Only the black-point ``offset`` is calibrated, from a low percentile of
+    the sample; the scale/knee (asinh) and gain/read_noise (Anscombe) are not
+    taken from high signal percentiles. The input ``cfg`` is not mutated; the
+    returned cfg is what should be serialized with the model and reused
+    verbatim at inference.
+
+    Parameters
+    ----------
+    cfg : dict
+        Transform config, optionally containing a ``"calibrate"`` block of
+        the form ``{"offset": bool, "offset_percentile": float}``.
+    sample : numpy.ndarray
+        Representative sample of raw counts used for calibration.
+
+    Returns
+    -------
+    dict
+        A new config with calibrated params frozen in.
+    """
+    cfg = {**cfg, "params": dict(cfg.get("params", {}))}
+    calib = cfg.get("calibrate", {})
+    if calib.get("offset", False):
+        cfg["params"]["offset"] = estimate_offset(
+            sample, percentile=calib.get("offset_percentile", 1.0)
+        )
+    return cfg
