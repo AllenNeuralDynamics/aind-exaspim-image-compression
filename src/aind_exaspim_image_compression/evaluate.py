@@ -18,10 +18,12 @@ import os
 import pandas as pd
 import torch
 
-from aind_exaspim_image_compression.inference import predict, predict_patch
+from aind_exaspim_image_compression.inference import (
+    build_volume_transform, predict, predict_patch,
+)
 from aind_exaspim_image_compression.machine_learning import data_handling
 from aind_exaspim_image_compression.machine_learning.transforms import (
-    build_transform,
+    build_transform, with_offset,
 )
 from aind_exaspim_image_compression.utils import img_util, util
 from aind_exaspim_image_compression.utils.img_util import (
@@ -31,7 +33,8 @@ from aind_exaspim_image_compression.utils.img_util import (
 
 class SupervisedEvaluator:
     def __init__(
-        self, img_paths, model, output_dir, transform=None, device="cuda"
+        self, img_paths, model, output_dir, transform=None, device="cuda",
+        raw_input=True,
     ):
         # Instance attributes
         self.codec = blosc.Blosc(cname="zstd", clevel=6, shuffle=blosc.SHUFFLE)
@@ -40,6 +43,7 @@ class SupervisedEvaluator:
         self.model = model
         self.model.eval().to(device)
         self.transform = transform or build_transform({"kind": "asinh"})
+        self.raw_input = raw_input
 
         # Initialize output directory
         self.output_dir = output_dir
@@ -84,9 +88,16 @@ class SupervisedEvaluator:
         df = pd.DataFrame(index=rows, columns=["cratio", "ssim"])
         desc = "Denoise Blocks"
         for block_id, noise in tqdm(self.noise_imgs.items(), desc=desc):
+            # For raw input, estimate this block's background offset so it is
+            # normalized to the same space the model was trained on.
+            if self.raw_input:
+                transform = build_volume_transform(self.transform, noise)
+            else:
+                transform = self.transform
+
             # Run model
             denoised = predict(
-                noise, self.model, self.transform, verbose=False
+                noise, self.model, transform, verbose=False
             )
 
             # Compute metrics
@@ -114,7 +125,8 @@ class SupervisedEvaluator:
 
 class UnsupervisedEvaluator:
     def __init__(
-        self, root_dir, model, img_paths_json, patch_shape, transform=None
+        self, root_dir, model, img_paths_json, patch_shape, transform=None,
+        offsets=None, raw_input=True,
     ):
         # Class attributes
         self.codec = blosc.Blosc(cname="zstd", clevel=6, shuffle=blosc.SHUFFLE)
@@ -125,6 +137,8 @@ class UnsupervisedEvaluator:
         self.data_dir = os.path.join(root_dir, "data")
         self.result_dir = os.path.join(root_dir, "models")
         self.transform = transform or build_transform({"kind": "asinh"})
+        self.offsets = offsets or dict()
+        self.raw_input = raw_input
 
         # Initialize directories
         util.mkdir(self.result_dir)
@@ -170,6 +184,16 @@ class UnsupervisedEvaluator:
             "lmax_gt": list()
         }
 
+        # For raw input, apply this brain's background offset (from the same
+        # per-brain offsets used in training). Estimated once per brain, not
+        # per patch, to avoid content-dependent offsets.
+        if self.raw_input:
+            transform = with_offset(
+                self.transform, self.offsets.get(brain_id, 0.0)
+            )
+        else:
+            transform = self.transform
+
         # Run evaluation
         for voxel in tqdm(voxels, desc=brain_id):
             # Get images
@@ -177,7 +201,7 @@ class UnsupervisedEvaluator:
             noise = input_noise[5:-5, 5:-5, 5:-5]
             denoised_gt = np.maximum(bm4d(noise, 10), 0).astype(int)
             denoised = predict_patch(
-                input_noise, self.model, self.transform
+                input_noise, self.model, transform
             )[5:-5, 5:-5, 5:-5]
 
             # Compute metrics
