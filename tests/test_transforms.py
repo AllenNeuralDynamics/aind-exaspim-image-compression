@@ -12,6 +12,7 @@ from aind_exaspim_image_compression.machine_learning.transforms import (
     build_transform,
     calibrate_transform,
     estimate_offset,
+    with_offset,
 )
 
 
@@ -116,11 +117,23 @@ class HelperTest(unittest.TestCase):
     """Tests for module-level helpers."""
 
     def test_estimate_offset(self):
-        """Offset estimate matches the requested percentile."""
-        sample = np.arange(0, 101, dtype=np.float32)
-        self.assertAlmostEqual(estimate_offset(sample, percentile=0), 0.0)
-        self.assertAlmostEqual(estimate_offset(sample, percentile=50), 50.0)
+        """Offset estimate matches the percentile and ignores zeros."""
+        sample = np.arange(0, 101, dtype=np.float32)  # 0..100
+        # ignore_zeros (default) drops the single 0 -> values are 1..100
+        self.assertAlmostEqual(estimate_offset(sample, percentile=0), 1.0)
         self.assertAlmostEqual(estimate_offset(sample, percentile=100), 100.0)
+        # keeping zeros, the 0th percentile is 0
+        self.assertAlmostEqual(
+            estimate_offset(sample, percentile=0, ignore_zeros=False), 0.0
+        )
+
+    def test_with_offset(self):
+        """with_offset rebuilds a transform with a new offset only."""
+        base = build_transform({"kind": "asinh", "params": {"scale": 32}})
+        shifted = with_offset(base, 120.0)
+        self.assertAlmostEqual(shifted.offset, 120.0)
+        self.assertAlmostEqual(shifted.scale, 32.0)
+        self.assertEqual(shifted.cfg["params"]["offset"], 120.0)
 
     def test_build_transform(self):
         """Factory builds each kind and rejects unknown kinds."""
@@ -146,7 +159,7 @@ class HelperTest(unittest.TestCase):
 
     def test_calibrate_transform_sets_offset(self):
         """Calibration freezes the offset without mutating the input."""
-        sample = np.arange(0, 1000, dtype=np.float32)
+        sample = np.arange(1, 1001, dtype=np.float32)  # no zeros
         cfg = {
             "kind": "asinh",
             "calibrate": {"offset": True, "offset_percentile": 10.0},

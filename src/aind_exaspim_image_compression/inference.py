@@ -19,6 +19,8 @@ import torch
 
 from aind_exaspim_image_compression.machine_learning.transforms import (
     build_transform,
+    estimate_offset,
+    with_offset,
 )
 from aind_exaspim_image_compression.machine_learning.unet3d import UNet
 
@@ -276,6 +278,35 @@ def load_model(path, device="cuda"):
     model.to(device)
     model.eval()
     return model, build_transform(transform_cfg)
+
+
+def build_volume_transform(base_transform, img, percentile=0.1):
+    """
+    Builds a per-volume transform whose offset is estimated from the image.
+
+    Use at inference on raw (non-background-subtracted) volumes: it estimates
+    the background offset from a low percentile of the nonzero voxels and
+    returns a transform with that offset plus the trained transform's kind and
+    scale. This mirrors the per-brain offset subtracted during training, so a
+    raw volume is normalized to the same background-at-zero space the model
+    was trained on.
+
+    Parameters
+    ----------
+    base_transform : IntensityTransform
+        The transform the model was trained with (e.g., from load_model).
+    img : numpy.ndarray
+        Raw image volume to be denoised.
+    percentile : float, optional
+        Low percentile used as the background estimate. Default is 0.1.
+
+    Returns
+    -------
+    IntensityTransform
+        A transform carrying the per-volume offset.
+    """
+    offset = estimate_offset(img, percentile=percentile, ignore_zeros=True)
+    return with_offset(base_transform, offset)
 
 
 def to_tensor(arr, device="cuda"):

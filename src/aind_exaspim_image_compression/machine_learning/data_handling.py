@@ -55,6 +55,7 @@ class TrainDataset(Dataset):
         min_foreground_voxels=50,
         min_segmentation_volume=200,
         n_examples_per_epoch=300,
+        offsets=None,
         prefetch_foreground_sampling=16,
         preserve_foreground=True,
         sigma_bm4d=16,
@@ -70,6 +71,7 @@ class TrainDataset(Dataset):
         self.min_foreground_voxels = min_foreground_voxels
         self.min_segmentation_volume = min_segmentation_volume
         self.n_examples_per_epoch = n_examples_per_epoch
+        self.offsets = offsets or dict()
         self.patch_shape = patch_shape
         self.preserve_foreground = preserve_foreground
         self.prefetch_foreground_sampling = prefetch_foreground_sampling
@@ -179,6 +181,7 @@ class TrainDataset(Dataset):
         brain_id = self.sample_brain()
         voxel = self.sample_voxel(brain_id)
         raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
+        raw = raw - self.offsets.get(brain_id, 0.0)
         teacher = bm4d(raw, self.sigma_bm4d)
         teacher = np.clip(teacher, 0, self.transform.max_count)
 
@@ -513,7 +516,7 @@ class ValidateDataset(Dataset):
 
     def __init__(
         self, patch_shape, sigma_bm4d=16, transform=None,
-        preserve_foreground=True,
+        preserve_foreground=True, offsets=None,
     ):
         """
         Instantiates a ValidateDataset object.
@@ -531,6 +534,9 @@ class ValidateDataset(Dataset):
         preserve_foreground : bool, optional
             Whether targets keep raw counts on the foreground. Default is
             True.
+        offsets : dict, optional
+            Per-brain background offsets subtracted from raw patches before
+            the transform. Default is None (no subtraction).
         """
         # Call parent class
         super(ValidateDataset, self).__init__()
@@ -540,6 +546,7 @@ class ValidateDataset(Dataset):
         self.sigma_bm4d = sigma_bm4d
         self.transform = transform or build_transform({"kind": "asinh"})
         self.preserve_foreground = preserve_foreground
+        self.offsets = offsets or dict()
 
         # Data structures
         self.example_ids = list()
@@ -586,6 +593,7 @@ class ValidateDataset(Dataset):
         """
         # Sample image patch and its BM4D-denoised target
         raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
+        raw = raw - self.offsets.get(brain_id, 0.0)
         teacher = bm4d(raw, self.sigma_bm4d)
         teacher = np.clip(teacher, 0, self.transform.max_count)
 
@@ -736,6 +744,7 @@ def init_datasets(
     swc_pointers=None,
     transform_cfg=None,
     preserve_foreground=True,
+    offsets=None,
 ):
     # Initializations
     if transform_cfg is None:
@@ -746,6 +755,7 @@ def init_datasets(
         min_foreground_voxels=min_foreground_voxels,
         min_segmentation_volume=min_segmentation_volume,
         n_examples_per_epoch=n_train_examples_per_epoch,
+        offsets=offsets,
         preserve_foreground=preserve_foreground,
         sigma_bm4d=sigma_bm4d
     )
@@ -753,6 +763,7 @@ def init_datasets(
         patch_shape,
         sigma_bm4d=sigma_bm4d,
         preserve_foreground=preserve_foreground,
+        offsets=offsets,
     )
 
     # Read segmentation path lookup (if applicable)

@@ -355,27 +355,30 @@ class LinearClipTransform(IntensityTransform):
         return np.rint(counts).astype(np.uint16)
 
 
-def estimate_offset(sample, percentile=1.0):
+def estimate_offset(sample, percentile=1.0, ignore_zeros=True):
     """
-    Estimates a robust global background / black-point (counts).
-
-    Compute this once over a representative sample of the training set, then
-    freeze it into the transform config. Do not recompute per patch or per
-    inference volume.
+    Estimates a robust background / black-point (counts).
 
     Parameters
     ----------
     sample : numpy.ndarray
-        Representative sample of raw counts.
+        Sample of raw counts (e.g., a coarse multiscale level or a volume).
     percentile : float, optional
         Low percentile used as the background estimate. Default is 1.0.
+    ignore_zeros : bool, optional
+        If True, exclude exactly-zero voxels so that zero-padding outside the
+        imaged volume does not drag the estimate to 0. Default is True.
 
     Returns
     -------
     float
         Estimated background offset in counts.
     """
-    sample = np.asarray(sample, dtype=np.float32)
+    sample = np.asarray(sample, dtype=np.float32).reshape(-1)
+    if ignore_zeros:
+        nonzero = sample[sample > 0]
+        if nonzero.size:
+            sample = nonzero
     return float(np.percentile(sample, percentile))
 
 
@@ -449,3 +452,33 @@ def calibrate_transform(cfg, sample):
             sample, percentile=calib.get("offset_percentile", 1.0)
         )
     return cfg
+
+
+def with_offset(transform, offset):
+    """
+    Returns a copy of an asinh/anscombe transform with a new offset.
+
+    Used to apply a per-volume background offset at inference: estimate the
+    offset from the raw volume, then rebuild the (frozen) transform with that
+    offset while keeping its kind, scale, and max_count. This mirrors the
+    per-brain offset subtracted during training.
+
+    Parameters
+    ----------
+    transform : IntensityTransform
+        A transform built via ``build_transform`` (so it carries ``.cfg``).
+    offset : float
+        Background offset in counts.
+
+    Returns
+    -------
+    IntensityTransform
+        A new transform with the given offset.
+    """
+    cfg = getattr(transform, "cfg", None)
+    if cfg is None:
+        raise ValueError(
+            "transform has no cfg; construct it via build_transform"
+        )
+    params = {**cfg.get("params", {}), "offset": float(offset)}
+    return build_transform({**cfg, "params": params})
