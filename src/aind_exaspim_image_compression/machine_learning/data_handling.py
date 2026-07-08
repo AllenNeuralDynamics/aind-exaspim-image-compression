@@ -117,14 +117,19 @@ class TrainDataset(Dataset):
             Path to segmentation.
         """
         if segmentation_path:
+            # Parse into (bucket, key), tolerating a full gs://bucket/key URL
+            # or a bucket-relative key. The kvstore path must not include the
+            # gs://bucket/ prefix, or tensorstore doubles it.
+            bucket, key = self._parse_gcs_path(segmentation_path)
+
             # Load image
             label_mask = ts.open(
                 {
                     "driver": "neuroglancer_precomputed",
                     "kvstore": {
                         "driver": "gcs",
-                        "bucket": "allen-nd-goog",
-                        "path": segmentation_path,
+                        "bucket": bucket,
+                        "path": key,
                     },
                     "context": {
                         "cache_pool": {"total_bytes_limit": 1000000000},
@@ -140,6 +145,33 @@ class TrainDataset(Dataset):
             label_mask = label_mask[ts.d[0].transpose[2]]
             label_mask = label_mask[ts.d[0].transpose[1]]
             self.segmentations[brain_id] = label_mask
+
+    @staticmethod
+    def _parse_gcs_path(path, default_bucket="allen-nd-goog"):
+        """
+        Splits a GCS path into a (bucket, key) pair.
+
+        Accepts either a full ``gs://bucket/key`` URL or a bucket-relative
+        key. The kvstore "path" must be relative to the bucket, so the
+        ``gs://bucket/`` prefix is stripped when present.
+
+        Parameters
+        ----------
+        path : str
+            Full gs:// URL or bucket-relative key.
+        default_bucket : str, optional
+            Bucket used when "path" has no gs:// scheme. Default is
+            "allen-nd-goog".
+
+        Returns
+        -------
+        Tuple[str]
+            The (bucket, key) pair.
+        """
+        if path.startswith("gs://"):
+            bucket, _, key = path[len("gs://"):].partition("/")
+            return bucket, key
+        return default_bucket, path
 
     def _load_swcs(self, brain_id, swc_pointer):
         if swc_pointer:
