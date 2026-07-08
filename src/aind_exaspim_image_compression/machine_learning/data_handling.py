@@ -52,6 +52,8 @@ class TrainDataset(Dataset):
         anisotropy=(0.748, 0.748, 1.0),
         boundary_buffer=5000,
         foreground_sampling_rate=0.5,
+        min_foreground_voxels=50,
+        min_segmentation_volume=200,
         n_examples_per_epoch=300,
         prefetch_foreground_sampling=16,
         preserve_foreground=True,
@@ -65,6 +67,8 @@ class TrainDataset(Dataset):
         self.anisotropy = anisotropy
         self.boundary_buffer = boundary_buffer
         self.foreground_sampling_rate = foreground_sampling_rate
+        self.min_foreground_voxels = min_foreground_voxels
+        self.min_segmentation_volume = min_segmentation_volume
         self.n_examples_per_epoch = n_examples_per_epoch
         self.patch_shape = patch_shape
         self.preserve_foreground = preserve_foreground
@@ -332,7 +336,7 @@ class TrainDataset(Dataset):
         best_voxel = self.sample_interior_voxel(brain_id)
         cnt = 0
         with ThreadPoolExecutor() as executor:
-            while best_volume < 1600:
+            while best_volume < self.min_segmentation_volume:
                 # Read random image patches
                 pending = dict()
                 for _ in range(self.prefetch_foreground_sampling):
@@ -364,7 +368,12 @@ class TrainDataset(Dataset):
 
     def sample_bright_voxel(self, brain_id):
         """
-        Samples a voxel coordinate whose image patch is sufficiently bright.
+        Samples a voxel whose patch has enough foreground voxels.
+
+        Foreground is counted with the same robust mask used for targets and
+        metrics (median + k * sigma), so the threshold adapts to each patch
+        instead of using a fixed intensity cutoff. The occupancy requirement
+        is low enough (min_foreground_voxels) to accept thin fibers.
 
         Parameters
         ----------
@@ -374,14 +383,14 @@ class TrainDataset(Dataset):
         Returns
         -------
         best_voxel : Tuple[int]
-            Voxel coordinate whose patch is sufficiently bright or is the
-            highest observed brightness after 4 * self.prefetch attempts.
+            Voxel coordinate whose patch has the most foreground voxels found,
+            stopping once min_foreground_voxels is reached.
         """
         best_brightness = 0
         best_voxel = self.sample_interior_voxel(brain_id)
         cnt = 0
         with ThreadPoolExecutor() as executor:
-            while best_brightness < 1000:
+            while best_brightness < self.min_foreground_voxels:
                 # Read random image patches
                 pending = dict()
                 for _ in range(self.prefetch_foreground_sampling):
@@ -391,11 +400,11 @@ class TrainDataset(Dataset):
                     )
                     pending[thread] = voxel
 
-                # Check if image patch is bright enough
+                # Check if image patch has enough foreground
                 for thread in as_completed(pending.keys()):
                     voxel = pending.pop(thread)
                     img_patch = thread.result()
-                    brightness = np.sum(img_patch > 100)
+                    brightness = int(make_foreground_mask(img_patch).sum())
                     if brightness > best_brightness:
                         best_voxel = voxel
                         best_brightness = brightness
@@ -718,6 +727,8 @@ def init_datasets(
     img_paths_json,
     patch_shape,
     foreground_sampling_rate=0.5,
+    min_foreground_voxels=50,
+    min_segmentation_volume=200,
     n_train_examples_per_epoch=100,
     n_validate_examples=0,
     segmentation_prefixes_path=None,
@@ -732,6 +743,8 @@ def init_datasets(
     train_dataset = TrainDataset(
         patch_shape,
         foreground_sampling_rate=foreground_sampling_rate,
+        min_foreground_voxels=min_foreground_voxels,
+        min_segmentation_volume=min_segmentation_volume,
         n_examples_per_epoch=n_train_examples_per_epoch,
         preserve_foreground=preserve_foreground,
         sigma_bm4d=sigma_bm4d
