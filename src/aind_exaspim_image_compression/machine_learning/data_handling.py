@@ -23,6 +23,10 @@ import random
 import tensorstore as ts
 import torch
 
+from aind_exaspim_image_compression.machine_learning.transforms import (
+    build_transform,
+    calibrate_transform,
+)
 from aind_exaspim_image_compression.utils import img_util, util
 from aind_exaspim_image_compression.utils.swc_util import Reader
 
@@ -46,10 +50,9 @@ class TrainDataset(Dataset):
         boundary_buffer=5000,
         foreground_sampling_rate=0.5,
         n_examples_per_epoch=300,
-        normalization_percentiles=(0.5, 99.9),
-        normalized_brightness_clip=8,
         prefetch_foreground_sampling=16,
         sigma_bm4d=16,
+        transform=None,
     ):
         # Call parent class
         super(TrainDataset, self).__init__()
@@ -59,11 +62,10 @@ class TrainDataset(Dataset):
         self.boundary_buffer = boundary_buffer
         self.foreground_sampling_rate = foreground_sampling_rate
         self.n_examples_per_epoch = n_examples_per_epoch
-        self.normalization_percentiles = normalization_percentiles
-        self.normalized_brightness_clip = normalized_brightness_clip
         self.patch_shape = patch_shape
         self.prefetch_foreground_sampling = prefetch_foreground_sampling
         self.sigma_bm4d = sigma_bm4d
+        self.transform = transform or build_transform({"kind": "asinh"})
         self.swc_reader = Reader()
 
         # Data structures
@@ -147,8 +149,7 @@ class TrainDataset(Dataset):
     # --- Sample Image Patches ---
     def __getitem__(self, dummy_input):
         """
-        Returns a pair of noisy and BM4D-denoised image patches, normalized
-        according to percentile-based scaling.
+        Returns a pair of transformed noisy and BM4D-denoised image patches.
 
         Parameters
         ----------
@@ -158,25 +159,22 @@ class TrainDataset(Dataset):
 
         Returns
         -------
-        noise : numpy.ndarray
-            Noisy image patch, normalized and clipped.
-        denoised : numpy.ndarray
-            Denoised image patch, normalized and clipped using the same scale
-            as the noisy patch.
-        (mn, mx) : Tuple[float]
-            Lower and upper percentiles used for normalization.
+        x : numpy.ndarray
+            Noisy image patch in the normalized transform domain.
+        y : numpy.ndarray
+            BM4D-denoised image patch in the normalized transform domain.
         """
-        # Get image patches
+        # Sample image patch and its BM4D-denoised target
         brain_id = self.sample_brain()
         voxel = self.sample_voxel(brain_id)
-        noise = self.read_patch(brain_id, voxel)
-        mn, mx = np.percentile(noise, self.normalization_percentiles)
-        denoised = bm4d(noise, self.sigma_bm4d)
+        raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
+        target = bm4d(raw, self.sigma_bm4d)
+        target = np.clip(target, 0, self.transform.max_count)
 
-        # Normalize image patches
-        noise = self.normalize(noise, mn, mx)
-        denoised = self.normalize(denoised, mn, mx)
-        return noise, denoised, (mn, mx)
+        # Map to the normalized transform domain
+        x = self.transform.forward(raw)
+        y = self.transform.forward(target)
+        return x, y
 
     def sample_brain(self):
         """
@@ -378,28 +376,30 @@ class TrainDataset(Dataset):
         """
         return self.n_examples_per_epoch
 
-    def normalize(self, img, mn, mx):
+    def sample_intensity_values(self, n_patches=8):
         """
-        Normalizes the given image using a percentile-based scheme and clips
-        the max brightness.
+        Reads a few interior patches and returns their flattened counts.
+
+        Used to calibrate a transform's background offset from a global
+        sample of the training data.
 
         Parameters
         ----------
-        img : numpy.ndarray
-            Image to be normalized
-        mn : float
-            Lower percentile.
-        mx : float
-            Upper percentile
+        n_patches : int, optional
+            Number of interior patches to sample. Default is 8.
 
         Returns
         -------
-        img : numpy.ndarray
-            Normalized image.
+        numpy.ndarray
+            Flattened raw counts from the sampled patches.
         """
-        img = (img - mn) / (mx - mn + 1e-8)
-        img = np.clip(img, 0, self.normalized_brightness_clip)
-        return img
+        values = list()
+        for _ in range(n_patches):
+            brain_id = self.sample_brain()
+            voxel = self.sample_interior_voxel(brain_id)
+            patch = np.asarray(self.read_patch(brain_id, voxel))
+            values.append(patch.ravel())
+        return np.concatenate(values)
 
     def read_patch(self, brain_id, center):
         """
@@ -460,13 +460,7 @@ class TrainDataset(Dataset):
 
 class ValidateDataset(Dataset):
 
-    def __init__(
-        self,
-        patch_shape,
-        normalization_percentiles=(0.5, 99.9),
-        normalized_brightness_clip=8,
-        sigma_bm4d=16,
-    ):
+    def __init__(self, patch_shape, sigma_bm4d=16, transform=None):
         """
         Instantiates a ValidateDataset object.
 
@@ -474,31 +468,26 @@ class ValidateDataset(Dataset):
         ----------
         patch_shape : Tuple[int]
             Shape of image patches to be extracted.
-        normalization_percentiles : Tuple[float], optional
-            Upper and lower percentiles used to normalize the input image.
-            Default is (0.5, 99.5).
-        normalized_brightness_clip : float, optional
-            Brightness value used as an upper limit that normalized intensities
-            are clipped to. Default is 10.
         sigma_bm4d : float, optional
             Smoothing parameter used in the BM4D denoising algorithm. Default
             is 16.
+        transform : IntensityTransform, optional
+            Transform mapping raw counts to the normalized domain. Default is
+            an asinh transform.
         """
         # Call parent class
         super(ValidateDataset, self).__init__()
 
         # Instance attributes
-        self.normalization_percentiles = normalization_percentiles
-        self.normalized_brightness_clip = normalized_brightness_clip
         self.patch_shape = patch_shape
         self.sigma_bm4d = sigma_bm4d
+        self.transform = transform or build_transform({"kind": "asinh"})
 
         # Data structures
         self.example_ids = list()
         self.imgs = dict()
         self.denoised = list()
         self.noise = list()
-        self.mn_mxs = list()
 
     def __len__(self):
         """
@@ -526,8 +515,7 @@ class ValidateDataset(Dataset):
 
     def ingest_example(self, brain_id, voxel):
         """
-        Extracts, denoises, normalizes, and stores an image patch from a brain
-        volume.
+        Extracts, denoises, transforms, and stores an image patch.
 
         Parameters
         ----------
@@ -536,20 +524,15 @@ class ValidateDataset(Dataset):
         voxel : Tuple[int]
             Voxel coordinates of the patch center in the brain volume.
         """
-        # Get image patches
-        noise = self.read_patch(brain_id, voxel)
-        mn, mx = np.percentile(noise, self.normalization_percentiles)
-        denoised = bm4d(noise, self.sigma_bm4d)
+        # Sample image patch and its BM4D-denoised target
+        raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
+        target = bm4d(raw, self.sigma_bm4d)
+        target = np.clip(target, 0, self.transform.max_count)
 
-        # Normalize image patches
-        noise = self.normalize(noise, mn, mx)
-        denoised = self.normalize(denoised, mn, mx)
-
-        # Store results
+        # Store transformed patches
         self.example_ids.append((brain_id, voxel))
-        self.noise.append(noise)
-        self.denoised.append(denoised)
-        self.mn_mxs.append((mn, mx))
+        self.noise.append(self.transform.forward(raw))
+        self.denoised.append(self.transform.forward(target))
 
     def __getitem__(self, idx):
         """
@@ -562,40 +545,14 @@ class ValidateDataset(Dataset):
 
         Returns
         -------
-        noise : numpy.ndarray
-            Noisy image patch at the given index.
-        denoised : numpy.ndarray
-            Corresponding denoised image patch.
-        mn_mx : Tuple[int]
-            Minimum and maximum values used for normalization of the image
-            patches.
+        x : numpy.ndarray
+            Noisy image patch in the normalized transform domain.
+        y : numpy.ndarray
+            BM4D-denoised image patch in the normalized transform domain.
         """
-        return self.noise[idx], self.denoised[idx], self.mn_mxs[idx]
+        return self.noise[idx], self.denoised[idx]
 
     # --- Helpers ---
-    def normalize(self, img, mn, mx):
-        """
-        Normalizes the given image using a percentile-based scheme and clips
-        the max brightness.
-
-        Parameters
-        ----------
-        img : numpy.ndarray
-            Image to be normalized
-        mn : float
-            Lower percentile.
-        mx : float
-            Upper percentile
-
-        Returns
-        -------
-        img : numpy.ndarray
-            Normalized image.
-        """
-        img = (img - mn) / (mx - mn + 1e-8)
-        img = np.clip(img, 0, self.normalized_brightness_clip)
-        return img
-
     def read_patch(self, brain_id, center):
         """
         Reads an image patch from a Zarr array.
@@ -678,13 +635,11 @@ class DataLoader:
             shape = (batch_size, 1,) + self.patch_shape
             noise_patches = np.zeros(shape)
             denoised_patches = np.zeros(shape)
-            mn_mxs = np.zeros((self.batch_size, 2))
             for i, process in enumerate(as_completed(processes)):
-                noise, denoised, mn_mx = process.result()
+                noise, denoised = process.result()
                 noise_patches[i, 0, ...] = noise
                 denoised_patches[i, 0, ...] = denoised
-                mn_mxs[i, :] = mn_mx
-        return to_tensor(noise_patches), to_tensor(denoised_patches), mn_mxs
+        return to_tensor(noise_patches), to_tensor(denoised_patches)
 
 
 # --- Helpers ---
@@ -697,9 +652,12 @@ def init_datasets(
     n_validate_examples=0,
     segmentation_prefixes_path=None,
     sigma_bm4d=16,
-    swc_pointers=None
+    swc_pointers=None,
+    transform_cfg=None,
 ):
     # Initializations
+    if transform_cfg is None:
+        transform_cfg = {"kind": "asinh"}
     train_dataset = TrainDataset(
         patch_shape,
         foreground_sampling_rate=foreground_sampling_rate,
@@ -737,6 +695,15 @@ def init_datasets(
         train_dataset.ingest_brain(
             brain_id, img_path, segmentation_path, swc_pointer
         )
+
+    # Resolve one frozen transform, optionally calibrating the offset from a
+    # global training sample, and share it across train and validation.
+    if transform_cfg.get("calibrate", {}).get("offset", False):
+        sample = train_dataset.sample_intensity_values()
+        transform_cfg = calibrate_transform(transform_cfg, sample)
+    transform = build_transform(transform_cfg)
+    train_dataset.transform = transform
+    val_dataset.transform = transform
 
     # Generate validation examples
     for _ in range(n_validate_examples):

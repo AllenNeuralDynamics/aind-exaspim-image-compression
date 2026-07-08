@@ -95,6 +95,7 @@ class Trainer:
         """
         # Initializations
         print("Experiment:", os.path.basename(os.path.normpath(self.log_dir)))
+        self.transform = train_dataset.transform
         train_dataloader = DataLoader(
             train_dataset, batch_size=self.batch_size
         )
@@ -135,7 +136,7 @@ class Trainer:
         """
         losses = list()
         self.model.train()
-        for x, y, _ in train_dataloader:
+        for x, y in train_dataloader:
             # Forward pass
             hat_y, loss = self.forward_pass(x, y)
 
@@ -173,12 +174,12 @@ class Trainer:
         cratios = list()
         with torch.no_grad():
             self.model.eval()
-            for x, y, mn_mx in val_dataloader:
+            for x, y in val_dataloader:
                 # Run model
                 hat_y, loss = self.forward_pass(x, y)
 
                 # Evalute result
-                cratios.extend(self.compute_cratios(hat_y, mn_mx))
+                cratios.extend(self.compute_cratios(hat_y))
                 losses.append(loss.detach().cpu())
 
         # Log results
@@ -219,12 +220,11 @@ class Trainer:
             return hat_y, loss
 
     # --- Helpers ---
-    def compute_cratios(self, imgs, mn_mx):
+    def compute_cratios(self, imgs):
         cratios = list()
         imgs = np.array(imgs.detach().cpu())
         for i in range(imgs.shape[0]):
-            mn, mx = tuple(mn_mx[i, :])
-            img = np.clip(imgs[i, 0, ...] * (mx - mn) + mn, 0, 2**16 - 1)
+            img = self.transform.inverse(imgs[i, 0, ...])
             cratios.append(img_util.compute_cratio(img, self.codec))
             if i < 10:
                 tifffile.imwrite(f"{i}.tiff", img)
@@ -239,9 +239,10 @@ class Trainer:
         model_path : str
             Path to the checkpoint file containing the saved weights.
         """
-        self.model.load_state_dict(
-            torch.load(model_path, map_location=self.device)
-        )
+        ckpt = torch.load(model_path, map_location=self.device)
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            ckpt = ckpt["model"]
+        self.model.load_state_dict(ckpt)
 
     def save_model(self, epoch):
         """
@@ -255,4 +256,10 @@ class Trainer:
         date = datetime.today().strftime("%Y%m%d")
         filename = f"BM4DNet-{date}-{epoch}-{self.best_l1:.6f}.pth"
         path = os.path.join(self.log_dir, filename)
-        torch.save(self.model.state_dict(), path)
+        torch.save(
+            {
+                "model": self.model.state_dict(),
+                "transform": getattr(self.transform, "cfg", None),
+            },
+            path,
+        )

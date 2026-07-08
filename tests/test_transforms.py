@@ -8,6 +8,7 @@ from aind_exaspim_image_compression.machine_learning.transforms import (
     AnscombeTransform,
     AsinhTransform,
     IntensityTransform,
+    LinearClipTransform,
     build_transform,
     calibrate_transform,
     estimate_offset,
@@ -92,6 +93,25 @@ class AnscombeTransformTest(unittest.TestCase):
         np.testing.assert_allclose(t._gat(x), expected, rtol=1e-5)
 
 
+class LinearClipTransformTest(unittest.TestCase):
+    """Tests for LinearClipTransform."""
+
+    def test_round_trip_within_clip(self):
+        """Values within the clip range round-trip."""
+        t = LinearClipTransform(mn=35, mx=1000, clip=8)
+        vals = np.array([35, 200, 1000, 5000], dtype=np.float32)
+        rec = t.inverse(t.forward(vals)).astype(np.float64)
+        np.testing.assert_allclose(rec, vals, rtol=1e-3, atol=1)
+
+    def test_clips_bright_tail(self):
+        """Values above the clip collapse to one plateau value."""
+        t = LinearClipTransform(mn=0, mx=1000, clip=8)
+        vals = np.array([9000, 30000, 60000], dtype=np.float32)
+        rec = t.inverse(t.forward(vals)).astype(np.float64)
+        self.assertTrue(np.all(rec == rec[0]))
+        self.assertLess(rec[0], 9000)
+
+
 class HelperTest(unittest.TestCase):
     """Tests for module-level helpers."""
 
@@ -111,8 +131,18 @@ class HelperTest(unittest.TestCase):
         self.assertIsInstance(t, AnscombeTransform)
         self.assertEqual(t.gain, 8.0)
 
+        t = build_transform({"kind": "linear", "params": {"mx": 500}})
+        self.assertIsInstance(t, LinearClipTransform)
+        self.assertEqual(t.mx, 500.0)
+
         with self.assertRaises(ValueError):
             build_transform({"kind": "nope"})
+
+    def test_build_transform_stamps_cfg(self):
+        """Factory stamps the frozen cfg onto the instance."""
+        t = build_transform({"kind": "asinh", "params": {"scale": 16}})
+        self.assertEqual(t.cfg["kind"], "asinh")
+        self.assertEqual(t.cfg["params"]["scale"], 16)
 
     def test_calibrate_transform_sets_offset(self):
         """Calibration freezes the offset without mutating the input."""

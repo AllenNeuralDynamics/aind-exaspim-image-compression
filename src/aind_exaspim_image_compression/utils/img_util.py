@@ -796,3 +796,45 @@ def ssim3D(img1, img2, data_range=None, window_size=16):
     denominator = (mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2)
     ssim_map = numerator / (np.maximum(denominator, 1e-8) + 1e-6)
     return np.mean(ssim_map)
+
+
+def compute_mae(img1, img2):
+    """
+    Computes the mean absolute error between two images.
+
+    Parameters
+    ----------
+    img1 : numpy.ndarray
+        Image.
+    img2 : numpy.ndarray
+        Image with the same shape as "img1".
+
+    Returns
+    -------
+    float
+        Mean absolute error between the two images.
+    """
+    a = np.asarray(img1, dtype=np.float64)
+    b = np.asarray(img2, dtype=np.float64)
+    return float(np.mean(np.abs(a - b)))
+
+
+def compute_lmax(img1, img2):
+    """
+    Computes the maximum absolute error between two images.
+
+    Parameters
+    ----------
+    img1 : numpy.ndarray
+        Image.
+    img2 : numpy.ndarray
+        Image with the same shape as "img1".
+
+    Returns
+    -------
+    float
+        Maximum absolute error between the two images.
+    """
+    a = np.asarray(img1, dtype=np.float64)
+    b = np.asarray(img2, dtype=np.float64)
+    return float(np.max(np.abs(a - b)))

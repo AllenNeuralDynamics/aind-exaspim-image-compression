@@ -273,6 +273,88 @@ class AnscombeTransform(IntensityTransform):
         return np.rint(counts).astype(np.uint16)
 
 
+class LinearClipTransform(IntensityTransform):
+    """
+    Linear normalization with a hard brightness clip.
+
+    Provided as a fixed, stateless baseline for A/B comparison against the
+    compressive transforms. It reproduces the original normalize-and-clip
+    behavior (with globally-frozen ``mn``/``mx`` instead of per-patch
+    percentiles), which flattens the bright tail above ``clip`` into a
+    non-invertible plateau. It is the thing the compressive transforms are
+    meant to beat, not a recommended default.
+
+    Attributes
+    ----------
+    mn : float
+        Lower normalization reference in counts (maps to 0).
+    mx : float
+        Upper normalization reference in counts (maps to 1).
+    clip : float
+        Upper bound applied in the normalized domain.
+    max_count : float
+        Physical sensor maximum used to clamp the inverse.
+    """
+
+    def __init__(self, mn=0.0, mx=1000.0, clip=8.0, max_count=65535.0):
+        """
+        Instantiates a LinearClipTransform.
+
+        Parameters
+        ----------
+        mn : float, optional
+            Lower normalization reference in counts. Default is 0.0.
+        mx : float, optional
+            Upper normalization reference in counts. Default is 1000.0.
+        clip : float, optional
+            Upper bound applied in the normalized domain. Default is 8.0.
+        max_count : float, optional
+            Physical sensor maximum used to clamp the inverse. Default is
+            65535.0.
+        """
+        self.mn = float(mn)
+        self.mx = float(mx)
+        self.clip = float(clip)
+        self.max_count = float(max_count)
+
+    def forward(self, x):
+        """
+        Maps raw counts to the normalized, clipped domain.
+
+        Parameters
+        ----------
+        x : numpy.ndarray
+            Image in raw count units.
+
+        Returns
+        -------
+        numpy.ndarray
+            Normalized image clipped to [0, clip], float32.
+        """
+        x = np.asarray(x, dtype=np.float32)
+        y = (x - self.mn) / (self.mx - self.mn + 1e-8)
+        return np.clip(y, 0.0, self.clip).astype(np.float32)
+
+    def inverse(self, y):
+        """
+        Maps normalized values back to raw uint16 counts.
+
+        Parameters
+        ----------
+        y : numpy.ndarray
+            Image in the normalized domain.
+
+        Returns
+        -------
+        numpy.ndarray
+            Image in raw counts, clipped to [0, max_count], uint16.
+        """
+        y = np.asarray(y, dtype=np.float32)
+        counts = y * (self.mx - self.mn) + self.mn
+        counts = np.clip(counts, 0, self.max_count)
+        return np.rint(counts).astype(np.uint16)
+
+
 def estimate_offset(sample, percentile=1.0):
     """
     Estimates a robust global background / black-point (counts).
@@ -303,12 +385,14 @@ def build_transform(cfg):
 
     Params are treated as frozen constants; any data-calibrated value must
     already be baked into ``cfg`` (see ``calibrate_transform``) so that
-    training and inference construct the identical transform.
+    training and inference construct the identical transform. The originating
+    (frozen) config is stamped onto the returned instance as ``.cfg`` so it
+    can be serialized alongside a model checkpoint.
 
     Parameters
     ----------
     cfg : dict
-        Config of the form ``{"kind": "asinh" | "anscombe",
+        Config of the form ``{"kind": "asinh" | "anscombe" | "linear",
         "params": {...}}``.
 
     Returns
@@ -324,10 +408,15 @@ def build_transform(cfg):
     kind = cfg["kind"]
     params = cfg.get("params", {})
     if kind == "asinh":
-        return AsinhTransform(**params)
-    if kind == "anscombe":
-        return AnscombeTransform(**params)
-    raise ValueError(f"Unknown transform kind: {kind}")
+        transform = AsinhTransform(**params)
+    elif kind == "anscombe":
+        transform = AnscombeTransform(**params)
+    elif kind == "linear":
+        transform = LinearClipTransform(**params)
+    else:
+        raise ValueError(f"Unknown transform kind: {kind}")
+    transform.cfg = {**cfg, "params": dict(params)}
+    return transform
 
 
 def calibrate_transform(cfg, sample):
