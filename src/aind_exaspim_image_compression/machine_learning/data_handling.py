@@ -54,6 +54,7 @@ class TrainDataset(Dataset):
         foreground_sampling_rate=0.5,
         n_examples_per_epoch=300,
         prefetch_foreground_sampling=16,
+        preserve_foreground=True,
         sigma_bm4d=16,
         transform=None,
     ):
@@ -66,6 +67,7 @@ class TrainDataset(Dataset):
         self.foreground_sampling_rate = foreground_sampling_rate
         self.n_examples_per_epoch = n_examples_per_epoch
         self.patch_shape = patch_shape
+        self.preserve_foreground = preserve_foreground
         self.prefetch_foreground_sampling = prefetch_foreground_sampling
         self.sigma_bm4d = sigma_bm4d
         self.transform = transform or build_transform({"kind": "asinh"})
@@ -165,19 +167,56 @@ class TrainDataset(Dataset):
         x : numpy.ndarray
             Noisy image patch in the normalized transform domain.
         y : numpy.ndarray
-            BM4D-denoised image patch in the normalized transform domain.
+            Target image patch in the normalized transform domain.
+        fg_mask : numpy.ndarray
+            Foreground mask (float 0/1) for the signal-preserving loss.
         """
         # Sample image patch and its BM4D-denoised target
         brain_id = self.sample_brain()
         voxel = self.sample_voxel(brain_id)
         raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
-        target = bm4d(raw, self.sigma_bm4d)
-        target = np.clip(target, 0, self.transform.max_count)
+        teacher = bm4d(raw, self.sigma_bm4d)
+        teacher = np.clip(teacher, 0, self.transform.max_count)
+
+        # Preserve raw counts on foreground so BM4D cannot erase neurites
+        fg_mask = self.foreground_mask(brain_id, voxel, raw)
+        if self.preserve_foreground:
+            target = np.where(fg_mask, raw, teacher)
+        else:
+            target = teacher
 
         # Map to the normalized transform domain
         x = self.transform.forward(raw)
         y = self.transform.forward(target)
-        return x, y
+        return x, y, fg_mask.astype(np.float32)
+
+    def foreground_mask(self, brain_id, center, raw):
+        """
+        Builds a high-confidence foreground mask for a patch.
+
+        Unions a robust intensity threshold with the segmentation labels
+        (when available for the brain), so both bright and labeled neurites
+        are protected from the BM4D teacher.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the sampled brain.
+        center : Tuple[int]
+            Center voxel of the patch.
+        raw : numpy.ndarray
+            Raw image patch in counts.
+
+        Returns
+        -------
+        numpy.ndarray
+            Boolean foreground mask with the shape of "raw".
+        """
+        mask = make_foreground_mask(raw)
+        if brain_id in self.segmentations:
+            labels = np.asarray(self.read_precomputed_patch(brain_id, center))
+            mask = mask | (labels > 0)
+        return mask
 
     def sample_brain(self):
         """
@@ -463,7 +502,10 @@ class TrainDataset(Dataset):
 
 class ValidateDataset(Dataset):
 
-    def __init__(self, patch_shape, sigma_bm4d=16, transform=None):
+    def __init__(
+        self, patch_shape, sigma_bm4d=16, transform=None,
+        preserve_foreground=True,
+    ):
         """
         Instantiates a ValidateDataset object.
 
@@ -477,6 +519,9 @@ class ValidateDataset(Dataset):
         transform : IntensityTransform, optional
             Transform mapping raw counts to the normalized domain. Default is
             an asinh transform.
+        preserve_foreground : bool, optional
+            Whether targets keep raw counts on the foreground. Default is
+            True.
         """
         # Call parent class
         super(ValidateDataset, self).__init__()
@@ -485,6 +530,7 @@ class ValidateDataset(Dataset):
         self.patch_shape = patch_shape
         self.sigma_bm4d = sigma_bm4d
         self.transform = transform or build_transform({"kind": "asinh"})
+        self.preserve_foreground = preserve_foreground
 
         # Data structures
         self.example_ids = list()
@@ -531,15 +577,22 @@ class ValidateDataset(Dataset):
         """
         # Sample image patch and its BM4D-denoised target
         raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
-        target = bm4d(raw, self.sigma_bm4d)
-        target = np.clip(target, 0, self.transform.max_count)
+        teacher = bm4d(raw, self.sigma_bm4d)
+        teacher = np.clip(teacher, 0, self.transform.max_count)
+
+        # Preserve raw counts on foreground (intensity mask only here)
+        fg_mask = make_foreground_mask(raw)
+        if self.preserve_foreground:
+            target = np.where(fg_mask, raw, teacher)
+        else:
+            target = teacher
 
         # Store transformed patches plus count-space metadata for metrics
         self.example_ids.append((brain_id, voxel))
         self.noise.append(self.transform.forward(raw))
         self.denoised.append(self.transform.forward(target))
         self.raws.append(raw)
-        self.fg_masks.append(make_foreground_mask(raw).astype(np.float32))
+        self.fg_masks.append(fg_mask.astype(np.float32))
 
     def __getitem__(self, idx):
         """
@@ -671,6 +724,7 @@ def init_datasets(
     sigma_bm4d=16,
     swc_pointers=None,
     transform_cfg=None,
+    preserve_foreground=True,
 ):
     # Initializations
     if transform_cfg is None:
@@ -679,9 +733,14 @@ def init_datasets(
         patch_shape,
         foreground_sampling_rate=foreground_sampling_rate,
         n_examples_per_epoch=n_train_examples_per_epoch,
+        preserve_foreground=preserve_foreground,
         sigma_bm4d=sigma_bm4d
     )
-    val_dataset = ValidateDataset(patch_shape, sigma_bm4d=sigma_bm4d)
+    val_dataset = ValidateDataset(
+        patch_shape,
+        sigma_bm4d=sigma_bm4d,
+        preserve_foreground=preserve_foreground,
+    )
 
     # Read segmentation path lookup (if applicable)
     if segmentation_prefixes_path:

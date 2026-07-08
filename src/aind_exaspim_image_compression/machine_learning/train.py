@@ -23,6 +23,9 @@ import torch.optim as optim
 
 from aind_exaspim_image_compression.machine_learning.unet3d import UNet
 from aind_exaspim_image_compression.machine_learning.data_handling import DataLoader
+from aind_exaspim_image_compression.machine_learning.losses import (
+    SignalPreservingLoss,
+)
 from aind_exaspim_image_compression.machine_learning.metrics import (
     checkpoint_score,
     evaluate_example,
@@ -42,6 +45,7 @@ class Trainer:
         model=None,
         use_amp=True,
         checkpoint_weights=None,
+        fg_weight=20.0,
     ):
         """
         Instantiates a Trainer object.
@@ -75,7 +79,7 @@ class Trainer:
         self.log_dir = log_dir
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
-        self.criterion = nn.L1Loss()
+        self.criterion = SignalPreservingLoss(fg_weight=fg_weight)
         self.checkpoint_weights = checkpoint_weights
         self.best_score = np.inf
         self.model = model.to(device) if model else UNet().to(device)
@@ -143,9 +147,9 @@ class Trainer:
         """
         losses = list()
         self.model.train()
-        for x, y in train_dataloader:
+        for x, y, fg_mask in train_dataloader:
             # Forward pass
-            hat_y, loss = self.forward_pass(x, y)
+            hat_y, loss = self.forward_pass(x, y, fg_mask)
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -188,7 +192,7 @@ class Trainer:
             self.model.eval()
             for x, y, raw, fg_mask in val_dataloader:
                 # Run model
-                hat_y, loss = self.forward_pass(x, y)
+                hat_y, loss = self.forward_pass(x, y, fg_mask)
 
                 # Evaluate result
                 losses.append(loss.detach().cpu())
@@ -220,7 +224,7 @@ class Trainer:
             self.save_model(epoch)
         return loss, cratio, is_best
 
-    def forward_pass(self, x, y):
+    def forward_pass(self, x, y, fg_mask):
         """
         Performs a forward pass through the model and computes loss.
 
@@ -229,7 +233,9 @@ class Trainer:
         x : torch.Tensor
             Input tensor with shape (B, C, D, H, W).
         y : torch.Tensor
-            Ground truth labels with shape (B, C, D, H, W).
+            Target tensor with shape (B, C, D, H, W).
+        fg_mask : torch.Tensor
+            Foreground mask (0/1) with shape (B, C, D, H, W).
 
         Returns
         -------
@@ -241,8 +247,9 @@ class Trainer:
         with self.autocast:
             x = x.to(self.device)
             y = y.to(self.device)
+            fg_mask = fg_mask.to(self.device)
             hat_y = self.model(x)
-            loss = self.criterion(hat_y, y)
+            loss = self.criterion(hat_y, y, fg_mask)
             return hat_y, loss
 
     # --- Helpers ---
