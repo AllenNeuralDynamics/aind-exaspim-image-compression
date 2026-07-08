@@ -23,6 +23,9 @@ import random
 import tensorstore as ts
 import torch
 
+from aind_exaspim_image_compression.machine_learning.metrics import (
+    make_foreground_mask,
+)
 from aind_exaspim_image_compression.machine_learning.transforms import (
     build_transform,
     calibrate_transform,
@@ -488,6 +491,8 @@ class ValidateDataset(Dataset):
         self.imgs = dict()
         self.denoised = list()
         self.noise = list()
+        self.raws = list()
+        self.fg_masks = list()
 
     def __len__(self):
         """
@@ -529,10 +534,12 @@ class ValidateDataset(Dataset):
         target = bm4d(raw, self.sigma_bm4d)
         target = np.clip(target, 0, self.transform.max_count)
 
-        # Store transformed patches
+        # Store transformed patches plus count-space metadata for metrics
         self.example_ids.append((brain_id, voxel))
         self.noise.append(self.transform.forward(raw))
         self.denoised.append(self.transform.forward(target))
+        self.raws.append(raw)
+        self.fg_masks.append(make_foreground_mask(raw).astype(np.float32))
 
     def __getitem__(self, idx):
         """
@@ -549,8 +556,17 @@ class ValidateDataset(Dataset):
             Noisy image patch in the normalized transform domain.
         y : numpy.ndarray
             BM4D-denoised image patch in the normalized transform domain.
+        raw : numpy.ndarray
+            Raw noisy image patch in counts (for count-space metrics).
+        fg_mask : numpy.ndarray
+            Foreground mask (float 0/1) for the metric split.
         """
-        return self.noise[idx], self.denoised[idx]
+        return (
+            self.noise[idx],
+            self.denoised[idx],
+            self.raws[idx],
+            self.fg_masks[idx],
+        )
 
     # --- Helpers ---
     def read_patch(self, brain_id, center):
@@ -624,22 +640,23 @@ class DataLoader:
 
         # Generate batch
         with ProcessPoolExecutor() as executor:
-            # Assign processs
             processes = list()
             for idx in range(start_idx, start_idx + batch_size):
                 processes.append(
                     executor.submit(self.dataset.__getitem__, idx)
                 )
+            results = [p.result() for p in as_completed(processes)]
 
-            # Process results
-            shape = (batch_size, 1,) + self.patch_shape
-            noise_patches = np.zeros(shape)
-            denoised_patches = np.zeros(shape)
-            for i, process in enumerate(as_completed(processes)):
-                noise, denoised = process.result()
-                noise_patches[i, 0, ...] = noise
-                denoised_patches[i, 0, ...] = denoised
-        return to_tensor(noise_patches), to_tensor(denoised_patches)
+        # Stack each field of the example tuple into its own batch tensor.
+        # Handles both the (x, y) train shape and the (x, y, raw, fg_mask)
+        # validation shape.
+        shape = (batch_size, 1,) + self.patch_shape
+        n_fields = len(results[0])
+        batched = [np.zeros(shape) for _ in range(n_fields)]
+        for i, fields in enumerate(results):
+            for j, field in enumerate(fields):
+                batched[j][i, 0, ...] = field
+        return tuple(to_tensor(arr) for arr in batched)
 
 
 # --- Helpers ---
