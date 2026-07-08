@@ -267,7 +267,8 @@ class TrainDataset(Dataset):
             Voxel coordinate near a skeleton point.
         """
         idx = random.randint(0, len(self.skeletons[brain_id]) - 1)
-        shift = np.random.randint(0, 16, size=3)
+        radius = np.array(self.patch_shape) // 4
+        shift = np.array([np.random.randint(-r, r + 1) for r in radius])
         return tuple(self.skeletons[brain_id][idx] + shift)
 
     def sample_segmentation_voxel(self, brain_id):
@@ -705,7 +706,7 @@ def init_datasets(
         n_examples_per_epoch=n_train_examples_per_epoch,
         sigma_bm4d=sigma_bm4d
     )
-    val_dataset = ValidateDataset(patch_shape)
+    val_dataset = ValidateDataset(patch_shape, sigma_bm4d=sigma_bm4d)
 
     # Read segmentation path lookup (if applicable)
     if segmentation_prefixes_path:

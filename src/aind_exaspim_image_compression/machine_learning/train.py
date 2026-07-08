@@ -212,8 +212,8 @@ class Trainer:
             Computed loss value.
         """
         with self.autocast:
-            x = x.to("cuda")
-            y = y.to("cuda")
+            x = x.to(self.device)
+            y = y.to(self.device)
             hat_y = self.model(x)
             loss = self.criterion(hat_y, y)
             return hat_y, loss

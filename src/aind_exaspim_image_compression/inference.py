@@ -136,7 +136,7 @@ def predict_patch(patch, model, normalization_percentiles=(0.5, 99.9)):
         patch = patch[np.newaxis, ...]
 
     # Run model
-    patch = to_tensor(patch)
+    patch = to_tensor(patch, device=next(model.parameters()).device)
     with torch.no_grad():
         pred = model(patch)
 
@@ -164,7 +164,7 @@ def _predict_batch(img, model, starts, patch_size, trim=5):
     inputs = np.stack([r[1] for r in results], axis=0)
 
     # Run model
-    inputs = batch_to_tensor(inputs)
+    inputs = batch_to_tensor(inputs, device=next(model.parameters()).device)
     with torch.no_grad():
         outputs = model(inputs).cpu().squeeze(1).numpy()
     return outputs[:, trim:-trim, trim:-trim, trim:-trim]
@@ -271,39 +271,44 @@ def load_model(path, device="cuda"):
     return model
 
 
-def to_tensor(arr):
+def to_tensor(arr, device="cuda"):
     """
-    Converts a NumPy array containing to a PyTorch tensor and moves it to the
-    GPU.
+    Converts a NumPy array to a PyTorch tensor and moves it to the given
+    device.
 
     Parameters
     ----------
     arr : numpy.ndarray
         Array to be converted.
+    device : str or torch.device, optional
+        Device to move the tensor to. Default is "cuda".
 
     Returns
     -------
     torch.Tensor
-        Tensor on GPU with shape (1, 1, depth, height, width).
+        Tensor on the given device with shape (1, 1, depth, height, width).
     """
     while (len(arr.shape)) < 5:
         arr = arr[np.newaxis, ...]
-    return torch.tensor(arr).to("cuda", dtype=torch.float)
+    return torch.tensor(arr).to(device, dtype=torch.float)
 
 
-def batch_to_tensor(arr):
+def batch_to_tensor(arr, device="cuda"):
     """
     Converts a NumPy array containing a batch of inputs to a PyTorch tensor
-    and moves it to the GPU.
+    and moves it to the given device.
 
     Parameters
     ----------
     arr : numpy.ndarray
         Array to be converted, with shape (batch_size, depth, height, width).
+    device : str or torch.device, optional
+        Device to move the tensor to. Default is "cuda".
 
     Returns
     -------
     torch.Tensor
-        Tensor on GPU with shape (batch_size, 1, depth, height, width).
+        Tensor on the given device with shape
+        (batch_size, 1, depth, height, width).
     """
-    return to_tensor(arr[:, np.newaxis, ...])
+    return to_tensor(arr[:, np.newaxis, ...], device=device)
