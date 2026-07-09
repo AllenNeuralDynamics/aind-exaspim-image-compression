@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from imagecodecs.numcodecs import Jpegxl
 from itertools import product
 from matplotlib.colors import ListedColormap
-from numcodecs import Blosc, register_codec
+from numcodecs import register_codec
 from ome_zarr.writer import write_multiscale
 from scipy.ndimage import uniform_filter
 from xarray_multiscale import multiscale
@@ -22,7 +22,6 @@ from xarray_multiscale.reducers import windowed_mode
 import gcsfs
 import matplotlib.pyplot as plt
 import numpy as np
-import s3fs
 import tensorstore as ts
 import tifffile
 import zarr
@@ -70,7 +69,12 @@ def read(img_path):
 
 def _read_n5(img_path):
     """
-    Reads an N5 volume from local disk or GCS.
+    Reads the "volume" dataset of an N5 container from local disk, GCS, or S3.
+
+    zarr v3 dropped built-in N5 support, so this reads through tensorstore (the
+    same backend used for neuroglancer volumes). NOTE: migrated for zarr>=3
+    compatibility but not exercised against live N5 data -- no current dataset
+    uses N5.
 
     Parameters
     ----------
@@ -79,18 +83,20 @@ def _read_n5(img_path):
 
     Returns
     -------
-    zarr.core.Array
+    numpy.ndarray
         Image volume.
     """
-    if is_gcs_path(img_path):
-        fs = gcsfs.GCSFileSystem(anon=False)
-        store = zarr.n5.N5FSStore(img_path, s=fs)
-    elif is_s3_path(img_path):
-        fs = s3fs.S3FileSystem(config_kwargs={"max_pool_connections": 50})
-        store = s3fs.S3Map(root=img_path, s3=fs)
+    if is_s3_path(img_path) or is_gcs_path(img_path):
+        bucket, prefix = util.parse_cloud_path(img_path)
+        kvstore = {
+            "driver": get_storage_driver(img_path),
+            "bucket": bucket,
+            "path": prefix.rstrip("/") + "/volume/",
+        }
     else:
-        store = zarr.n5.N5Store(img_path)
-    return zarr.open(store, mode="r")["volume"]
+        kvstore = {"driver": "file", "path": img_path.rstrip("/") + "/volume"}
+    arr = ts.open({"driver": "n5", "kvstore": kvstore}).result()
+    return arr[:].read().result()
 
 
 def _read_neuroglancer_precompted(img_path):
@@ -158,19 +164,15 @@ def _read_zarr(img_path):
 
     Returns
     -------
-    zarr.ndarray
+    zarr.Array
         Image volume.
     """
     register_codec(Jpegxl)
-    if is_gcs_path(img_path):
-        fs = gcsfs.GCSFileSystem(anon=False)
-        store = zarr.storage.FSStore(img_path, fs=fs)
-    elif is_s3_path(img_path):
-        fs = s3fs.S3FileSystem(anon=True)
-        store = s3fs.S3Map(root=img_path, s3=fs)
-    else:
-        store = zarr.DirectoryStore(img_path)
-    return zarr.open(store, mode="r")
+    # zarr v3 builds the store from the path: a LocalStore for a filesystem
+    # path, an FsspecStore for s3:// / gs://. The S3 buckets read here are
+    # public (read anonymously); GCS uses the default credential chain.
+    storage_options = {"anon": True} if is_s3_path(img_path) else None
+    return zarr.open(img_path, mode="r", storage_options=storage_options)
 
 
 # --- Read Patches ---
@@ -711,11 +713,18 @@ def write_ome_zarr(
     img,
     output_path,
     chunks=(1, 1, 64, 128, 128),
-    compressor=Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
+    compressor=None,
     n_levels=1,
     scale_factors=(1, 1, 2, 2, 2),
     voxel_size=(748, 748, 1000),
+    storage_options=None,
 ):
+    # zarr v3 codec; default matches the cratio codec (zstd, level 5, shuffle).
+    from zarr.codecs import BloscCodec
+
+    if compressor is None:
+        compressor = BloscCodec(cname="zstd", clevel=5, shuffle="shuffle")
+
     # Ensure 5D image (T, C, Z, Y, X)
     while img.ndim < 5:
         img = img[np.newaxis, ...]
@@ -724,9 +733,12 @@ def write_ome_zarr(
     pyramid = multiscale(img, windowed_mode, scale_factors=scale_factors)[:n_levels]
     pyramid = [level.data for level in pyramid]
 
-    # Prepare Zarr store
-    store = zarr.DirectoryStore(output_path, dimension_separator="/")
-    zgroup = zarr.open(store=store, mode="w")
+    # Prepare Zarr store. zarr v3 builds it from the path: a LocalStore for a
+    # filesystem path, an FsspecStore for s3:// / gs:// (credentials from
+    # storage_options or the default chain).
+    zgroup = zarr.open_group(
+        store=output_path, mode="w", storage_options=storage_options
+    )
 
     # Voxel size scaling for each level
     base_scale = np.array([1, 1, *reversed(voxel_size)])
@@ -746,7 +758,7 @@ def write_ome_zarr(
             {"name": "x", "type": "space", "unit": "micrometer"},
         ],
         coordinate_transformations=coord_transforms,
-        storage_options={"compressor": compressor},
+        storage_options={"compressors": [compressor]},
     )
 
 
