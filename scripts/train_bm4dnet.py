@@ -154,7 +154,7 @@ if __name__ == "__main__":
     # alongside cache_dir, training runs fully offline (no cloud reads or BM4D
     # at startup) and the GPU is busy almost immediately. Leave None to build
     # the validation set live from the cloud.
-    val_cache_dir = None
+    val_cache_dir = "/root/capsule/data/denoise_net_val_patch_cache_500_2026_07_09"
     util.mkdir(output_dir)
 
     # Resume path. Checkpoints from before the normalization overhaul are NOT
@@ -189,8 +189,8 @@ if __name__ == "__main__":
     # Training parameters
     batch_size = 32
     foreground_sampling_rate = 0.5
-    lr = 1e-4
-    max_epochs = 400
+    lr = 1e-3
+    max_epochs = 500
     n_train_examples_per_epoch = 300
     n_validate_examples = 60
     patch_shape = (64, 64, 64)
@@ -206,7 +206,7 @@ if __name__ == "__main__":
     # fg_weight rewards the identity map -- the net stops denoising and its
     # output compresses no better than raw. Keep fg_weight modest (~1-3) so
     # background denoising, not foreground copying, dominates the loss.
-    fg_weight = 2.0
+    fg_weight = 0
     preserve_foreground = True
     min_foreground_voxels = 50
     min_segmentation_volume = 200
