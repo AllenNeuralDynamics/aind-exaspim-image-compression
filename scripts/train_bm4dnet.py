@@ -218,7 +218,7 @@ if __name__ == "__main__":
     # exists for. cratio is the operating-point knob: raise it to trade
     # fidelity for compression, lower it to protect faint neurites.
     checkpoint_weights = dict(
-        fg_mae=1.0, bg_mae=0.2, top_pct_error=0.5, cratio=20.0
+        fg_mae=1.0, bg_mae=0.2, top_pct_error=0.5, cratio=1.0
     )
 
     # Main
