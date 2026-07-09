@@ -18,6 +18,8 @@ skeleton arrays and cloud handles are not re-pickled per patch.
 
 """
 
+import random
+
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
 from numpy.lib.format import open_memmap
@@ -27,16 +29,42 @@ from aind_exaspim_image_compression.machine_learning import data_handling
 from aind_exaspim_image_compression.utils import util
 
 _WORKER_DATASET = None
+_WORKER_SEED = None
+
+# Distinct RNG stream id for this script so the training and validation caches,
+# even at the same base seed, never sample the same (brain, voxel) for a given
+# task index. Keep it different from the validation precompute's stream.
+_SEED_STREAM = 0
 
 
-def _init_worker(init_kwargs):
+def _seed_task(base_seed, index):
+    """
+    Seeds the global RNGs deterministically from a base seed and task index.
+
+    Uses a SeedSequence so per-task streams are independent and well-mixed,
+    making the cache reproducible and independent of worker count / task
+    scheduling (executor.map assigns result i to task i regardless of which
+    worker runs it). A None base seed is a no-op (nondeterministic sampling).
+    """
+    if base_seed is None:
+        return
+    states = np.random.SeedSequence(
+        [base_seed, _SEED_STREAM, index]
+    ).generate_state(2)
+    random.seed(int(states[0]))
+    np.random.seed(int(states[1]))
+
+
+def _init_worker(init_kwargs, base_seed):
     """Builds one TrainDataset per worker process and caches it globally."""
-    global _WORKER_DATASET
+    global _WORKER_DATASET, _WORKER_SEED
+    _WORKER_SEED = base_seed
     _WORKER_DATASET, _ = data_handling.init_datasets(**init_kwargs)
 
 
-def _sample_counts(_):
+def _sample_counts(index):
     """Samples one count-space example from the per-worker dataset."""
+    _seed_task(_WORKER_SEED, index)
     return _WORKER_DATASET._sample_counts()
 
 
@@ -83,7 +111,7 @@ def precompute():
     with ProcessPoolExecutor(
         max_workers=num_workers,
         initializer=_init_worker,
-        initargs=(init_kwargs,),
+        initargs=(init_kwargs, seed),
     ) as executor:
         results = executor.map(
             _sample_counts, range(n_patches), chunksize=1
@@ -134,5 +162,10 @@ if __name__ == "__main__":
     # so 8000 patches ~= 10 GB. num_workers=None uses all CPUs.
     n_patches = 30000
     num_workers = None
+
+    # Base RNG seed for reproducibility: with a fixed seed the sampled pool is
+    # identical across runs and independent of num_workers. Set to None for
+    # nondeterministic sampling.
+    seed = 42
 
     precompute()
