@@ -772,9 +772,9 @@ class CachedPatchDataset(Dataset):
     Dataset that samples precomputed count-space patches from disk.
 
     The expensive cloud reads + BM4D + foreground masks are precomputed once
-    (see code/precompute_patches.py) into memory-mapped arrays; this dataset
-    reads a random cached patch and applies only the cheap transform + target
-    construction, so training becomes GPU-bound instead of BM4D-bound.
+    (see scripts/precompute.py --split train) into memory-mapped arrays; this
+    dataset reads a random cached patch and applies only the cheap transform +
+    target construction, so training becomes GPU-bound instead of BM4D-bound.
 
     Attributes
     ----------
@@ -852,7 +852,7 @@ class CachedValidateDataset(Dataset):
     a fixed set of examples iterated in order (not sampled at random), whose
     __getitem__ also returns the raw counts needed for the count-space
     metrics. The expensive cloud reads + BM4D + foreground masks are
-    precomputed once (see scripts/precompute_val_patches.py); this dataset
+    precomputed once (see scripts/precompute.py --split val); this dataset
     applies only the cheap transform + target construction, so a cache-backed
     training run needs no cloud access or BM4D at startup.
 

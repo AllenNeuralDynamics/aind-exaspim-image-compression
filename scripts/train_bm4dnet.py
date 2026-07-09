@@ -120,11 +120,12 @@ if __name__ == "__main__":
     # Per-brain background offsets from estimate_background_offsets.py. Set to
     # None to disable per-brain offset subtraction.
     offsets_path = "/data/exaspim_background_offsets.json"
-    # Precomputed patch cache from precompute_patches.py. Leave None to sample
-    # + BM4D live from the cloud (slow, GPU-starved); after precomputing, set
-    # this to the cache dir (e.g. "/results/patch_cache") to train GPU-bound.
+    # Precomputed patch cache from precompute.py --split train. Leave None to
+    # sample + BM4D live from the cloud (slow, GPU-starved); after
+    # precomputing, set this to the cache dir (e.g. "/results/patch_cache") to
+    # train GPU-bound.
     cache_dir = "/root/capsule/data/denoise_net_patch_cache_10K_2026_07_09"
-    # Precomputed validation cache from precompute_val_patches.py. When set
+    # Precomputed validation cache from precompute.py --split val. When set
     # alongside cache_dir, training runs fully offline (no cloud reads or BM4D
     # at startup) and the GPU is busy almost immediately. Leave None to build
     # the validation set live from the cloud.
