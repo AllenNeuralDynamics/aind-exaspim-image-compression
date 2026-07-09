@@ -16,10 +16,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 import numpy as np
 import os
-import tifffile
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from skimage import io
 
 from aind_exaspim_image_compression.machine_learning.unet3d import UNet
 from aind_exaspim_image_compression.machine_learning.data_handling import DataLoader
@@ -31,6 +31,33 @@ from aind_exaspim_image_compression.machine_learning.metrics import (
     evaluate_example,
 )
 from aind_exaspim_image_compression.utils import img_util, util
+
+
+def save_mip_png(path, img, low_pct=1.0, high_pct=99.9):
+    """
+    Writes a 3D volume as a contrast-stretched 8-bit PNG for easy viewing.
+
+    The volume is reduced to 2D with a maximum-intensity projection along the
+    z-axis (axis 0), then percentile-normalized to uint8 so that dim neurites
+    are visible in a standard image viewer.
+
+    Parameters
+    ----------
+    path : str
+        Output path for the PNG file.
+    img : numpy.ndarray
+        3D image volume with shape (D, H, W) in raw counts.
+    low_pct : float, optional
+        Lower percentile mapped to black. The default is 1.0.
+    high_pct : float, optional
+        Upper percentile mapped to white. The default is 99.9.
+    """
+    mip = img.max(axis=0).astype(np.float32)
+    lo, hi = np.percentile(mip, (low_pct, high_pct))
+    if hi <= lo:
+        hi = lo + 1.0
+    mip = np.clip((mip - lo) / (hi - lo), 0.0, 1.0)
+    io.imsave(path, np.rint(mip * 255).astype(np.uint8), check_contrast=False)
 
 
 class Trainer:
@@ -294,7 +321,7 @@ class Trainer:
             img = self.transform.inverse(imgs[i, 0, ...])
             cratios.append(img_util.compute_cratio(img, self.codec))
             if i < 10:
-                tifffile.imwrite(f"{i}.tiff", img)
+                save_mip_png(f"{i}.png", img)
         return cratios
 
     def compute_metrics(self, hat_y, y, raw, fg_mask):
