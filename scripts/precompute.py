@@ -15,13 +15,15 @@ One script builds both caches; ``--split`` selects which:
     python scripts/precompute.py --split train   # GPU-bound training pool
     python scripts/precompute.py --split val      # fixed validation set
 
-Both splits draw voxels with the TrainDataset's foreground-biased sampler. The
-only differences are the target's foreground mask and a few outputs:
-
-    * train -- mask is intensity ∪ segmentation labels (protects labeled
-      neurites from the BM4D teacher), produced by TrainDataset.
-    * val   -- mask is intensity-only, produced by ValidateDataset so it
-      matches the validation metric split.
+Both splits draw voxels with the TrainDataset's foreground-biased sampler and
+build the foreground mask from the segmentation labels unioned with the traced
+skeleton (each dilated), so the training target and the validation metric agree
+on what counts as neurite signal -- bright non-neuronal structures (noise,
+off-target label) are left for the BM4D teacher to denoise rather than
+preserved, while neurites the segmentation misses are still protected by the
+skeleton. The train split builds the mask inside TrainDataset; the val split
+builds the annotation mask from the TrainDataset and hands it to the
+ValidateDataset. The splits otherwise differ only in the outputs each records.
 
 A distinct RNG stream per split means the two caches never sample the same
 (brain, voxel) for a given task index when built with the same base seed.
@@ -97,17 +99,20 @@ def _sample_counts(index):
     """
     Samples one count-space example for the configured split.
 
-    The train split builds the target with the TrainDataset mask (intensity ∪
-    segmentation labels); the val split draws the voxel with the same
-    foreground-biased sampler but builds the example with the ValidateDataset
-    (intensity-only mask) so it matches the validation metric split.
+    Both splits build the foreground mask from the segmentation labels unioned
+    with the traced skeleton (each dilated). The train split does this inside
+    TrainDataset; the val split draws the voxel with the same foreground-biased
+    sampler, builds the annotation mask from the TrainDataset (which owns the
+    segmentations and skeletons), and hands it to the ValidateDataset so the
+    target and the validation metric agree.
     """
     _seed_task(index)
     if _WORKER_SPLIT == "train":
         return _WORKER_TRAIN._sample_counts()
     brain_id = _WORKER_TRAIN.sample_brain()
     voxel = _WORKER_TRAIN.sample_voxel(brain_id)
-    return _WORKER_VAL.sample_counts(brain_id, voxel)
+    fg_mask = _WORKER_TRAIN.annotation_mask(brain_id, voxel)
+    return _WORKER_VAL.sample_counts(brain_id, voxel, fg_mask=fg_mask)
 
 
 def _to_float16(arr):
@@ -144,6 +149,7 @@ def precompute():
         preserve_foreground=preserve_foreground,
         segmentation_prefixes_path=segmentation_prefixes_path,
         sigma_bm4d=sigma_bm4d,
+        skeleton_radius=skeleton_radius,
         swc_pointers=swc_pointers,
         transform_cfg=transform_cfg,
     )
@@ -225,6 +231,8 @@ if __name__ == "__main__":
     min_foreground_voxels = 50
     min_segmentation_volume = 200
     patch_shape = (64, 64, 64)
+    # Neurite radius (voxels) the traced skeleton is dilated to in the mask.
+    skeleton_radius = 2
     preserve_foreground = True
     sigma_bm4d = 24
 

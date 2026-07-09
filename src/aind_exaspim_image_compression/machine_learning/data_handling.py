@@ -28,6 +28,8 @@ import torch
 
 from aind_exaspim_image_compression.machine_learning.metrics import (
     make_foreground_mask,
+    make_segmentation_mask,
+    make_skeleton_mask,
 )
 from aind_exaspim_image_compression.machine_learning.transforms import (
     build_transform,
@@ -98,6 +100,7 @@ class TrainDataset(Dataset):
         prefetch_foreground_sampling=16,
         preserve_foreground=True,
         sigma_bm4d=16,
+        skeleton_radius=2,
         transform=None,
     ):
         # Call parent class
@@ -115,6 +118,7 @@ class TrainDataset(Dataset):
         self.preserve_foreground = preserve_foreground
         self.prefetch_foreground_sampling = prefetch_foreground_sampling
         self.sigma_bm4d = sigma_bm4d
+        self.skeleton_radius = skeleton_radius
         self.transform = transform or build_transform({"kind": "asinh"})
         self.swc_reader = Reader()
 
@@ -277,11 +281,16 @@ class TrainDataset(Dataset):
 
     def foreground_mask(self, brain_id, center, raw):
         """
-        Builds a high-confidence foreground mask for a patch.
+        Builds a foreground mask for a patch from ground-truth annotations.
 
-        Unions a robust intensity threshold with the segmentation labels
-        (when available for the brain), so both bright and labeled neurites
-        are protected from the BM4D teacher.
+        Foreground is the union of the segmentation labels and the traced
+        skeleton (each dilated), so both segmented and traced neurites are
+        preserved from the BM4D teacher while bright non-neuronal structures --
+        noise, off-target label -- are not. The skeleton union matters because
+        the segmentation can miss neurites the ground-truth skeletons trace, and
+        those patches are sampled deliberately. Brains with neither annotation
+        fall back to the robust intensity threshold (should not occur when every
+        brain is segmented).
 
         Parameters
         ----------
@@ -290,18 +299,72 @@ class TrainDataset(Dataset):
         center : Tuple[int]
             Center voxel of the patch.
         raw : numpy.ndarray
-            Raw image patch in counts.
+            Raw image patch in counts, used only for the no-annotation
+            fallback.
 
         Returns
         -------
         numpy.ndarray
             Boolean foreground mask with the shape of "raw".
         """
-        mask = make_foreground_mask(raw)
+        mask = self.annotation_mask(brain_id, center)
+        return make_foreground_mask(raw) if mask is None else mask
+
+    def annotation_mask(self, brain_id, center):
+        """
+        Builds the ground-truth foreground mask (segmentation and skeleton).
+
+        Unions the dilated segmentation labels with the rasterized, dilated
+        skeleton for the patch. Returns None when the brain has neither
+        annotation, so callers can fall back to an intensity mask. Needs no raw
+        image, so the validation path can request the same mask without an
+        extra cloud image read.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the sampled brain.
+        center : Tuple[int]
+            Center voxel of the patch.
+
+        Returns
+        -------
+        numpy.ndarray or None
+            Boolean foreground mask with shape "self.patch_shape", or None if
+            the brain has no segmentation and no skeleton.
+        """
+        mask = None
         if brain_id in self.segmentations:
-            labels = np.asarray(self.read_precomputed_patch(brain_id, center))
-            mask = mask | (labels > 0)
+            labels = self.read_precomputed_patch(brain_id, center)
+            mask = make_segmentation_mask(labels, dilate=1)
+        if brain_id in self.skeletons:
+            skel = self.skeleton_mask(brain_id, center)
+            mask = skel if mask is None else (mask | skel)
         return mask
+
+    def skeleton_mask(self, brain_id, center):
+        """
+        Rasterizes the ground-truth skeleton points falling within a patch.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the sampled brain.
+        center : Tuple[int]
+            Center voxel of the patch.
+
+        Returns
+        -------
+        numpy.ndarray
+            Boolean foreground mask with shape "self.patch_shape".
+        """
+        start = [c - d // 2 for c, d in zip(center, self.patch_shape)]
+        return make_skeleton_mask(
+            self.skeletons[brain_id],
+            start,
+            self.patch_shape,
+            dilate=self.skeleton_radius,
+        )
 
     def sample_brain(self):
         """
@@ -662,15 +725,16 @@ class ValidateDataset(Dataset):
         """
         self.imgs[brain_id] = img_util.read(img_path)
 
-    def sample_counts(self, brain_id, voxel):
+    def sample_counts(self, brain_id, voxel, fg_mask=None):
         """
         Samples one validation patch and its BM4D target in count space.
 
         This is the expensive step (cloud read + BM4D + foreground mask) and
         is exactly what the validation cache stores; the cheap transform +
         target construction is applied by build_training_example. The mask is
-        intensity-only here (no segmentation union), matching the validation
-        metric split.
+        supplied by the caller -- the TrainDataset's annotation mask
+        (segmentation unioned with skeleton), matching the training mask -- and
+        falls back to the intensity threshold only when none is supplied.
 
         Parameters
         ----------
@@ -678,6 +742,9 @@ class ValidateDataset(Dataset):
             Unique identifier of the brain from which to extract the patch.
         voxel : Tuple[int]
             Voxel coordinates of the patch center in the brain volume.
+        fg_mask : numpy.ndarray, optional
+            Precomputed foreground mask aligned with the sampled voxel. When
+            None, the mask falls back to the robust intensity threshold.
 
         Returns
         -------
@@ -689,10 +756,11 @@ class ValidateDataset(Dataset):
         raw = raw - self.offsets.get(brain_id, 0.0)
         teacher = bm4d(raw, self.sigma_bm4d)
         teacher = np.clip(teacher, 0, self.transform.max_count)
-        fg_mask = make_foreground_mask(raw)
+        if fg_mask is None:
+            fg_mask = make_foreground_mask(raw)
         return raw, teacher, fg_mask
 
-    def ingest_example(self, brain_id, voxel):
+    def ingest_example(self, brain_id, voxel, fg_mask=None):
         """
         Extracts, denoises, transforms, and stores an image patch.
 
@@ -702,11 +770,16 @@ class ValidateDataset(Dataset):
             Unique identifier of the brain from which to extract the patch.
         voxel : Tuple[int]
             Voxel coordinates of the patch center in the brain volume.
+        fg_mask : numpy.ndarray, optional
+            Precomputed foreground mask aligned with the sampled voxel. When
+            None, the mask falls back to the intensity threshold.
         """
         # Sample image patch and its BM4D-denoised target
-        raw, teacher, fg_mask = self.sample_counts(brain_id, voxel)
+        raw, teacher, fg_mask = self.sample_counts(
+            brain_id, voxel, fg_mask=fg_mask
+        )
 
-        # Preserve raw counts on foreground (intensity mask only here)
+        # Preserve raw counts on the ground-truth neurite foreground
         if self.preserve_foreground:
             target = np.where(fg_mask, raw, teacher)
         else:
@@ -1064,6 +1137,7 @@ def init_datasets(
     n_validate_examples=0,
     segmentation_prefixes_path=None,
     sigma_bm4d=16,
+    skeleton_radius=2,
     swc_pointers=None,
     transform_cfg=None,
     preserve_foreground=True,
@@ -1080,7 +1154,8 @@ def init_datasets(
         n_examples_per_epoch=n_train_examples_per_epoch,
         offsets=offsets,
         preserve_foreground=preserve_foreground,
-        sigma_bm4d=sigma_bm4d
+        sigma_bm4d=sigma_bm4d,
+        skeleton_radius=skeleton_radius,
     )
     val_dataset = ValidateDataset(
         patch_shape,
@@ -1128,11 +1203,16 @@ def init_datasets(
     train_dataset.transform = transform
     val_dataset.transform = transform
 
-    # Generate validation examples
+    # Generate validation examples. The voxel is drawn from the train dataset,
+    # which owns the segmentations and skeletons, so build the annotation mask
+    # (segmentation unioned with skeleton) here and hand it to the validation
+    # dataset (which loads neither) for a foreground mask consistent with
+    # training.
     for _ in range(n_validate_examples):
         brain_id = train_dataset.sample_brain()
         voxel = train_dataset.sample_voxel(brain_id)
-        val_dataset.ingest_example(brain_id, voxel)
+        fg_mask = train_dataset.annotation_mask(brain_id, voxel)
+        val_dataset.ingest_example(brain_id, voxel, fg_mask=fg_mask)
     return train_dataset, val_dataset
 
 

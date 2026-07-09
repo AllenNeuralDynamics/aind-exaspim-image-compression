@@ -6,7 +6,11 @@ the same thing regardless of which intensity transform is used. They split
 voxels into foreground and background with a robust intensity mask and
 measure, separately, whether bright signal is preserved (foreground, vs. the
 raw counts) and whether background is cleaned like the BM4D teacher
-(background, vs. the target counts).
+(background, vs. the target counts). The foreground/background split uses a
+caller-supplied mask -- the segmentation labels unioned with the traced
+skeleton during training and validation (see make_segmentation_mask,
+make_skeleton_mask), or the robust intensity threshold (make_foreground_mask)
+when no annotations are available.
 
 """
 
@@ -52,6 +56,75 @@ def make_foreground_mask(raw, k=6.0, dilate=1):
     mad = np.median(np.abs(raw - med)) + 1e-6
     sigma = 1.4826 * mad
     mask = raw > (med + k * sigma)
+    if dilate > 0:
+        mask = ndimage.binary_dilation(mask, iterations=dilate)
+    return mask
+
+
+def make_segmentation_mask(labels, dilate=1):
+    """
+    Builds a foreground mask from segmentation labels.
+
+    Foreground is the labeled neurites alone, so bright non-neuronal structures
+    (noise, off-target label) are left for the BM4D teacher to denoise rather
+    than preserved as raw counts. A small dilation protects labeled neurite
+    boundaries and partial-volume edges.
+
+    Parameters
+    ----------
+    labels : numpy.ndarray
+        Segmentation label patch; 0 is background and any positive id is a
+        labeled object.
+    dilate : int, optional
+        Number of binary-dilation iterations. Default is 1.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean foreground mask with the same shape as "labels".
+    """
+    mask = np.asarray(labels) > 0
+    if dilate > 0:
+        mask = ndimage.binary_dilation(mask, iterations=dilate)
+    return mask
+
+
+def make_skeleton_mask(points, start, patch_shape, dilate=2):
+    """
+    Builds a foreground mask from ground-truth skeleton points in a patch.
+
+    Rasterizes the traced neurite centerline points that fall within the patch
+    and dilates them to an approximate neurite radius, so ground-truth signal
+    is preserved even where the segmentation does not label it. Raw intensity
+    is never consulted, so noise is not picked up.
+
+    Parameters
+    ----------
+    points : numpy.ndarray
+        Skeleton points as an (N, 3) array of voxel coordinates in the brain
+        volume, in the same axis order as the patch.
+    start : Sequence[int]
+        Lower corner of the patch in the brain volume (center - patch_shape //
+        2 per axis), matching img_util.get_slices.
+    patch_shape : Tuple[int]
+        Shape of the patch.
+    dilate : int, optional
+        Binary-dilation iterations approximating the neurite radius, in voxels
+        and treated isotropically (anisotropy is ignored). Default is 2.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean foreground mask with shape "patch_shape".
+    """
+    start = np.asarray(start)
+    stop = start + np.asarray(patch_shape)
+    pts = np.asarray(points)
+    inside = np.all((pts >= start) & (pts < stop), axis=1)
+    mask = np.zeros(tuple(patch_shape), dtype=bool)
+    local = (pts[inside] - start).astype(int)
+    if local.size:
+        mask[local[:, 0], local[:, 1], local[:, 2]] = True
     if dilate > 0:
         mask = ndimage.binary_dilation(mask, iterations=dilate)
     return mask
