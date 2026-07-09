@@ -373,6 +373,36 @@ class Trainer:
             ckpt = ckpt["model"]
         self.model.load_state_dict(ckpt)
 
+    def save_config(self, config):
+        """
+        Writes a run configuration to ``config.json`` in the session directory.
+
+        The training script's hyperparameters are not otherwise persisted, so
+        this records them alongside the checkpoints and tensorboard logs to
+        make each run reproducible. The Trainer's own hyperparameters are
+        merged in so callers cannot forget them.
+
+        Parameters
+        ----------
+        config : dict
+            Run configuration (paths, hyperparameters, transform) assembled by
+            the caller. Merged over the Trainer-owned fields.
+        """
+        record = {
+            "batch_size": self.batch_size,
+            "device": self.device,
+            "max_epochs": self.max_epochs,
+            "num_workers": self.num_workers,
+            "prefetch": self.prefetch,
+            "val_every": self.val_every,
+            "fg_weight": getattr(self.criterion, "fg_weight", None),
+            "checkpoint_weights": self.checkpoint_weights,
+            "lr": self.optimizer.param_groups[0]["lr"],
+            "model": type(self.model).__name__,
+        }
+        record.update(config)
+        util.write_json(os.path.join(self.log_dir, "config.json"), record)
+
     def save_model(self, epoch):
         """
         Saves the current model state to a file.

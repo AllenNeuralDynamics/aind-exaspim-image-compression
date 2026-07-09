@@ -104,6 +104,31 @@ def train():
         num_workers=0 if cache_dir else None,
         val_every=val_every,
     )
+
+    # Persist the run configuration next to the checkpoints/tensorboard so each
+    # session is reproducible (the Trainer merges in its own hyperparameters).
+    trainer.save_config(
+        {
+            "brain_ids_path": brain_ids_path,
+            "img_prefixes_path": img_prefixes_path,
+            "segmentation_prefixes_path": segmentation_prefixes_path,
+            "offsets_path": offsets_path,
+            "cache_dir": cache_dir,
+            "val_cache_dir": val_cache_dir,
+            "resume_path": resume_path,
+            "swc_pointers": swc_pointers,
+            "transform_cfg": transform_cfg,
+            "foreground_sampling_rate": foreground_sampling_rate,
+            "n_train_examples_per_epoch": n_train_examples_per_epoch,
+            "n_validate_examples": n_validate_examples,
+            "patch_shape": patch_shape,
+            "sigma_bm4d": sigma_bm4d,
+            "preserve_foreground": preserve_foreground,
+            "min_foreground_voxels": min_foreground_voxels,
+            "min_segmentation_volume": min_segmentation_volume,
+        }
+    )
+
     if resume_path is not None:
         trainer.load_pretrained_weights(resume_path)
     trainer.run(train_dataset, val_dataset)
