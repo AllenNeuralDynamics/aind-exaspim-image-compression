@@ -762,6 +762,59 @@ def write_ome_zarr(
     )
 
 
+def write_zarr(
+    img,
+    output_path,
+    chunks=(1, 1, 64, 64, 64),
+    cname="zstd",
+    clevel=5,
+    shuffle="shuffle",
+    storage_options=None,
+):
+    """
+    Writes an image volume to a single Zarr array (local or cloud).
+
+    Uses the zarr v3 API, so ``output_path`` may be a local path or a cloud URL
+    (``s3://...``, ``gs://...``); zarr builds the store from the URL. For cloud
+    writes, credentials are resolved by fsspec from the standard chain (env,
+    ``~/.aws``, instance role) unless ``storage_options`` overrides them. The
+    array is stored 5D (t, c, z, y, x) so ``read`` reads it back unchanged.
+
+    Parameters
+    ----------
+    img : numpy.ndarray
+        Image volume to write. Promoted to 5D if it has fewer dimensions.
+    output_path : str
+        Destination array path/URL (e.g. "s3://bucket/denoised.zarr").
+    chunks : Tuple[int], optional
+        Chunk shape. Default is (1, 1, 64, 64, 64), matching the cratio chunk.
+    cname : str, optional
+        Blosc compressor name. Default is "zstd".
+    clevel : int, optional
+        Blosc compression level. Default is 5.
+    shuffle : str, optional
+        Blosc shuffle mode ("shuffle", "bitshuffle", or "noshuffle"). Default
+        is "shuffle".
+    storage_options : dict or None, optional
+        fsspec storage options for cloud stores (e.g. {"anon": True}). Default
+        is None (default credential chain).
+    """
+    from zarr.codecs import BloscCodec
+
+    while img.ndim < 5:
+        img = img[np.newaxis, ...]
+    z = zarr.create_array(
+        store=output_path,
+        shape=img.shape,
+        chunks=chunks,
+        dtype=img.dtype,
+        compressors=BloscCodec(cname=cname, clevel=clevel, shuffle=shuffle),
+        overwrite=True,
+        storage_options=storage_options,
+    )
+    z[:] = img
+
+
 def ssim3D(img1, img2, data_range=None, window_size=16):
     """
     Computes the structural similarity (SSIM) between two 3D images.
