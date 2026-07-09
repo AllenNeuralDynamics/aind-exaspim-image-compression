@@ -658,6 +658,36 @@ class ValidateDataset(Dataset):
         """
         self.imgs[brain_id] = img_util.read(img_path)
 
+    def sample_counts(self, brain_id, voxel):
+        """
+        Samples one validation patch and its BM4D target in count space.
+
+        This is the expensive step (cloud read + BM4D + foreground mask) and
+        is exactly what the validation cache stores; the cheap transform +
+        target construction is applied by build_training_example. The mask is
+        intensity-only here (no segmentation union), matching the validation
+        metric split.
+
+        Parameters
+        ----------
+        brain_id : hashable
+            Unique identifier of the brain from which to extract the patch.
+        voxel : Tuple[int]
+            Voxel coordinates of the patch center in the brain volume.
+
+        Returns
+        -------
+        Tuple[numpy.ndarray]
+            (raw, teacher, fg_mask) in count space. raw has the per-brain
+            offset subtracted; teacher is the clipped BM4D denoising.
+        """
+        raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
+        raw = raw - self.offsets.get(brain_id, 0.0)
+        teacher = bm4d(raw, self.sigma_bm4d)
+        teacher = np.clip(teacher, 0, self.transform.max_count)
+        fg_mask = make_foreground_mask(raw)
+        return raw, teacher, fg_mask
+
     def ingest_example(self, brain_id, voxel):
         """
         Extracts, denoises, transforms, and stores an image patch.
@@ -670,13 +700,9 @@ class ValidateDataset(Dataset):
             Voxel coordinates of the patch center in the brain volume.
         """
         # Sample image patch and its BM4D-denoised target
-        raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
-        raw = raw - self.offsets.get(brain_id, 0.0)
-        teacher = bm4d(raw, self.sigma_bm4d)
-        teacher = np.clip(teacher, 0, self.transform.max_count)
+        raw, teacher, fg_mask = self.sample_counts(brain_id, voxel)
 
         # Preserve raw counts on foreground (intensity mask only here)
-        fg_mask = make_foreground_mask(raw)
         if self.preserve_foreground:
             target = np.where(fg_mask, raw, teacher)
         else:
@@ -812,6 +838,82 @@ class CachedPatchDataset(Dataset):
         return build_training_example(
             self.transform, self.preserve_foreground, raw, teacher, fg_mask
         )
+
+
+class CachedValidateDataset(Dataset):
+    """
+    Validation dataset backed by a precomputed count-space patch cache.
+
+    Mirrors CachedPatchDataset but reproduces the ValidateDataset interface:
+    a fixed set of examples iterated in order (not sampled at random), whose
+    __getitem__ also returns the raw counts needed for the count-space
+    metrics. The expensive cloud reads + BM4D + foreground masks are
+    precomputed once (see scripts/precompute_val_patches.py); this dataset
+    applies only the cheap transform + target construction, so a cache-backed
+    training run needs no cloud access or BM4D at startup.
+
+    Attributes
+    ----------
+    patch_shape : Tuple[int]
+        Shape of the cached patches.
+    transform : IntensityTransform
+        Transform mapping counts to the normalized domain.
+    """
+
+    def __init__(
+        self, cache_dir, transform=None, preserve_foreground=True,
+    ):
+        """
+        Instantiates a CachedValidateDataset.
+
+        Parameters
+        ----------
+        cache_dir : str
+            Directory holding raw.npy, teacher.npy, and fg.npy.
+        transform : IntensityTransform, optional
+            Transform mapping counts to the normalized domain. Default is an
+            asinh transform.
+        preserve_foreground : bool, optional
+            Whether the target keeps raw counts on the foreground. Default is
+            True.
+        """
+        super(CachedValidateDataset, self).__init__()
+        self.raw = np.load(os.path.join(cache_dir, "raw.npy"), mmap_mode="r")
+        self.teacher = np.load(
+            os.path.join(cache_dir, "teacher.npy"), mmap_mode="r"
+        )
+        self.fg = np.load(os.path.join(cache_dir, "fg.npy"), mmap_mode="r")
+        self.transform = transform or build_transform({"kind": "asinh"})
+        self.preserve_foreground = preserve_foreground
+        self.patch_shape = tuple(self.raw.shape[1:])
+
+    def __len__(self):
+        """Number of cached validation examples."""
+        return len(self.raw)
+
+    def __getitem__(self, idx):
+        """
+        Returns a cached validation example as (x, y, raw, fg_mask).
+
+        Parameters
+        ----------
+        idx : int
+            Index of the example to retrieve.
+
+        Returns
+        -------
+        Tuple[numpy.ndarray]
+            (x, y, raw, fg_mask) matching ValidateDataset.__getitem__: model
+            input, target, raw counts (for count-space metrics), and the
+            foreground mask (float 0/1).
+        """
+        raw = np.asarray(self.raw[idx], dtype=np.float32)
+        teacher = np.asarray(self.teacher[idx], dtype=np.float32)
+        fg_mask = np.asarray(self.fg[idx])
+        x, y, fg = build_training_example(
+            self.transform, self.preserve_foreground, raw, teacher, fg_mask
+        )
+        return x, y, raw, fg
 
 
 # --- Custom Dataloader ---

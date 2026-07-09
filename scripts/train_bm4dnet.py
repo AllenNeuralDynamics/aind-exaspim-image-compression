@@ -3,6 +3,9 @@ import os
 
 from aind_exaspim_image_compression.machine_learning import data_handling
 from aind_exaspim_image_compression.machine_learning.train import Trainer
+from aind_exaspim_image_compression.machine_learning.transforms import (
+    build_transform,
+)
 from aind_exaspim_image_compression.machine_learning.unet3d import UNet
 from aind_exaspim_image_compression.utils import util
 
@@ -11,47 +14,82 @@ os.environ["GRPC_TRACE"] = ""
 
 
 def train():
-    # Load Brain IDs and per-brain background offsets
-    brain_ids = util.read_txt(brain_ids_path)
-    offsets = util.read_json(offsets_path) if offsets_path else None
-
-    # Datasets. The per-brain offset is subtracted from each patch, then one
-    # shared transform (offset 0) maps every brain to a background-at-zero
-    # space; the transform cfg is serialized with each checkpoint.
-    train_dataset, val_dataset = data_handling.init_datasets(
-        brain_ids,
-        img_prefixes_path,
-        patch_shape,
-        foreground_sampling_rate=foreground_sampling_rate,
-        min_foreground_voxels=min_foreground_voxels,
-        min_segmentation_volume=min_segmentation_volume,
-        n_train_examples_per_epoch=n_train_examples_per_epoch,
-        n_validate_examples=n_validate_examples,
-        offsets=offsets,
-        preserve_foreground=preserve_foreground,
-        segmentation_prefixes_path=segmentation_prefixes_path,
-        sigma_bm4d=sigma_bm4d,
-        swc_pointers=swc_pointers,
-        transform_cfg=transform_cfg,
-    )
-    print("Transform:", train_dataset.transform.cfg)
-    print("# Brains with Skeletons:", len(train_dataset.skeletons))
-    print("# Brains with Segmentations:", len(train_dataset.segmentations))
-
-    # Train from the precomputed patch cache when available (GPU-bound).
-    # Reuse the transform init_datasets built so the cache and validation
-    # share the identical mapping; validation stays on the cloud dataset.
-    if cache_dir:
+    # Fully-cached path: with both a training and a validation cache, no cloud
+    # reads or BM4D happen at startup. Rebuild the exact transform the caches
+    # were built with (stamped in the val cache) so the cached patches and the
+    # model share the identical mapping; per-brain offsets are already baked
+    # into the cached counts.
+    if cache_dir and val_cache_dir:
+        transform_path = os.path.join(val_cache_dir, "transform.json")
+        cached_cfg = (
+            util.read_json(transform_path)
+            if os.path.exists(transform_path)
+            else transform_cfg
+        )
+        transform = build_transform(cached_cfg)
         train_dataset = data_handling.CachedPatchDataset(
             cache_dir,
-            transform=train_dataset.transform,
+            transform=transform,
             preserve_foreground=preserve_foreground,
             n_examples_per_epoch=n_train_examples_per_epoch,
         )
+        val_dataset = data_handling.CachedValidateDataset(
+            val_cache_dir,
+            transform=transform,
+            preserve_foreground=preserve_foreground,
+        )
+        print("Transform:", transform.cfg)
         print(
             "Training from cache:", cache_dir,
             "| pool size:", len(train_dataset.raw),
         )
+        print(
+            "Validating from cache:", val_cache_dir,
+            "| examples:", len(val_dataset),
+        )
+    else:
+        # Load Brain IDs and per-brain background offsets
+        brain_ids = util.read_txt(brain_ids_path)
+        offsets = util.read_json(offsets_path) if offsets_path else None
+
+        # Datasets. The per-brain offset is subtracted from each patch, then
+        # one shared transform (offset 0) maps every brain to a
+        # background-at-zero space; the transform cfg is serialized with each
+        # checkpoint.
+        train_dataset, val_dataset = data_handling.init_datasets(
+            brain_ids,
+            img_prefixes_path,
+            patch_shape,
+            foreground_sampling_rate=foreground_sampling_rate,
+            min_foreground_voxels=min_foreground_voxels,
+            min_segmentation_volume=min_segmentation_volume,
+            n_train_examples_per_epoch=n_train_examples_per_epoch,
+            n_validate_examples=n_validate_examples,
+            offsets=offsets,
+            preserve_foreground=preserve_foreground,
+            segmentation_prefixes_path=segmentation_prefixes_path,
+            sigma_bm4d=sigma_bm4d,
+            swc_pointers=swc_pointers,
+            transform_cfg=transform_cfg,
+        )
+        print("Transform:", train_dataset.transform.cfg)
+        print("# Brains with Skeletons:", len(train_dataset.skeletons))
+        print("# Brains with Segmentations:", len(train_dataset.segmentations))
+
+        # Train from the precomputed patch cache when available (GPU-bound).
+        # Reuse the transform init_datasets built so the cache and validation
+        # share the identical mapping; validation stays on the cloud dataset.
+        if cache_dir:
+            train_dataset = data_handling.CachedPatchDataset(
+                cache_dir,
+                transform=train_dataset.transform,
+                preserve_foreground=preserve_foreground,
+                n_examples_per_epoch=n_train_examples_per_epoch,
+            )
+            print(
+                "Training from cache:", cache_dir,
+                "| pool size:", len(train_dataset.raw),
+            )
 
     # Run. Cached patches are cheap, so load them in-thread (num_workers=0);
     # the cloud dataset needs the process pool for parallel BM4D.
@@ -84,7 +122,12 @@ if __name__ == "__main__":
     # Precomputed patch cache from precompute_patches.py. Leave None to sample
     # + BM4D live from the cloud (slow, GPU-starved); after precomputing, set
     # this to the cache dir (e.g. "/results/patch_cache") to train GPU-bound.
-    cache_dir = None
+    cache_dir = "/root/capsule/data/denoise_net_patch_cache_10K_2026_07_09"
+    # Precomputed validation cache from precompute_val_patches.py. When set
+    # alongside cache_dir, training runs fully offline (no cloud reads or BM4D
+    # at startup) and the GPU is busy almost immediately. Leave None to build
+    # the validation set live from the cloud.
+    val_cache_dir = None
     util.mkdir(output_dir)
 
     # Resume path. Checkpoints from before the normalization overhaul are NOT
@@ -117,7 +160,7 @@ if __name__ == "__main__":
     model = UNet()
 
     # Training parameters
-    batch_size = 8
+    batch_size = 32
     foreground_sampling_rate = 0.5
     lr = 1e-4
     max_epochs = 400
