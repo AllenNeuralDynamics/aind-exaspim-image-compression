@@ -88,7 +88,10 @@ class Trainer:
         self.best_score = np.inf
         self.model = model.to(device) if model else UNet().to(device)
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=25)
+        # T_max spans the whole run so the cosine anneals once. With a small
+        # T_max the LR returns to its peak every 2*T_max epochs, and each
+        # return destabilized training (growing periodic loss spikes).
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=max_epochs)
         self.writer = SummaryWriter(log_dir=log_dir)
 
         if use_amp:
