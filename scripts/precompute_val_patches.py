@@ -164,9 +164,13 @@ if __name__ == "__main__":
     preserve_foreground = True
     sigma_bm4d = 24
 
-    # Pool size and parallelism. The validation set is small and fixed; match
-    # n_validate_examples from train_bm4dnet.py. num_workers=None uses all CPUs.
-    n_patches = 60
+    # Pool size and parallelism. The per-patch metrics are heavy-tailed (a
+    # sizable fraction of patches are near-pure background that compress at
+    # hundreds of x), so a small set makes the reported median cratio -- and
+    # thus checkpoint selection -- noisy. ~500 patches keeps the sampling error
+    # of the selection score small; returns diminish past ~1000. Disk is cheap
+    # (~1.3 MB/patch). num_workers=None uses all CPUs.
+    n_patches = 500
     num_workers = None
 
     precompute()
