@@ -102,6 +102,7 @@ def train():
         fg_weight=fg_weight,
         checkpoint_weights=checkpoint_weights,
         num_workers=0 if cache_dir else None,
+        val_every=val_every,
     )
     if resume_path is not None:
         trainer.load_pretrained_weights(resume_path)
@@ -168,6 +169,10 @@ if __name__ == "__main__":
     n_validate_examples = 60
     patch_shape = (64, 64, 64)
     sigma_bm4d = 24
+    # Validate (and consider a checkpoint) every this many epochs. A larger
+    # cached validation set is cheap to store but CPU-bound to score, so keep
+    # this above 1 to avoid the metrics dominating epoch time.
+    val_every = 5
 
     # Signal-preserving loss + target/sampling (Parts E/F). preserve_foreground
     # keeps raw counts on the foreground so BM4D cannot erase neurites; that
@@ -187,7 +192,7 @@ if __name__ == "__main__":
     # exists for. cratio is the operating-point knob: raise it to trade
     # fidelity for compression, lower it to protect faint neurites.
     checkpoint_weights = dict(
-        fg_mae=1.0, bg_mae=0.2, top_pct_error=0.5, cratio=200.0
+        fg_mae=1.0, bg_mae=0.2, top_pct_error=0.5, cratio=20.0
     )
 
     # Main

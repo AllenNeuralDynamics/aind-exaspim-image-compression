@@ -48,6 +48,7 @@ class Trainer:
         fg_weight=20.0,
         num_workers=None,
         prefetch=2,
+        val_every=1,
     ):
         """
         Instantiates a Trainer object.
@@ -68,6 +69,11 @@ class Trainer:
             Model to be trained on the given datasets. Default is None.
         use_amp : bool, optional
             Indication of whether to use mixed precision. Default is True.
+        val_every : int, optional
+            Run validation (and checkpoint selection) every this many epochs;
+            the final epoch is always validated. The count-space metrics are
+            CPU-bound, so a large validation set is only cheap if it is not run
+            every epoch. Default is 1 (validate every epoch).
         """
         # Initializations
         exp_name = "session-" + datetime.today().strftime("%Y%m%d_%H%M")
@@ -81,6 +87,7 @@ class Trainer:
         self.log_dir = log_dir
         self.num_workers = num_workers
         self.prefetch = prefetch
+        self.val_every = max(1, int(val_every))
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
         self.criterion = SignalPreservingLoss(fg_weight=fg_weight)
@@ -135,15 +142,21 @@ class Trainer:
         # Main
         self.best_score = np.inf
         for epoch in range(self.max_epochs):
-            # Train-Validate
+            # Train
             train_loss = self.train_step(train_dataloader, epoch)
-            val_loss, val_cratio, is_best = self.validate_step(
-                val_dataloader, epoch
-            )
 
-            # Report results
-            suffix = " - New Best!" if is_best else ""
-            s = f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio}" + suffix
+            # Validate every val_every epochs (and always on the final epoch);
+            # the count-space metrics are CPU-bound, so a large validation set
+            # is only cheap when it is not run every epoch.
+            is_last = epoch == self.max_epochs - 1
+            if epoch % self.val_every == 0 or is_last:
+                val_loss, val_cratio, is_best = self.validate_step(
+                    val_dataloader, epoch
+                )
+                suffix = " - New Best!" if is_best else ""
+                s = f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio}" + suffix
+            else:
+                s = f"Epoch {epoch}:  train_loss={train_loss}"
             print(s)
 
             # Step scheduler
