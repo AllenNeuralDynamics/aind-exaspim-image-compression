@@ -75,9 +75,11 @@ def predict(
     n_starts = count_patches(img, patch_size, overlap)
     pbar = tqdm(total=n_starts, desc="Denoise") if verbose else None
 
-    # Main
-    accum_pred = np.zeros(img.shape[2:])
-    accum_wgt = np.zeros(img.shape[2:])
+    # Main. Use float32 accumulators, not numpy's default float64: these are
+    # full-volume buffers, and for a 1024**3 volume each float64 array is 8 GiB,
+    # so the two accumulators alone cost 16 GiB.
+    accum_pred = np.zeros(img.shape[2:], dtype=np.float32)
+    accum_wgt = np.zeros(img.shape[2:], dtype=np.float32)
     for _ in range(0, n_starts, batch_size):
         # Extract batch and run model
         starts = list(itertools.islice(patch_starts_generator, batch_size))
@@ -102,9 +104,16 @@ def predict(
 
         pbar.update(len(starts)) if verbose else None
 
-    # Postprocess prediction
-    denoised = accum_pred[:, ...] / (accum_wgt + 1e-8)
-    return transform.inverse(denoised)
+    # Postprocess prediction in place. The transformed input is no longer
+    # needed, and averaging in place avoids the two extra full-volume buffers
+    # that "accum_pred / (accum_wgt + 1e-8)" would allocate -- on a 1024**3
+    # volume that expression added ~16 GiB of temporaries on top of the
+    # accumulators and OOM'd a 30 GB host.
+    del img
+    accum_wgt += 1e-8
+    accum_pred /= accum_wgt
+    del accum_wgt
+    return transform.inverse(accum_pred)
 
 
 def predict_patch(patch, model, transform):
