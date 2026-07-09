@@ -137,3 +137,13 @@ dmypy.json
 
 # MacOs
 **/.DS_Store
+
+# CodeOcean folders
+.vscode
+/data
+/scratch
+.claude
+.codeocean
+/environment
+/metadata
+*.png
