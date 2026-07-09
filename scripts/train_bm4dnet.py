@@ -180,12 +180,15 @@ if __name__ == "__main__":
     min_foreground_voxels = 50
     min_segmentation_volume = 200
 
-    # Checkpoint selection (Part C). None => fidelity-only (cratio weight 0).
-    # Once you pick the compression-vs-fidelity operating point, set e.g.
-    #   checkpoint_weights = dict(
-    #       fg_mae=1.0, bg_mae=0.2, top_pct_error=0.5, cratio=200.0
-    #   )
-    checkpoint_weights = None
+    # Checkpoint selection (Part C). None => fidelity-only (cratio weight 0),
+    # which cannot see compression and happily selects a non-denoising model
+    # (identity minimizes fg_mae because the fg target is the raw input). Give
+    # cratio a nonzero weight so selection rewards the compression the project
+    # exists for. cratio is the operating-point knob: raise it to trade
+    # fidelity for compression, lower it to protect faint neurites.
+    checkpoint_weights = dict(
+        fg_mae=1.0, bg_mae=0.2, top_pct_error=0.5, cratio=200.0
+    )
 
     # Main
     mp.set_start_method("spawn", force=True)
