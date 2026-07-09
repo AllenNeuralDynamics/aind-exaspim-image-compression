@@ -61,14 +61,16 @@ def make_foreground_mask(raw, k=6.0, dilate=1):
     return mask
 
 
-def make_segmentation_mask(labels, dilate=1):
+def make_segmentation_mask(labels, dilate=0):
     """
     Builds a foreground mask from segmentation labels.
 
     Foreground is the labeled neurites alone, so bright non-neuronal structures
     (noise, off-target label) are left for the BM4D teacher to denoise rather
-    than preserved as raw counts. A small dilation protects labeled neurite
-    boundaries and partial-volume edges.
+    than preserved as raw counts. The labels are used as-is by default: they
+    already mark neurite voxels, so dilating them would annex surrounding
+    background into the preserved region. Dilation is opt-in (dilate > 0) to
+    feather labeled boundaries / partial-volume edges when wanted.
 
     Parameters
     ----------
@@ -76,7 +78,7 @@ def make_segmentation_mask(labels, dilate=1):
         Segmentation label patch; 0 is background and any positive id is a
         labeled object.
     dilate : int, optional
-        Number of binary-dilation iterations. Default is 1.
+        Number of binary-dilation iterations. Default is 0 (labels as-is).
 
     Returns
     -------

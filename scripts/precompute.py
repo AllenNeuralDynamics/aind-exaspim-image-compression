@@ -16,9 +16,10 @@ One script builds both caches; ``--split`` selects which:
     python scripts/precompute.py --split val      # fixed validation set
 
 Both splits draw voxels with the TrainDataset's foreground-biased sampler and
-build the foreground mask from the segmentation labels unioned with the traced
-skeleton (each dilated), so the training target and the validation metric agree
-on what counts as neurite signal -- bright non-neuronal structures (noise,
+build the foreground mask from the segmentation labels (used as-is unless
+segmentation_dilate > 0) unioned with the traced skeleton (dilated to a neurite
+radius), so the training target and the validation metric agree on what counts
+as neurite signal -- bright non-neuronal structures (noise,
 off-target label) are left for the BM4D teacher to denoise rather than
 preserved, while neurites the segmentation misses are still protected by the
 skeleton. The train split builds the mask inside TrainDataset; the val split
@@ -99,8 +100,9 @@ def _sample_counts(index):
     """
     Samples one count-space example for the configured split.
 
-    Both splits build the foreground mask from the segmentation labels unioned
-    with the traced skeleton (each dilated). The train split does this inside
+    Both splits build the foreground mask from the segmentation labels (used
+    as-is unless segmentation_dilate > 0) unioned with the traced skeleton
+    (dilated to a neurite radius). The train split does this inside
     TrainDataset; the val split draws the voxel with the same foreground-biased
     sampler, builds the annotation mask from the TrainDataset (which owns the
     segmentations and skeletons), and hands it to the ValidateDataset so the
@@ -148,6 +150,7 @@ def precompute():
         offsets=offsets,
         preserve_foreground=preserve_foreground,
         segmentation_prefixes_path=segmentation_prefixes_path,
+        segmentation_dilate=segmentation_dilate,
         sigma_bm4d=sigma_bm4d,
         skeleton_radius=skeleton_radius,
         swc_pointers=swc_pointers,
@@ -233,6 +236,9 @@ if __name__ == "__main__":
     patch_shape = (64, 64, 64)
     # Neurite radius (voxels) the traced skeleton is dilated to in the mask.
     skeleton_radius = 2
+    # Dilation (voxels) applied to the segmentation labels; 0 uses them as-is,
+    # since the labels already mark neurite voxels.
+    segmentation_dilate = 0
     preserve_foreground = True
     sigma_bm4d = 24
 

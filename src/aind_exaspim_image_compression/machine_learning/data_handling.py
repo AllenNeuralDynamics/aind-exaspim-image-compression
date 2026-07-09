@@ -99,6 +99,7 @@ class TrainDataset(Dataset):
         offsets=None,
         prefetch_foreground_sampling=16,
         preserve_foreground=True,
+        segmentation_dilate=0,
         sigma_bm4d=16,
         skeleton_radius=2,
         transform=None,
@@ -117,6 +118,7 @@ class TrainDataset(Dataset):
         self.patch_shape = patch_shape
         self.preserve_foreground = preserve_foreground
         self.prefetch_foreground_sampling = prefetch_foreground_sampling
+        self.segmentation_dilate = segmentation_dilate
         self.sigma_bm4d = sigma_bm4d
         self.skeleton_radius = skeleton_radius
         self.transform = transform or build_transform({"kind": "asinh"})
@@ -283,14 +285,15 @@ class TrainDataset(Dataset):
         """
         Builds a foreground mask for a patch from ground-truth annotations.
 
-        Foreground is the union of the segmentation labels and the traced
-        skeleton (each dilated), so both segmented and traced neurites are
-        preserved from the BM4D teacher while bright non-neuronal structures --
-        noise, off-target label -- are not. The skeleton union matters because
-        the segmentation can miss neurites the ground-truth skeletons trace, and
-        those patches are sampled deliberately. Brains with neither annotation
-        fall back to the robust intensity threshold (should not occur when every
-        brain is segmented).
+        Foreground is the union of the segmentation labels (used as-is unless
+        segmentation_dilate > 0) and the traced skeleton (dilated to a neurite
+        radius), so both segmented and traced neurites are preserved from the
+        BM4D teacher while bright non-neuronal structures -- noise, off-target
+        label -- are not. The skeleton union matters because the segmentation
+        can miss neurites the ground-truth skeletons trace, and those patches
+        are sampled deliberately. Brains with neither annotation fall back to
+        the robust intensity threshold (should not occur when every brain is
+        segmented).
 
         Parameters
         ----------
@@ -314,11 +317,11 @@ class TrainDataset(Dataset):
         """
         Builds the ground-truth foreground mask (segmentation and skeleton).
 
-        Unions the dilated segmentation labels with the rasterized, dilated
-        skeleton for the patch. Returns None when the brain has neither
-        annotation, so callers can fall back to an intensity mask. Needs no raw
-        image, so the validation path can request the same mask without an
-        extra cloud image read.
+        Unions the segmentation labels (dilated only when segmentation_dilate >
+        0) with the rasterized, dilated skeleton for the patch. Returns None
+        when the brain has neither annotation, so callers can fall back to an
+        intensity mask. Needs no raw image, so the validation path can request
+        the same mask without an extra cloud image read.
 
         Parameters
         ----------
@@ -336,7 +339,9 @@ class TrainDataset(Dataset):
         mask = None
         if brain_id in self.segmentations:
             labels = self.read_precomputed_patch(brain_id, center)
-            mask = make_segmentation_mask(labels, dilate=1)
+            mask = make_segmentation_mask(
+                labels, dilate=self.segmentation_dilate
+            )
         if brain_id in self.skeletons:
             skel = self.skeleton_mask(brain_id, center)
             mask = skel if mask is None else (mask | skel)
@@ -1136,6 +1141,7 @@ def init_datasets(
     n_train_examples_per_epoch=100,
     n_validate_examples=0,
     segmentation_prefixes_path=None,
+    segmentation_dilate=0,
     sigma_bm4d=16,
     skeleton_radius=2,
     swc_pointers=None,
@@ -1154,6 +1160,7 @@ def init_datasets(
         n_examples_per_epoch=n_train_examples_per_epoch,
         offsets=offsets,
         preserve_foreground=preserve_foreground,
+        segmentation_dilate=segmentation_dilate,
         sigma_bm4d=sigma_bm4d,
         skeleton_radius=skeleton_radius,
     )
