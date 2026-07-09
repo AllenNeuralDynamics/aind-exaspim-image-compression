@@ -46,6 +46,8 @@ class Trainer:
         use_amp=True,
         checkpoint_weights=None,
         fg_weight=20.0,
+        num_workers=None,
+        prefetch=2,
     ):
         """
         Instantiates a Trainer object.
@@ -77,6 +79,8 @@ class Trainer:
         self.device = device
         self.max_epochs = max_epochs
         self.log_dir = log_dir
+        self.num_workers = num_workers
+        self.prefetch = prefetch
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
         self.criterion = SignalPreservingLoss(fg_weight=fg_weight)
@@ -108,9 +112,17 @@ class Trainer:
         print("Experiment:", os.path.basename(os.path.normpath(self.log_dir)))
         self.transform = train_dataset.transform
         train_dataloader = DataLoader(
-            train_dataset, batch_size=self.batch_size
+            train_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            prefetch=self.prefetch,
         )
-        val_dataloader = DataLoader(val_dataset, batch_size=self.batch_size)
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            prefetch=self.prefetch,
+        )
 
         # Main
         self.best_score = np.inf

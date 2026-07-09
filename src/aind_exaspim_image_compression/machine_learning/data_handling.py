@@ -19,8 +19,11 @@ from tqdm import tqdm
 
 import fastremap
 import numpy as np
+import os
+import queue
 import random
 import tensorstore as ts
+import threading
 import torch
 
 from aind_exaspim_image_compression.machine_learning.metrics import (
@@ -31,6 +34,42 @@ from aind_exaspim_image_compression.machine_learning.transforms import (
     calibrate_transform,
 )
 from aind_exaspim_image_compression.utils import img_util, util
+
+
+def build_training_example(
+    transform, preserve_foreground, raw, teacher, fg_mask
+):
+    """
+    Assembles a training example from count-space arrays.
+
+    Applies the foreground-preserving target construction and the transform,
+    shared by the live TrainDataset and the CachedPatchDataset.
+
+    Parameters
+    ----------
+    transform : IntensityTransform
+        Transform mapping counts to the normalized domain.
+    preserve_foreground : bool
+        Whether the target keeps raw counts on the foreground.
+    raw : numpy.ndarray
+        Offset-subtracted raw counts.
+    teacher : numpy.ndarray
+        Clipped BM4D denoising in counts.
+    fg_mask : numpy.ndarray
+        Foreground mask.
+
+    Returns
+    -------
+    Tuple[numpy.ndarray]
+        (x, y, fg_mask) — model input, target, and mask (float 0/1).
+    """
+    fg = np.asarray(fg_mask).astype(bool)
+    target = np.where(fg, raw, teacher) if preserve_foreground else teacher
+    return (
+        transform.forward(raw),
+        transform.forward(target),
+        fg.astype(np.float32),
+    )
 from aind_exaspim_image_compression.utils.swc_util import Reader
 
 
@@ -209,25 +248,33 @@ class TrainDataset(Dataset):
         fg_mask : numpy.ndarray
             Foreground mask (float 0/1) for the signal-preserving loss.
         """
-        # Sample image patch and its BM4D-denoised target
+        raw, teacher, fg_mask = self._sample_counts()
+        return build_training_example(
+            self.transform, self.preserve_foreground, raw, teacher, fg_mask
+        )
+
+    def _sample_counts(self):
+        """
+        Samples one patch and its BM4D target in offset-subtracted counts.
+
+        This is the expensive step (cloud read + BM4D + foreground mask) and
+        is exactly what the patch cache stores; the cheap transform + target
+        construction is applied by build_training_example.
+
+        Returns
+        -------
+        Tuple[numpy.ndarray]
+            (raw, teacher, fg_mask) in count space. raw has the per-brain
+            offset subtracted; teacher is the clipped BM4D denoising.
+        """
         brain_id = self.sample_brain()
         voxel = self.sample_voxel(brain_id)
         raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
         raw = raw - self.offsets.get(brain_id, 0.0)
         teacher = bm4d(raw, self.sigma_bm4d)
         teacher = np.clip(teacher, 0, self.transform.max_count)
-
-        # Preserve raw counts on foreground so BM4D cannot erase neurites
         fg_mask = self.foreground_mask(brain_id, voxel, raw)
-        if self.preserve_foreground:
-            target = np.where(fg_mask, raw, teacher)
-        else:
-            target = teacher
-
-        # Map to the normalized transform domain
-        x = self.transform.forward(raw)
-        y = self.transform.forward(target)
-        return x, y, fg_mask.astype(np.float32)
+        return raw, teacher, fg_mask
 
     def foreground_mask(self, brain_id, center, raw):
         """
@@ -691,67 +738,206 @@ class ValidateDataset(Dataset):
         return self.imgs[brain_id][(0, 0, *slices)]
 
 
+class CachedPatchDataset(Dataset):
+    """
+    Dataset that samples precomputed count-space patches from disk.
+
+    The expensive cloud reads + BM4D + foreground masks are precomputed once
+    (see code/precompute_patches.py) into memory-mapped arrays; this dataset
+    reads a random cached patch and applies only the cheap transform + target
+    construction, so training becomes GPU-bound instead of BM4D-bound.
+
+    Attributes
+    ----------
+    patch_shape : Tuple[int]
+        Shape of the cached patches.
+    transform : IntensityTransform
+        Transform mapping counts to the normalized domain.
+    """
+
+    def __init__(
+        self, cache_dir, transform=None, preserve_foreground=True,
+        n_examples_per_epoch=None,
+    ):
+        """
+        Instantiates a CachedPatchDataset.
+
+        Parameters
+        ----------
+        cache_dir : str
+            Directory holding raw.npy, teacher.npy, and fg.npy.
+        transform : IntensityTransform, optional
+            Transform mapping counts to the normalized domain. Default is an
+            asinh transform.
+        preserve_foreground : bool, optional
+            Whether the target keeps raw counts on the foreground. Default is
+            True.
+        n_examples_per_epoch : int, optional
+            Number of examples drawn per epoch. Default is the pool size.
+        """
+        super(CachedPatchDataset, self).__init__()
+        self.raw = np.load(os.path.join(cache_dir, "raw.npy"), mmap_mode="r")
+        self.teacher = np.load(
+            os.path.join(cache_dir, "teacher.npy"), mmap_mode="r"
+        )
+        self.fg = np.load(os.path.join(cache_dir, "fg.npy"), mmap_mode="r")
+        self.transform = transform or build_transform({"kind": "asinh"})
+        self.preserve_foreground = preserve_foreground
+        self.patch_shape = tuple(self.raw.shape[1:])
+        self.n_examples_per_epoch = (
+            n_examples_per_epoch if n_examples_per_epoch else len(self.raw)
+        )
+
+    def __len__(self):
+        """Number of examples drawn per epoch."""
+        return self.n_examples_per_epoch
+
+    def __getitem__(self, dummy_input):
+        """
+        Returns a random cached example as (x, y, fg_mask).
+
+        Parameters
+        ----------
+        dummy_input : Any
+            Unused index; patches are sampled at random from the pool.
+
+        Returns
+        -------
+        Tuple[numpy.ndarray]
+            (x, y, fg_mask) for the model.
+        """
+        idx = random.randint(0, len(self.raw) - 1)
+        raw = np.asarray(self.raw[idx], dtype=np.float32)
+        teacher = np.asarray(self.teacher[idx], dtype=np.float32)
+        fg_mask = np.asarray(self.fg[idx])
+        return build_training_example(
+            self.transform, self.preserve_foreground, raw, teacher, fg_mask
+        )
+
+
 # --- Custom Dataloader ---
+_WORKER_DATASET = None
+
+
+def _worker_init(dataset):
+    """Stores the dataset in a per-worker global (avoids per-task pickling)."""
+    global _WORKER_DATASET
+    _WORKER_DATASET = dataset
+
+
+def _worker_getitem(idx):
+    """Fetches one example from the per-worker dataset global."""
+    return _WORKER_DATASET[idx]
+
+
 class DataLoader:
     """
-    DataLoader that uses multithreading to fetch image patches from the cloud
-    to form batches.
+    Prefetching DataLoader that overlaps batch preparation with training.
+
+    A background thread fills a bounded queue of prepared batches while the
+    training loop consumes them, so the GPU is not starved. Per-example work
+    runs either in-thread (num_workers=0, best for the cheap cached dataset)
+    or in a persistent process pool (num_workers>0 or None, for the cloud
+    dataset where BM4D dominates). The pool is created once per epoch, and the
+    dataset is pickled to workers once at pool startup rather than per task.
 
     Attributes
     ----------
     dataset : torch.utils.data.Dataset
-        Dataset to iterated over.
+        Dataset to iterate over.
     batch_size : int
         Number of examples in each batch.
     patch_shape : Tuple[int]
         Shape of image patch expected by the model.
     """
 
-    def __init__(self, dataset, batch_size=16):
+    def __init__(self, dataset, batch_size=16, num_workers=None, prefetch=2):
         """
         Instantiates a DataLoader object.
 
         Parameters
         ----------
         dataset : torch.utils.data.Dataset
-            Dataset to iterated over.
+            Dataset to iterate over.
         batch_size : int, optional
             Number of examples in each batch. Default is 16.
+        num_workers : int, optional
+            Process-pool workers for per-example work. None uses the CPU count;
+            0 runs in-thread (best for the cheap cached dataset). Default is
+            None.
+        prefetch : int, optional
+            Number of batches prepared ahead of the consumer. Default is 2.
         """
-        # Instance attributes
         self.dataset = dataset
         self.batch_size = batch_size
         self.patch_shape = dataset.patch_shape
+        self.num_workers = num_workers
+        self.prefetch = prefetch
 
     def __iter__(self):
         """
-        Iterates over the dataset and yields batches of examples.
+        Yields batches, preparing them ahead of the consumer in a thread.
 
         Returns
         -------
         iterator
-            Yields batches of examples.
+            Yields batches of tensors.
         """
-        for idx in range(0, len(self.dataset), self.batch_size):
-            yield self._load_batch(idx)
+        starts = list(range(0, len(self.dataset), self.batch_size))
+        if not starts:
+            return
 
-    def _load_batch(self, start_idx):
+        executor = None
+        if self.num_workers != 0:
+            executor = ProcessPoolExecutor(
+                max_workers=self.num_workers,
+                initializer=_worker_init,
+                initargs=(self.dataset,),
+            )
+
+        result_queue = queue.Queue(maxsize=max(1, self.prefetch))
+        done = object()
+
+        def produce():
+            try:
+                for start in starts:
+                    result_queue.put((None, self._load_batch(executor, start)))
+            except Exception as exc:  # surface loader errors to the consumer
+                result_queue.put((exc, None))
+            else:
+                result_queue.put((done, None))
+
+        thread = threading.Thread(target=produce, daemon=True)
+        thread.start()
+        try:
+            while True:
+                flag, batch = result_queue.get()
+                if flag is done:
+                    break
+                if flag is not None:
+                    raise flag
+                yield batch
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
+            thread.join(timeout=1)
+
+    def _load_batch(self, executor, start_idx):
         # Compute batch size
-        n_remaining_examples = len(self.dataset) - start_idx
-        batch_size = min(self.batch_size, n_remaining_examples)
+        n_remaining = len(self.dataset) - start_idx
+        batch_size = min(self.batch_size, n_remaining)
+        indices = range(start_idx, start_idx + batch_size)
 
-        # Generate batch
-        with ProcessPoolExecutor() as executor:
-            processes = list()
-            for idx in range(start_idx, start_idx + batch_size):
-                processes.append(
-                    executor.submit(self.dataset.__getitem__, idx)
-                )
-            results = [p.result() for p in as_completed(processes)]
+        # Per-example work: in-thread when there is no pool, else in parallel.
+        if executor is None:
+            results = [self.dataset[idx] for idx in indices]
+        else:
+            futures = [executor.submit(_worker_getitem, idx) for idx in indices]
+            results = [f.result() for f in as_completed(futures)]
 
         # Stack each field of the example tuple into its own batch tensor.
-        # Handles both the (x, y) train shape and the (x, y, raw, fg_mask)
-        # validation shape.
+        # Handles the (x, y, fg_mask) train shape and the
+        # (x, y, raw, fg_mask) validation shape alike.
         shape = (batch_size, 1,) + self.patch_shape
         n_fields = len(results[0])
         batched = [np.zeros(shape) for _ in range(n_fields)]
