@@ -4,15 +4,82 @@ import unittest
 
 import numpy as np
 
+from scipy import ndimage
+
 from aind_exaspim_image_compression.machine_learning.metrics import (
     DEFAULT_CHECKPOINT_WEIGHTS,
     checkpoint_score,
     evaluate_example,
     false_bright_rate,
     foreground_background_mae,
+    highfreq_energy_fraction,
+    local_autocorr,
     make_foreground_mask,
     mip_max_error,
+    patch_has_incoherent_segment,
 )
+
+
+def _smooth_blob(shape=(48, 48, 48), lo=(8, 8, 8), hi=(40, 40, 40),
+                 amp=800.0, sigma=2.0):
+    """A bright, spatially smooth (PSF-like) blob -- stands in for a neurite."""
+    v = np.zeros(shape, dtype=np.float32)
+    v[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = amp
+    return ndimage.gaussian_filter(v, sigma)
+
+
+def _salt_pepper(shape=(48, 48, 48), lo=(8, 8, 8), hi=(40, 40, 40),
+                 amp=900.0, rate=0.4, seed=0):
+    """A bright, spatially incoherent salt-and-pepper block -- the artifact."""
+    rng = np.random.default_rng(seed)
+    v = np.zeros(shape, dtype=np.float32)
+    region = np.zeros(shape, dtype=bool)
+    region[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = True
+    v[(rng.random(shape) < rate) & region] = amp
+    return v, region
+
+
+class CoherenceGateTest(unittest.TestCase):
+    """Tests for spatial-coherence artifact detection (patch rejection)."""
+
+    def test_metrics_separate_signal_from_noise(self):
+        """Smooth signal has high lag-2 autocorr and low HF energy; noise the
+        opposite."""
+        blob = _smooth_blob()
+        sp, region = _salt_pepper()
+        blob_mask = blob > 50
+        self.assertGreater(local_autocorr(blob, blob_mask, lag=2), 0.5)
+        self.assertLess(highfreq_energy_fraction(blob, blob_mask), 0.35)
+        self.assertLess(local_autocorr(sp, region, lag=2), 0.4)
+        self.assertGreater(highfreq_energy_fraction(sp, region), 0.35)
+
+    def test_flags_patch_with_incoherent_segment(self):
+        """A patch whose label is salt-and-pepper is flagged for rejection."""
+        sp, region = _salt_pepper()
+        labels = np.zeros(region.shape, dtype=np.uint64)
+        labels[region] = 22
+        self.assertTrue(patch_has_incoherent_segment(labels, sp))
+
+    def test_keeps_patch_with_coherent_segment(self):
+        """A patch whose label is a smooth blob is not flagged."""
+        blob = _smooth_blob()
+        labels = np.zeros(blob.shape, dtype=np.uint64)
+        labels[blob > 50] = 11
+        self.assertFalse(patch_has_incoherent_segment(labels, blob))
+
+    def test_empty_labels_not_flagged(self):
+        """A patch with no labels is never flagged."""
+        labels = np.zeros((48, 48, 48), dtype=np.uint64)
+        raw = np.zeros((48, 48, 48), dtype=np.float32)
+        self.assertFalse(patch_has_incoherent_segment(labels, raw))
+
+    def test_small_incoherent_segments_ignored(self):
+        """A sub-min_segment_voxels noise speck does not trigger rejection."""
+        sp, region = _salt_pepper(lo=(20, 20, 20), hi=(23, 23, 23))  # 27 vox
+        labels = np.zeros(region.shape, dtype=np.uint64)
+        labels[region] = 7
+        self.assertFalse(
+            patch_has_incoherent_segment(labels, sp, min_segment_voxels=50))
 
 
 class MaskTest(unittest.TestCase):

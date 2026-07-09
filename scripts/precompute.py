@@ -111,10 +111,14 @@ def _sample_counts(index):
     _seed_task(index)
     if _WORKER_SPLIT == "train":
         return _WORKER_TRAIN._sample_counts()
-    brain_id = _WORKER_TRAIN.sample_brain()
-    voxel = _WORKER_TRAIN.sample_voxel(brain_id)
-    fg_mask = _WORKER_TRAIN.annotation_mask(brain_id, voxel)
-    return _WORKER_VAL.sample_counts(brain_id, voxel, fg_mask=fg_mask)
+    # sample_clean draws a patch (reading the val image and the train
+    # segmentation), resampling past incoherent-artifact patches, and returns
+    # the raw + labels so the val cache reads the image only once.
+    brain_id, voxel, raw, labels = _WORKER_TRAIN.sample_clean(
+        _WORKER_VAL.read_counts
+    )
+    fg_mask = _WORKER_TRAIN.annotation_mask(brain_id, voxel, labels=labels)
+    return _WORKER_VAL.sample_counts(brain_id, voxel, fg_mask=fg_mask, raw=raw)
 
 
 def _to_float16(arr):
@@ -149,6 +153,13 @@ def precompute():
         n_validate_examples=0,
         offsets=offsets,
         preserve_foreground=preserve_foreground,
+        reject_incoherent_patches=reject_incoherent_patches,
+        coherence_min_autocorr=coherence_min_autocorr,
+        coherence_max_highfreq_frac=coherence_max_highfreq_frac,
+        coherence_min_segment_voxels=coherence_min_segment_voxels,
+        coherence_smooth_sigma=coherence_smooth_sigma,
+        coherence_lag=coherence_lag,
+        max_resample_attempts=max_resample_attempts,
         segmentation_prefixes_path=segmentation_prefixes_path,
         segmentation_dilate=segmentation_dilate,
         sigma_bm4d=sigma_bm4d,
@@ -241,6 +252,29 @@ if __name__ == "__main__":
     segmentation_dilate = 0
     preserve_foreground = True
     sigma_bm4d = 24
+
+    # Reject whole patches contaminated by a bright, spatially incoherent
+    # raw-image processing artifact (blocky salt-and-pepper noise) the FFN
+    # mislabels as a neurite. The artifact corrupts the raw input itself, so
+    # such a patch is a poor training example even with the label removed;
+    # sample_clean discards it and resamples (before BM4D, so rejects are
+    # cheap). A segment triggers rejection only when it fails BOTH tests --
+    # lag-2 autocorrelation below coherence_min_autocorr AND high-frequency
+    # energy fraction above coherence_max_highfreq_frac -- so dim-but-smooth
+    # neurites do not. Lag 2 (not 1) is the discriminating scale: the brightest
+    # artifacts correlate at lag 1 but decorrelate by lag 2, while real
+    # PSF-blurred signal stays correlated. Only segments >=
+    # coherence_min_segment_voxels are scored. See
+    # metrics.patch_has_incoherent_segment.
+    reject_incoherent_patches = True
+    coherence_min_autocorr = 0.4
+    coherence_max_highfreq_frac = 0.35
+    coherence_min_segment_voxels = 50
+    coherence_smooth_sigma = 1.0
+    coherence_lag = 2
+    # Give up resampling a clean patch after this many artifact hits and accept
+    # the last draw (rare; keeps the fixed-size cache build from stalling).
+    max_resample_attempts = 50
 
     # Base RNG seed for reproducibility: with a fixed seed the sampled pool is
     # identical across runs and independent of num_workers. Set to None for

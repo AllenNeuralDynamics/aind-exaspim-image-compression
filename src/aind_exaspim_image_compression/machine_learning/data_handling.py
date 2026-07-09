@@ -30,6 +30,7 @@ from aind_exaspim_image_compression.machine_learning.metrics import (
     make_foreground_mask,
     make_segmentation_mask,
     make_skeleton_mask,
+    patch_has_incoherent_segment,
 )
 from aind_exaspim_image_compression.machine_learning.transforms import (
     build_transform,
@@ -99,6 +100,13 @@ class TrainDataset(Dataset):
         offsets=None,
         prefetch_foreground_sampling=16,
         preserve_foreground=True,
+        reject_incoherent_patches=False,
+        coherence_min_autocorr=0.4,
+        coherence_max_highfreq_frac=0.35,
+        coherence_min_segment_voxels=50,
+        coherence_smooth_sigma=1.0,
+        coherence_lag=2,
+        max_resample_attempts=50,
         segmentation_dilate=0,
         sigma_bm4d=16,
         skeleton_radius=2,
@@ -118,6 +126,13 @@ class TrainDataset(Dataset):
         self.patch_shape = patch_shape
         self.preserve_foreground = preserve_foreground
         self.prefetch_foreground_sampling = prefetch_foreground_sampling
+        self.reject_incoherent_patches = reject_incoherent_patches
+        self.coherence_min_autocorr = coherence_min_autocorr
+        self.coherence_max_highfreq_frac = coherence_max_highfreq_frac
+        self.coherence_min_segment_voxels = coherence_min_segment_voxels
+        self.coherence_smooth_sigma = coherence_smooth_sigma
+        self.coherence_lag = coherence_lag
+        self.max_resample_attempts = max_resample_attempts
         self.segmentation_dilate = segmentation_dilate
         self.sigma_bm4d = sigma_bm4d
         self.skeleton_radius = skeleton_radius
@@ -264,7 +279,9 @@ class TrainDataset(Dataset):
 
         This is the expensive step (cloud read + BM4D + foreground mask) and
         is exactly what the patch cache stores; the cheap transform + target
-        construction is applied by build_training_example.
+        construction is applied by build_training_example. The patch is drawn
+        by sample_clean, which resamples past patches contaminated by an
+        incoherent processing artifact before the (expensive) BM4D runs.
 
         Returns
         -------
@@ -272,16 +289,87 @@ class TrainDataset(Dataset):
             (raw, teacher, fg_mask) in count space. raw has the per-brain
             offset subtracted; teacher is the clipped BM4D denoising.
         """
-        brain_id = self.sample_brain()
-        voxel = self.sample_voxel(brain_id)
-        raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
-        raw = raw - self.offsets.get(brain_id, 0.0)
+        brain_id, voxel, raw, labels = self.sample_clean(self.read_counts)
         teacher = bm4d(raw, self.sigma_bm4d)
         teacher = np.clip(teacher, 0, self.transform.max_count)
-        fg_mask = self.foreground_mask(brain_id, voxel, raw)
+        fg_mask = self.foreground_mask(brain_id, voxel, raw, labels=labels)
         return raw, teacher, fg_mask
 
-    def foreground_mask(self, brain_id, center, raw):
+    def read_counts(self, brain_id, center):
+        """
+        Reads a patch and subtracts the per-brain offset (count space).
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the sampled brain.
+        center : Tuple[int]
+            Center voxel of the patch.
+
+        Returns
+        -------
+        numpy.ndarray
+            Offset-subtracted raw counts.
+        """
+        raw = np.asarray(self.read_patch(brain_id, center)).astype(np.float32)
+        return raw - self.offsets.get(brain_id, 0.0)
+
+    def sample_clean(self, read_counts):
+        """
+        Samples a patch, resampling past incoherent-artifact contamination.
+
+        Draws a (brain, voxel), reads its raw counts and (if the brain is
+        segmented) its label patch, and -- when reject_incoherent_patches is
+        set -- checks whether the segmentation contains a bright, spatially
+        incoherent processing artifact (see
+        metrics.patch_has_incoherent_segment). Such a patch is discarded and a
+        new one drawn, up to max_resample_attempts, because the artifact
+        corrupts the raw input itself, so the patch is a poor training example
+        even with the offending label removed. The check runs before BM4D, so
+        rejected patches cost only a label read, not the denoising. Returning
+        the labels lets the caller build the mask without a second read.
+
+        When rejection is disabled this draws a single patch. On exhausting the
+        attempt budget it returns the last patch drawn (rare; keeps the caller,
+        e.g. a fixed-size cache build, from stalling).
+
+        Parameters
+        ----------
+        read_counts : Callable[[str, Tuple[int]], numpy.ndarray]
+            Returns the offset-subtracted raw counts for a (brain, voxel). Lets
+            the validation cache read its own image while this TrainDataset
+            supplies the segmentation and skeletons.
+
+        Returns
+        -------
+        Tuple[str, Tuple[int], numpy.ndarray, numpy.ndarray or None]
+            (brain_id, voxel, raw, labels); labels is None when the brain has
+            no segmentation.
+        """
+        attempts = self.max_resample_attempts \
+            if self.reject_incoherent_patches else 1
+        brain_id = voxel = raw = labels = None
+        for _ in range(max(1, attempts)):
+            brain_id = self.sample_brain()
+            voxel = self.sample_voxel(brain_id)
+            raw = read_counts(brain_id, voxel)
+            labels = None
+            if brain_id in self.segmentations:
+                labels = np.asarray(self.read_precomputed_patch(brain_id, voxel))
+                if self.reject_incoherent_patches and patch_has_incoherent_segment(
+                    labels,
+                    raw,
+                    min_autocorr=self.coherence_min_autocorr,
+                    max_highfreq_frac=self.coherence_max_highfreq_frac,
+                    min_segment_voxels=self.coherence_min_segment_voxels,
+                    smooth_sigma=self.coherence_smooth_sigma,
+                    coherence_lag=self.coherence_lag,
+                ):
+                    continue
+            return brain_id, voxel, raw, labels
+        return brain_id, voxel, raw, labels
+
+    def foreground_mask(self, brain_id, center, raw, labels=None):
         """
         Builds a foreground mask for a patch from ground-truth annotations.
 
@@ -304,24 +392,28 @@ class TrainDataset(Dataset):
         raw : numpy.ndarray
             Raw image patch in counts, used only for the no-annotation
             fallback.
+        labels : numpy.ndarray, optional
+            Pre-read segmentation label patch, when the caller already read it
+            (e.g. sample_clean). Avoids a second cloud read. Default is None.
 
         Returns
         -------
         numpy.ndarray
             Boolean foreground mask with the shape of "raw".
         """
-        mask = self.annotation_mask(brain_id, center)
+        mask = self.annotation_mask(brain_id, center, labels=labels)
         return make_foreground_mask(raw) if mask is None else mask
 
-    def annotation_mask(self, brain_id, center):
+    def annotation_mask(self, brain_id, center, labels=None):
         """
         Builds the ground-truth foreground mask (segmentation and skeleton).
 
         Unions the segmentation labels (dilated only when segmentation_dilate >
         0) with the rasterized, dilated skeleton for the patch. Returns None
         when the brain has neither annotation, so callers can fall back to an
-        intensity mask. Needs no raw image, so the validation path can request
-        the same mask without an extra cloud image read.
+        intensity mask. Incoherent-artifact segments are handled by rejecting
+        the whole patch at sampling time (see sample_clean), not here, so this
+        mask trusts the labels as given.
 
         Parameters
         ----------
@@ -329,6 +421,9 @@ class TrainDataset(Dataset):
             Unique identifier of the sampled brain.
         center : Tuple[int]
             Center voxel of the patch.
+        labels : numpy.ndarray, optional
+            Pre-read segmentation label patch. When None it is read here.
+            Default is None.
 
         Returns
         -------
@@ -338,10 +433,9 @@ class TrainDataset(Dataset):
         """
         mask = None
         if brain_id in self.segmentations:
-            labels = self.read_precomputed_patch(brain_id, center)
-            mask = make_segmentation_mask(
-                labels, dilate=self.segmentation_dilate
-            )
+            if labels is None:
+                labels = self.read_precomputed_patch(brain_id, center)
+            mask = make_segmentation_mask(labels, dilate=self.segmentation_dilate)
         if brain_id in self.skeletons:
             skel = self.skeleton_mask(brain_id, center)
             mask = skel if mask is None else (mask | skel)
@@ -730,7 +824,30 @@ class ValidateDataset(Dataset):
         """
         self.imgs[brain_id] = img_util.read(img_path)
 
-    def sample_counts(self, brain_id, voxel, fg_mask=None):
+    def read_counts(self, brain_id, voxel):
+        """
+        Reads a patch and subtracts the per-brain offset (count space).
+
+        Exposed so a caller that also needs the raw patch to build the
+        foreground mask (e.g. the coherence gate) can read it once and hand it
+        to "sample_counts", avoiding a second cloud read.
+
+        Parameters
+        ----------
+        brain_id : hashable
+            Unique identifier of the brain from which to extract the patch.
+        voxel : Tuple[int]
+            Voxel coordinates of the patch center in the brain volume.
+
+        Returns
+        -------
+        numpy.ndarray
+            Offset-subtracted raw counts.
+        """
+        raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
+        return raw - self.offsets.get(brain_id, 0.0)
+
+    def sample_counts(self, brain_id, voxel, fg_mask=None, raw=None):
         """
         Samples one validation patch and its BM4D target in count space.
 
@@ -750,6 +867,10 @@ class ValidateDataset(Dataset):
         fg_mask : numpy.ndarray, optional
             Precomputed foreground mask aligned with the sampled voxel. When
             None, the mask falls back to the robust intensity threshold.
+        raw : numpy.ndarray, optional
+            Offset-subtracted raw counts for this voxel, when already read by
+            the caller (e.g. to build the coherence-gated mask). Avoids a
+            redundant cloud read. Default is None (read here).
 
         Returns
         -------
@@ -757,15 +878,15 @@ class ValidateDataset(Dataset):
             (raw, teacher, fg_mask) in count space. raw has the per-brain
             offset subtracted; teacher is the clipped BM4D denoising.
         """
-        raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
-        raw = raw - self.offsets.get(brain_id, 0.0)
+        if raw is None:
+            raw = self.read_counts(brain_id, voxel)
         teacher = bm4d(raw, self.sigma_bm4d)
         teacher = np.clip(teacher, 0, self.transform.max_count)
         if fg_mask is None:
             fg_mask = make_foreground_mask(raw)
         return raw, teacher, fg_mask
 
-    def ingest_example(self, brain_id, voxel, fg_mask=None):
+    def ingest_example(self, brain_id, voxel, fg_mask=None, raw=None):
         """
         Extracts, denoises, transforms, and stores an image patch.
 
@@ -778,10 +899,13 @@ class ValidateDataset(Dataset):
         fg_mask : numpy.ndarray, optional
             Precomputed foreground mask aligned with the sampled voxel. When
             None, the mask falls back to the intensity threshold.
+        raw : numpy.ndarray, optional
+            Offset-subtracted raw counts for this voxel, when already read by
+            the caller. Avoids a redundant cloud read. Default is None.
         """
         # Sample image patch and its BM4D-denoised target
         raw, teacher, fg_mask = self.sample_counts(
-            brain_id, voxel, fg_mask=fg_mask
+            brain_id, voxel, fg_mask=fg_mask, raw=raw
         )
 
         # Preserve raw counts on the ground-truth neurite foreground
@@ -1140,6 +1264,13 @@ def init_datasets(
     min_segmentation_volume=200,
     n_train_examples_per_epoch=100,
     n_validate_examples=0,
+    reject_incoherent_patches=False,
+    coherence_min_autocorr=0.4,
+    coherence_max_highfreq_frac=0.35,
+    coherence_min_segment_voxels=50,
+    coherence_smooth_sigma=1.0,
+    coherence_lag=2,
+    max_resample_attempts=50,
     segmentation_prefixes_path=None,
     segmentation_dilate=0,
     sigma_bm4d=16,
@@ -1160,6 +1291,13 @@ def init_datasets(
         n_examples_per_epoch=n_train_examples_per_epoch,
         offsets=offsets,
         preserve_foreground=preserve_foreground,
+        reject_incoherent_patches=reject_incoherent_patches,
+        coherence_min_autocorr=coherence_min_autocorr,
+        coherence_max_highfreq_frac=coherence_max_highfreq_frac,
+        coherence_min_segment_voxels=coherence_min_segment_voxels,
+        coherence_smooth_sigma=coherence_smooth_sigma,
+        coherence_lag=coherence_lag,
+        max_resample_attempts=max_resample_attempts,
         segmentation_dilate=segmentation_dilate,
         sigma_bm4d=sigma_bm4d,
         skeleton_radius=skeleton_radius,
@@ -1216,10 +1354,11 @@ def init_datasets(
     # dataset (which loads neither) for a foreground mask consistent with
     # training.
     for _ in range(n_validate_examples):
-        brain_id = train_dataset.sample_brain()
-        voxel = train_dataset.sample_voxel(brain_id)
-        fg_mask = train_dataset.annotation_mask(brain_id, voxel)
-        val_dataset.ingest_example(brain_id, voxel, fg_mask=fg_mask)
+        brain_id, voxel, raw, labels = train_dataset.sample_clean(
+            val_dataset.read_counts
+        )
+        fg_mask = train_dataset.annotation_mask(brain_id, voxel, labels=labels)
+        val_dataset.ingest_example(brain_id, voxel, fg_mask=fg_mask, raw=raw)
     return train_dataset, val_dataset
 
 
