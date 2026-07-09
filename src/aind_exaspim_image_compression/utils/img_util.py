@@ -108,11 +108,10 @@ def _read_neuroglancer_precompted(img_path):
                 "path": path,
                 },
             "context": {
-                "cache_pool": {"total_bytes_limit": 1000000000},
-                "cache_pool#remote": {"total_bytes_limit": 1000000000},
+                "cache_pool": {"total_bytes_limit": 0},
+                "cache_pool#remote": {"total_bytes_limit": 0},
                 "data_copy_concurrency": {"limit": 8},
             },
-            "recheck_cached_data": "open",
             }
     ).result()
 
