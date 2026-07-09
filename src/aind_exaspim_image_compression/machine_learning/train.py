@@ -99,6 +99,11 @@ class Trainer:
         else:
             self.autocast = nullcontext()
 
+        # Scale the loss before backward so small float16 gradients do not
+        # underflow (and are unscaled before the step). Disabled => no-op, so
+        # the same code path is correct with and without AMP.
+        self.scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
     # --- Core Routines ---
     def run(self, train_dataset, val_dataset):
         """
@@ -166,10 +171,11 @@ class Trainer:
             # Forward pass
             hat_y, loss = self.forward_pass(x, y, fg_mask)
 
-            # Backward pass
+            # Backward pass (loss-scaled for AMP stability)
             self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             # Store loss for tensorboard
             losses.append(float(loss.detach().cpu()))
