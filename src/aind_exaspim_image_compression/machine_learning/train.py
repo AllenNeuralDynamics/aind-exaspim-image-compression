@@ -278,11 +278,16 @@ class Trainer:
         for name, value in agg.items():
             self.writer.add_scalar(f"val_{name}", value, epoch)
 
-        # Check if current model is best so far (lower score is better)
-        is_best = score < self.best_score
+        # Save every validated checkpoint so the best can be chosen offline.
+        # Skip epoch 0: the untrained net emits a near-constant, trivially
+        # compressible volume whose cratio-weighted score would beat every
+        # trained checkpoint despite its high loss. is_best is tracked only for
+        # the "New Best!" log line.
+        is_best = epoch > 0 and score < self.best_score
         if is_best:
             self.best_score = score
-            self.save_model(epoch)
+        if epoch > 0:
+            self.save_model(epoch, score)
         return loss, cratio, is_best
 
     def forward_pass(self, x, y, fg_mask):
@@ -403,7 +408,7 @@ class Trainer:
         record.update(config)
         util.write_json(os.path.join(self.log_dir, "config.json"), record)
 
-    def save_model(self, epoch):
+    def save_model(self, epoch, score):
         """
         Saves the current model state to a file.
 
@@ -411,9 +416,12 @@ class Trainer:
         ----------
         epoch : int
             Current training epoch.
+        score : float
+            Checkpoint-selection score for this epoch (lower is better),
+            embedded in the filename so checkpoints can be ranked offline.
         """
         date = datetime.today().strftime("%Y%m%d")
-        filename = f"BM4DNet-{date}-{epoch}-{self.best_score:.6f}.pth"
+        filename = f"BM4DNet-{date}-{epoch}-{score:.6f}.pth"
         path = os.path.join(self.log_dir, filename)
         torch.save(
             {
