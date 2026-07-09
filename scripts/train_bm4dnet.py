@@ -169,10 +169,13 @@ if __name__ == "__main__":
     patch_shape = (64, 64, 64)
     sigma_bm4d = 24
 
-    # Signal-preserving loss + target/sampling (Parts E/F). fg_weight is
-    # aggressive; sweep it against foreground fraction. preserve_foreground
-    # keeps raw counts on the foreground so BM4D cannot erase neurites.
-    fg_weight = 20.0
+    # Signal-preserving loss + target/sampling (Parts E/F). preserve_foreground
+    # keeps raw counts on the foreground so BM4D cannot erase neurites; that
+    # makes the foreground target equal to the (noisy) input, so a large
+    # fg_weight rewards the identity map -- the net stops denoising and its
+    # output compresses no better than raw. Keep fg_weight modest (~1-3) so
+    # background denoising, not foreground copying, dominates the loss.
+    fg_weight = 2.0
     preserve_foreground = True
     min_foreground_voxels = 50
     min_segmentation_volume = 200
