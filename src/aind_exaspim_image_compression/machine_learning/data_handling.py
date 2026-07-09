@@ -427,9 +427,11 @@ class TrainDataset(Dataset):
                     )
                     pending[thread] = voxel
 
-                # Check if labels patch has large enough object
-                for thread in as_completed(pending.keys()):
-                    voxel = pending.pop(thread)
+                # Check if labels patch has large enough object. Reads run
+                # concurrently, but results are consumed in submission order
+                # (not completion order) so ties break deterministically and
+                # a seeded run is reproducible.
+                for thread, voxel in pending.items():
                     labels_patch = thread.result()
                     vals, cnts = fastremap.unique(
                         labels_patch, return_counts=True
@@ -481,9 +483,11 @@ class TrainDataset(Dataset):
                     )
                     pending[thread] = voxel
 
-                # Check if image patch has enough foreground
-                for thread in as_completed(pending.keys()):
-                    voxel = pending.pop(thread)
+                # Check if image patch has enough foreground. Reads run
+                # concurrently, but results are consumed in submission order
+                # (not completion order) so ties break deterministically and
+                # a seeded run is reproducible.
+                for thread, voxel in pending.items():
                     img_patch = thread.result()
                     brightness = int(make_foreground_mask(img_patch).sum())
                     if brightness > best_brightness:
