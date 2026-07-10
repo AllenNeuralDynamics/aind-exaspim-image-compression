@@ -121,6 +121,7 @@ class Trainer:
         self.checkpoint_weights = checkpoint_weights
         self.best_score = np.inf
         self.model = model.to(device) if model else UNet().to(device)
+        self._resume_transform_cfg = None
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
         # T_max spans the whole run so the cosine anneals once. With a small
         # T_max the LR returns to its peak every 2*T_max epochs, and each
@@ -152,6 +153,19 @@ class Trainer:
         """
         # Initializations
         print("Experiment:", os.path.basename(os.path.normpath(self.log_dir)))
+        if self._resume_transform_cfg is not None:
+            train_cfg = getattr(train_dataset.transform, "cfg", None)
+            val_cfg = getattr(val_dataset.transform, "cfg", None)
+            if train_cfg != self._resume_transform_cfg:
+                raise ValueError(
+                    "resume checkpoint transform does not match the training "
+                    "dataset transform"
+                )
+            if val_cfg != self._resume_transform_cfg:
+                raise ValueError(
+                    "resume checkpoint transform does not match the validation "
+                    "dataset transform"
+                )
         self.transform = train_dataset.transform
         train_dataloader = DataLoader(
             train_dataset,
@@ -375,8 +389,21 @@ class Trainer:
         """
         ckpt = torch.load(model_path, map_location=self.device)
         if isinstance(ckpt, dict) and "model" in ckpt:
-            ckpt = ckpt["model"]
-        self.model.load_state_dict(ckpt)
+            checkpoint_model_cfg = ckpt.get("model_config")
+            current_model_cfg = getattr(self.model, "config", None)
+            if (
+                checkpoint_model_cfg is not None
+                and checkpoint_model_cfg != current_model_cfg
+            ):
+                raise ValueError(
+                    "resume checkpoint model configuration does not match "
+                    "the configured model"
+                )
+            self._resume_transform_cfg = ckpt.get("transform")
+            state_dict = ckpt["model"]
+        else:
+            state_dict = ckpt
+        self.model.load_state_dict(state_dict)
 
     def save_config(self, config):
         """
@@ -404,6 +431,7 @@ class Trainer:
             "checkpoint_weights": self.checkpoint_weights,
             "lr": self.optimizer.param_groups[0]["lr"],
             "model": type(self.model).__name__,
+            "model_config": getattr(self.model, "config", None),
         }
         record.update(config)
         util.write_json(os.path.join(self.log_dir, "config.json"), record)
@@ -426,6 +454,7 @@ class Trainer:
         torch.save(
             {
                 "model": self.model.state_dict(),
+                "model_config": getattr(self.model, "config", None),
                 "transform": getattr(self.transform, "cfg", None),
             },
             path,

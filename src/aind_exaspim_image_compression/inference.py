@@ -278,11 +278,13 @@ def load_model(path, device="cuda"):
     if isinstance(ckpt, dict) and "model" in ckpt:
         state_dict = ckpt["model"]
         transform_cfg = ckpt.get("transform") or {"kind": "asinh"}
+        model_cfg = ckpt.get("model_config") or {}
     else:
         state_dict = ckpt
         transform_cfg = {"kind": "asinh"}
+        model_cfg = {}
 
-    model = UNet()
+    model = UNet(**model_cfg)
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
