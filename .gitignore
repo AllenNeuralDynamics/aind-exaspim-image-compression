@@ -147,3 +147,6 @@ dmypy.json
 /environment
 /metadata
 *.png
+
+# only temporary
+uv.lock
