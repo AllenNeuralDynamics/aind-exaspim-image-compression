@@ -35,6 +35,7 @@ loads with CachedValidateDataset):
     teacher.npy    float16  (N, *patch_shape)   clipped BM4D denoising
     fg.npy         uint8    (N, *patch_shape)   foreground mask (0/1)
     transform.json                              resolved transform cfg
+    config.json                                 full precompute configuration
 
 The transform cfg is stamped alongside the patches so the training run rebuilds
 the identical transform without touching the cloud. Each worker builds its
@@ -143,6 +144,7 @@ def precompute():
     # 0 because per-brain offsets are subtracted per patch.
     brain_ids = util.read_txt(brain_ids_path)
     offsets = util.read_json(offsets_path) if offsets_path else None
+    resolved_transform_cfg = build_transform(transform_cfg).cfg
     init_kwargs = dict(
         brain_ids=brain_ids,
         img_paths_json=img_prefixes_path,
@@ -165,11 +167,46 @@ def precompute():
         sigma_bm4d=sigma_bm4d,
         skeleton_radius=skeleton_radius,
         swc_pointers=swc_pointers,
-        transform_cfg=transform_cfg,
+        transform_cfg=resolved_transform_cfg,
     )
 
     # Pre-allocate memory-mapped outputs and stream results into them.
     util.mkdir(cache_dir)
+    util.write_json(
+        f"{cache_dir}/config.json",
+        {
+            "split": split,
+            "cache_dir": cache_dir,
+            "n_patches": n_patches,
+            "brain_ids_path": brain_ids_path,
+            "img_prefixes_path": img_prefixes_path,
+            "segmentation_prefixes_path": segmentation_prefixes_path,
+            "offsets_path": offsets_path,
+            "swc_pointers": swc_pointers,
+            "transform_cfg": resolved_transform_cfg,
+            "foreground_sampling_rate": foreground_sampling_rate,
+            "min_foreground_voxels": min_foreground_voxels,
+            "min_segmentation_volume": min_segmentation_volume,
+            "patch_shape": patch_shape,
+            "skeleton_radius": skeleton_radius,
+            "segmentation_dilate": segmentation_dilate,
+            "preserve_foreground": preserve_foreground,
+            "sigma_bm4d": sigma_bm4d,
+            "reject_incoherent_patches": reject_incoherent_patches,
+            "coherence_min_autocorr": coherence_min_autocorr,
+            "coherence_max_highfreq_frac": coherence_max_highfreq_frac,
+            "coherence_min_segment_voxels": (
+                coherence_min_segment_voxels
+            ),
+            "coherence_smooth_sigma": coherence_smooth_sigma,
+            "coherence_lag": coherence_lag,
+            "max_resample_attempts": max_resample_attempts,
+            "seed": seed,
+            "seed_stream": _SEED_STREAMS[split],
+            "num_workers": num_workers,
+            "n_validate_examples": 0,
+        },
+    )
     shape = (n_patches,) + tuple(patch_shape)
     raw_mm = open_memmap(
         f"{cache_dir}/raw.npy", mode="w+", dtype=np.float16, shape=shape
@@ -203,7 +240,7 @@ def precompute():
     # Stamp the resolved transform cfg so training rebuilds it exactly without
     # touching the cloud.
     util.write_json(
-        f"{cache_dir}/transform.json", build_transform(transform_cfg).cfg
+        f"{cache_dir}/transform.json", resolved_transform_cfg
     )
     print(f"Wrote {n_patches} {split} patches to {cache_dir}")
 
