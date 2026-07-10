@@ -63,13 +63,56 @@ def evaluate():
     # ".../image.zarr/0"). Slicing the lazy zarr in get_patch fetches only the
     # requested region, so a crop avoids pulling the whole (huge) volume from S3.
     img = img_util.read(img_path)
+    source_transform = img_util.get_ome_zarr_level_transform(img_path)
+    source_scale = np.asarray(source_transform["scale"])
+    source_translation = np.asarray(source_transform["translation"])
+    crop_start = (0, 0, 0)
     if crop_center is not None:
+        # Neuroglancer reports transformed spatial coordinates in (x, y, z)
+        # order. Convert them to this level's integer (z, y, x) voxel indices.
+        crop_center_voxel = img_util.ome_zarr_coordinate_to_voxel(
+            crop_center, source_transform
+        )
+        source_offset_zyx = source_translation[2:] / source_scale[2:]
+        snapped_center_zyx = source_offset_zyx + np.asarray(
+            crop_center_voxel
+        )
         crop_start, _ = img_util.get_start_end(
-            crop_center, crop_shape, is_center=True
+            crop_center_voxel, crop_shape, is_center=True
+        )
+        crop_origin_zyx = source_offset_zyx + np.asarray(crop_start)
+        crop_end = np.asarray(crop_start) + np.asarray(crop_shape)
+        if np.any(np.asarray(crop_start) < 0) or np.any(
+            crop_end > np.asarray(img.shape[2:])
+        ):
+            raise ValueError(
+                "Crop is outside the source level: "
+                f"start={tuple(crop_start)}, end={tuple(crop_end)}, "
+                f"source_shape={tuple(img.shape[2:])}"
+            )
+        print(
+            "Requested Neuroglancer crop center (x, y, z):",
+            tuple(crop_center),
+        )
+        print(
+            "Neuroglancer spatial scale (x, y, z):",
+            tuple(source_scale[2:][::-1].tolist()),
+            source_transform["spatial_unit"],
+        )
+        print("Crop center voxel (z, y, x):", crop_center_voxel)
+        print(
+            "Snapped crop center (x, y, z):",
+            tuple(snapped_center_zyx[::-1].tolist()),
         )
         print("Crop origin (z, y, x):", tuple(crop_start))
+        print(
+            "Neuroglancer crop origin (x, y, z):",
+            tuple(crop_origin_zyx[::-1].tolist()),
+        )
         raw = np.asarray(
-            img_util.get_patch(img, crop_center, crop_shape, is_center=True)
+            img_util.get_patch(
+                img, crop_center_voxel, crop_shape, is_center=True
+            )
         )
     else:
         raw = np.asarray(img[0, 0])
@@ -118,7 +161,23 @@ def evaluate():
     # to S3 needs credentials (the default AWS chain), unlike the anonymous
     # public read of the input.
     if output_zarr is not None:
-        img_util.write_ome_zarr(denoised, output_zarr)
+        crop_offset = np.asarray([0, 0, *crop_start])
+        output_translation = source_translation + source_scale * crop_offset
+        print(
+            "Output OME transform (t, c, z, y, x):",
+            {
+                "scale": tuple(source_scale.tolist()),
+                "translation": tuple(output_translation.tolist()),
+                "unit": source_transform["spatial_unit"],
+            },
+        )
+        img_util.write_ome_zarr(
+            denoised,
+            output_zarr,
+            scale=source_scale,
+            translation=output_translation,
+            spatial_unit=source_transform["spatial_unit"],
+        )
         print("Denoised Zarr written to:", output_zarr)
 
 
@@ -126,33 +185,32 @@ if __name__ == "__main__":
     # Checkpoint. Point session_dir at a training session (the folder holding
     # the BM4DNet-*.pth files) to auto-select the best checkpoint. Set
     # checkpoint_path to a .pth to evaluate that file explicitly instead.
-    session_dir = "/root/capsule/results/training-sessions/session-20260709_1817"
-    checkpoint_path = "/root/capsule/results/training-sessions/session-20260709_1817/BM4DNet-20260709-499--2.026414.pth"
+    session_dir = "/root/capsule/results/training-sessions/session-20260710_1719"
+    checkpoint_path = "/root/capsule/results/training-sessions/session-20260710_1719/BM4DNet-20260710-499--19.965923.pth"
 
     # Test image. Any zarr readable by img_util.read, including an s3:// path;
     # give the full path to a single 5D multiscale level array.
-    img_path = "s3://aind-benchmark-data/3d-image-compression/blocks/block_001/input.zarr/0"
+    img_path = "s3://aind-open-data/exaSPIM_826511_2026-06-02_15-10-47/SPIM.ome.zarr/tile_000010_ch_488.zarr/0"
 
-    # Region to evaluate. crop_center=(z, y, x) with crop_shape denoises only a
-    # bounded sub-volume (reads just that region from S3); each dim of crop_shape
-    # must be >= the model patch size (64). Set crop_center=None to denoise the
-    # entire volume -- only safe for small, pre-cropped test blocks, since a
-    # full-resolution zarr will not fit in memory.
-    # crop_center = (256, 256, 256)
-    crop_center = None
-    crop_shape = (256, 256, 256)
+    # Region to evaluate. crop_center is the numeric (x, y, z) position shown by
+    # Neuroglancer; the physical scale displayed beside each coordinate is read
+    # from the source OME-Zarr. The position is converted to the nearest source
+    # voxel before cropping. Each crop_shape dimension must be >= the model patch
+    # size (64). Set crop_center=None only for a small, pre-cropped input volume.
+    crop_center = (22464, -15914, 18711)
+    crop_shape = (1024, 1024, 1024)
 
     # Use raw_input=True for volumes that were not background-subtracted.
     raw_input = True
     # Prefer the background offset precomputed from the full image tile's
     # lower-resolution data. None estimates from this test subvolume instead.
-    background_offset = None
+    background_offset = 37
 
     # Output + misc
     output_dir = "/results/evaluation"
     # Where to persist the denoised volume as an OME-Zarr. Local path or a
     # cloud path (e.g. "s3://BUCKET/PATH/denoised.zarr"). Set to None to skip.
-    output_zarr = "s3://aind-scratch-data/cameron.arshadi/denoising-experiments/outputs/BM4DNet-20260709-499--2.026414/block_001.zarr"
+    output_zarr = "s3://aind-scratch-data/cameron.arshadi/denoising-experiments/outputs/BM4DNet-20260710-499--19.965923/826511_raw_crop.zarr"
     device = "cuda"
     batch_size = 32
     clevel = 5

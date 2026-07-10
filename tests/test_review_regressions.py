@@ -206,7 +206,10 @@ class ImageUtilityRegressionTest(unittest.TestCase):
                 image,
                 path,
                 chunks=(1, 1, 2, 2, 2),
-                n_levels=1,
+                n_levels=2,
+                scale=(1, 1, 1.0, 0.748, 0.748),
+                translation=(0, 0, 10.0, 20.0, 30.0),
+                spatial_unit="micrometer",
             )
             group = zarr.open_group(path, mode="r")
             self.assertEqual(group.metadata.zarr_format, 3)
@@ -214,6 +217,51 @@ class ImageUtilityRegressionTest(unittest.TestCase):
             multiscales = group.attrs["ome"]["multiscales"]
             dataset_path = multiscales[0]["datasets"][0]["path"]
             np.testing.assert_array_equal(group[dataset_path][0, 0], image)
+            transforms = multiscales[0]["datasets"][0][
+                "coordinateTransformations"
+            ]
+            self.assertEqual(
+                transforms,
+                [
+                    {"type": "scale", "scale": [1, 1, 1.0, 0.748, 0.748]},
+                    {
+                        "type": "translation",
+                        "translation": [0, 0, 10.0, 20.0, 30.0],
+                    },
+                ],
+            )
+            self.assertEqual(
+                multiscales[0]["datasets"][1]["coordinateTransformations"],
+                [
+                    {"type": "scale", "scale": [1, 1, 2.0, 1.496, 1.496]},
+                    {
+                        "type": "translation",
+                        "translation": [0, 0, 10.5, 20.374, 30.374],
+                    },
+                ],
+            )
+            self.assertEqual(
+                img_util.get_ome_zarr_level_transform(
+                    os.path.join(path, dataset_path)
+                ),
+                {
+                    "scale": (1.0, 1.0, 1.0, 0.748, 0.748),
+                    "translation": (0.0, 0.0, 10.0, 20.0, 30.0),
+                    "spatial_unit": "micrometer",
+                },
+            )
+
+    def test_ome_coordinate_with_negative_y_converts_to_voxel(self):
+        """Displayed Neuroglancer coordinates map back to level voxels."""
+        transform = {
+            "scale": (1, 1, 1.0, 0.748, 0.748),
+            "translation": (0, 0, 8153.2, -15468.424, 10217.7),
+            "spatial_unit": "micrometer",
+        }
+        voxel_zyx = img_util.ome_zarr_coordinate_to_voxel(
+            (22464, -15914, 18711), transform
+        )
+        self.assertEqual(voxel_zyx, (10558, 4766, 8804))
 
     def test_ssim_uint16_matches_float_computation(self):
         """Bright uint16 products cannot overflow before local filtering."""
