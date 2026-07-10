@@ -38,7 +38,6 @@ class PrecomputeConfigTest(unittest.TestCase):
             "patch_shape": (64, 64, 64),
             "skeleton_radius": 2,
             "segmentation_dilate": 0,
-            "preserve_foreground": True,
             "sigma_bm4d": 24,
             "reject_incoherent_patches": True,
             "coherence_min_autocorr": 0.4,
@@ -66,15 +65,11 @@ class PrecomputeConfigTest(unittest.TestCase):
         write_json.assert_called_once()
         path, config = write_json.call_args.args
         self.assertEqual(path, "/cache/config.json")
-        expected_keys = set(settings) | {
-            "seed_stream",
-            "n_validate_examples",
-        }
+        expected_keys = set(settings) | {"seed_stream"}
         self.assertEqual(set(config), expected_keys)
         for key, value in settings.items():
             self.assertEqual(config[key], value)
         self.assertEqual(config["seed_stream"], 0)
-        self.assertEqual(config["n_validate_examples"], 0)
 
 
 if __name__ == "__main__":

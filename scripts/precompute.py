@@ -154,7 +154,6 @@ def precompute():
         min_segmentation_volume=min_segmentation_volume,
         n_validate_examples=0,
         offsets=offsets,
-        preserve_foreground=preserve_foreground,
         reject_incoherent_patches=reject_incoherent_patches,
         coherence_min_autocorr=coherence_min_autocorr,
         coherence_max_highfreq_frac=coherence_max_highfreq_frac,
@@ -190,7 +189,6 @@ def precompute():
             "patch_shape": patch_shape,
             "skeleton_radius": skeleton_radius,
             "segmentation_dilate": segmentation_dilate,
-            "preserve_foreground": preserve_foreground,
             "sigma_bm4d": sigma_bm4d,
             "reject_incoherent_patches": reject_incoherent_patches,
             "coherence_min_autocorr": coherence_min_autocorr,
@@ -204,7 +202,6 @@ def precompute():
             "seed": seed,
             "seed_stream": _SEED_STREAMS[split],
             "num_workers": num_workers,
-            "n_validate_examples": 0,
         },
     )
     shape = (n_patches,) + tuple(patch_shape)
@@ -287,7 +284,6 @@ if __name__ == "__main__":
     # Dilation (voxels) applied to the segmentation labels; 0 uses them as-is,
     # since the labels already mark neurite voxels.
     segmentation_dilate = 0
-    preserve_foreground = True
     sigma_bm4d = 24
 
     # Reject whole patches contaminated by a bright, spatially incoherent
