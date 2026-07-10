@@ -17,6 +17,7 @@ from copy import deepcopy
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+import logging
 import fastremap
 import numpy as np
 import os
@@ -37,6 +38,9 @@ from aind_exaspim_image_compression.machine_learning.transforms import (
     calibrate_transform,
 )
 from aind_exaspim_image_compression.utils import img_util, util
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_training_example(
@@ -236,17 +240,48 @@ class TrainDataset(Dataset):
         if swc_pointer:
             # Initializations
             swc_dicts = self.swc_reader.read(swc_pointer)
-            n_points = np.sum([len(d["xyz"]) for d in swc_dicts])
+            point_sets = list()
 
-            # Extract skeleton voxels
-            if n_points > 0:
-                start = 0
-                skeletons = np.zeros((n_points, 3), dtype=np.int32)
-                for swc_dict in swc_dicts:
-                    end = start + len(swc_dict["xyz"])
-                    skeletons[start:end] = self.to_voxels(swc_dict["xyz"])
-                    start = end
-                self.skeletons[brain_id] = skeletons
+            # SWCs are expected to be dense in voxel space. Validate parent
+            # links with Chebyshev distance so one-step 3D diagonals count as
+            # adjacent, but do not rasterize edges into the mask.
+            for swc_dict in swc_dicts:
+                points = self.to_voxels(
+                    np.asarray(swc_dict["xyz"], dtype=np.float32).copy()
+                )
+                if not len(points):
+                    continue
+                point_sets.append(points)
+                id_to_index = {
+                    int(node_id): i
+                    for i, node_id in enumerate(swc_dict["id"])
+                }
+                edge_lengths = list()
+                for child_index, parent_id in enumerate(swc_dict["pid"]):
+                    parent_index = id_to_index.get(int(parent_id))
+                    if parent_index is not None:
+                        edge_lengths.append(
+                            int(
+                                np.max(
+                                    np.abs(
+                                        points[child_index]
+                                        - points[parent_index]
+                                    )
+                                )
+                            )
+                        )
+                long_edges = [length for length in edge_lengths if length > 1]
+                if long_edges:
+                    logger.warning(
+                        "SWC for brain %s has %d parent-child edges longer "
+                        "than one voxel (maximum Chebyshev length: %d)",
+                        brain_id,
+                        len(long_edges),
+                        max(long_edges),
+                    )
+
+            if point_sets:
+                self.skeletons[brain_id] = np.concatenate(point_sets, axis=0)
 
     # --- Sample Image Patches ---
     def __getitem__(self, dummy_input):

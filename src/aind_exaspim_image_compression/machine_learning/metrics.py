@@ -264,10 +264,11 @@ def make_skeleton_mask(points, start, patch_shape, dilate=2):
     """
     Builds a foreground mask from ground-truth skeleton points in a patch.
 
-    Rasterizes the traced neurite centerline points that fall within the patch
-    and dilates them to an approximate neurite radius, so ground-truth signal
-    is preserved even where the segmentation does not label it. Raw intensity
-    is never consulted, so noise is not picked up.
+    Rasterizes traced neurite nodes before dilating them to an approximate
+    neurite radius, so ground-truth signal is preserved even where the
+    segmentation does not label it. SWCs are expected to contain a node at
+    every 3D voxel step. Raw intensity is never consulted, so noise is not
+    picked up.
 
     Parameters
     ----------
@@ -296,6 +297,7 @@ def make_skeleton_mask(points, start, patch_shape, dilate=2):
     local = (pts[inside] - start).astype(int)
     if local.size:
         mask[local[:, 0], local[:, 1], local[:, 2]] = True
+
     if dilate > 0:
         mask = ndimage.binary_dilation(mask, iterations=dilate)
     return mask

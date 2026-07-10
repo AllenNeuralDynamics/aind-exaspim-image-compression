@@ -15,6 +15,7 @@ from aind_exaspim_image_compression.machine_learning.metrics import (
     highfreq_energy_fraction,
     local_autocorr,
     make_foreground_mask,
+    make_skeleton_mask,
     mip_max_error,
     patch_has_incoherent_segment,
 )
@@ -93,6 +94,19 @@ class MaskTest(unittest.TestCase):
         self.assertTrue(mask[7, 7, 7])
         self.assertFalse(mask[0, 0, 0])
         self.assertGreaterEqual(mask.sum(), 64)  # >= block, dilation adds more
+
+    def test_skeleton_mask_marks_nodes_without_filling_edges(self):
+        """Skeleton masks mark supplied nodes without interpolating gaps."""
+        points = np.array([[1, 1, 1], [3, 3, 3]], dtype=np.int32)
+        mask = make_skeleton_mask(
+            points,
+            start=(0, 0, 0),
+            patch_shape=(5, 5, 5),
+            dilate=0,
+        )
+        self.assertTrue(mask[1, 1, 1])
+        self.assertTrue(mask[3, 3, 3])
+        self.assertFalse(mask[2, 2, 2])
 
 
 class MetricTest(unittest.TestCase):
