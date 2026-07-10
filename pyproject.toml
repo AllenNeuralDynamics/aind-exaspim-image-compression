@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "aind-exaspim-image-compression"
 description = "Generated from aind-library-template"
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     {name = "Allen Institute for Neural Dynamics"}
 ]
@@ -26,7 +26,7 @@ dependencies = [
     'imagecodecs',
     'interrogate',
     'matplotlib',
-    'ome-zarr',
+    'ome-zarr>=0.12.0',
     'pandas',
     's3fs==2025.7.0',
     'scikit-image',
@@ -38,7 +38,7 @@ dependencies = [
     'torchvision',
     'tqdm',
     'xarray_multiscale==1.2.0',
-    'zarr',
+    'zarr>=3.0.8',
     "aind-exaspim-dataset-utils @ git+https://github.com/AllenNeuralDynamics/aind-exaspim-dataset-utils.git@main"
 ]
 
@@ -61,7 +61,7 @@ version = {attr = "aind_exaspim_image_compression.__version__"}
 
 [tool.black]
 line-length = 79
-target_version = ['py310']
+target_version = ['py311']
 exclude = '''
 
 (

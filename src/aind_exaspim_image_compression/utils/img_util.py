@@ -83,8 +83,8 @@ def _read_n5(img_path):
 
     Returns
     -------
-    numpy.ndarray
-        Image volume.
+    tensorstore.TensorStore
+        Lazy, sliceable image volume.
     """
     if is_s3_path(img_path) or is_gcs_path(img_path):
         bucket, prefix = util.parse_cloud_path(img_path)
@@ -96,7 +96,7 @@ def _read_n5(img_path):
     else:
         kvstore = {"driver": "file", "path": img_path.rstrip("/") + "/volume"}
     arr = ts.open({"driver": "n5", "kvstore": kvstore}).result()
-    return arr[:].read().result()
+    return arr
 
 
 def _read_neuroglancer_precompted(img_path):
@@ -719,37 +719,41 @@ def write_ome_zarr(
     voxel_size=(748, 748, 1000),
     storage_options=None,
 ):
-    # zarr v3 codec; default matches the cratio codec (zstd, level 5, shuffle).
+    # Zarr v3 codec; default matches the cratio codec (zstd, level 5, shuffle).
     from zarr.codecs import BloscCodec
 
     if compressor is None:
-        compressor = BloscCodec(cname="zstd", clevel=5, shuffle="shuffle")
+        compressor = BloscCodec(
+            cname="zstd", clevel=5, shuffle="shuffle"
+        )
 
     # Ensure 5D image (T, C, Z, Y, X)
     while img.ndim < 5:
         img = img[np.newaxis, ...]
 
     # Generate multiscale pyramid
-    pyramid = multiscale(img, windowed_mode, scale_factors=scale_factors)[:n_levels]
+    pyramid = multiscale(
+        img, windowed_mode, scale_factors=scale_factors
+    )[:n_levels]
     pyramid = [level.data for level in pyramid]
 
-    # Prepare Zarr store. zarr v3 builds it from the path: a LocalStore for a
-    # filesystem path, an FsspecStore for s3:// / gs:// (credentials from
-    # storage_options or the default chain).
+    # Zarr v3 builds a LocalStore or FsspecStore from the path/URL.
     zgroup = zarr.open_group(
         store=output_path, mode="w", storage_options=storage_options
     )
 
     # Voxel size scaling for each level
     base_scale = np.array([1, 1, *reversed(voxel_size)])
-    scales = [base_scale[:2].tolist() + (base_scale[2:] * 2**i).tolist() for i in range(n_levels)]
+    scales = [
+        base_scale[:2].tolist() + (base_scale[2:] * 2**i).tolist()
+        for i in range(n_levels)
+    ]
     coord_transforms = [[{"type": "scale", "scale": s}] for s in scales]
 
     # Write to OME-Zarr
     write_multiscale(
         pyramid=pyramid,
         group=zgroup,
-        chunks=chunks,
         axes=[
             {"name": "t", "type": "time", "unit": "millisecond"},
             {"name": "c", "type": "channel"},
@@ -758,7 +762,10 @@ def write_ome_zarr(
             {"name": "x", "type": "space", "unit": "micrometer"},
         ],
         coordinate_transformations=coord_transforms,
-        storage_options={"compressors": [compressor]},
+        storage_options={
+            "chunks": chunks,
+            "compressors": [compressor],
+        },
     )
 
 
@@ -774,11 +781,11 @@ def write_zarr(
     """
     Writes an image volume to a single Zarr array (local or cloud).
 
-    Uses the zarr v3 API, so ``output_path`` may be a local path or a cloud URL
-    (``s3://...``, ``gs://...``); zarr builds the store from the URL. For cloud
-    writes, credentials are resolved by fsspec from the standard chain (env,
-    ``~/.aws``, instance role) unless ``storage_options`` overrides them. The
-    array is stored 5D (t, c, z, y, x) so ``read`` reads it back unchanged.
+    Uses the Zarr v3 API, so ``output_path`` may be a local path or a cloud URL
+    (``s3://...``, ``gs://...``); Zarr builds the store from the URL. Cloud
+    credentials are resolved from the standard chain unless ``storage_options``
+    overrides them. The array is stored 5D (t, c, z, y, x) so ``read`` reads it
+    back unchanged.
 
     Parameters
     ----------
@@ -808,7 +815,9 @@ def write_zarr(
         shape=img.shape,
         chunks=chunks,
         dtype=img.dtype,
-        compressors=BloscCodec(cname=cname, clevel=clevel, shuffle=shuffle),
+        compressors=BloscCodec(
+            cname=cname, clevel=clevel, shuffle=shuffle
+        ),
         overwrite=True,
         storage_options=storage_options,
     )
@@ -838,6 +847,12 @@ def ssim3D(img1, img2, data_range=None, window_size=16):
     """
     if img1.shape != img2.shape:
         raise ValueError("Input images must have the same dimensions")
+
+    # Integer powers and products overflow before scipy sees them (notably for
+    # normal uint16 microscopy inputs), corrupting the local moments. Convert
+    # once up front so all subsequent arithmetic is floating point.
+    img1 = np.asarray(img1, dtype=np.float64)
+    img2 = np.asarray(img2, dtype=np.float64)
 
     if data_range is None:
         data_range1 = np.max(img1) - np.min(img1)
