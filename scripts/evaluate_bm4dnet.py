@@ -64,6 +64,10 @@ def evaluate():
     # requested region, so a crop avoids pulling the whole (huge) volume from S3.
     img = img_util.read(img_path)
     if crop_center is not None:
+        crop_start, _ = img_util.get_start_end(
+            crop_center, crop_shape, is_center=True
+        )
+        print("Crop origin (z, y, x):", tuple(crop_start))
         raw = np.asarray(
             img_util.get_patch(img, crop_center, crop_shape, is_center=True)
         )
