@@ -291,32 +291,41 @@ def load_model(path, device="cuda"):
     return model, build_transform(transform_cfg)
 
 
-def build_volume_transform(base_transform, img, percentile=0.1):
+def build_volume_transform(
+    base_transform, img=None, percentile=0.1, offset=None
+):
     """
-    Builds a per-volume transform whose offset is estimated from the image.
+    Builds an inference transform with a raw-count background offset.
 
-    Use at inference on raw (non-background-subtracted) volumes: it estimates
-    the background offset from a low percentile of the nonzero voxels and
-    returns a transform with that offset plus the trained transform's kind and
-    scale. This mirrors the per-brain offset subtracted during training, so a
-    raw volume is normalized to the same background-at-zero space the model
-    was trained on.
+    Production inference should pass an offset precomputed from the full image
+    tile using lower-resolution data. When no offset is supplied, this falls
+    back to estimating one directly from ``img``; that mode is intended for
+    testing and debugging on representative subvolumes.
 
     Parameters
     ----------
     base_transform : IntensityTransform
         The transform the model was trained with (e.g., from load_model).
-    img : numpy.ndarray
-        Raw image volume to be denoised.
+    img : numpy.ndarray, optional
+        Raw image volume used only when ``offset`` is None.
     percentile : float, optional
-        Low percentile used as the background estimate. Default is 0.1.
+        Low percentile used for fallback estimation from ``img``. Default is
+        0.1.
+    offset : float, optional
+        Precomputed full-tile background offset. When supplied, no statistic
+        is calculated from ``img``.
 
     Returns
     -------
     IntensityTransform
         A transform carrying the per-volume offset.
     """
-    offset = estimate_offset(img, percentile=percentile, ignore_zeros=True)
+    if offset is None:
+        if img is None:
+            raise ValueError("img is required when offset is not supplied")
+        offset = estimate_offset(
+            img, percentile=percentile, ignore_zeros=True
+        )
     return with_offset(base_transform, offset)
 
 
