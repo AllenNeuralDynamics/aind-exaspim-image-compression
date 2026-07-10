@@ -71,12 +71,16 @@ def evaluate():
         raw = np.asarray(img[0, 0])
     print("Volume shape:", raw.shape)
 
-    # For a raw (non-background-subtracted) volume, estimate this volume's
-    # background offset so it lands in the same background-at-zero space the
-    # model was trained on (mirrors the per-brain offset subtracted in training).
-    # Set raw_input=False if the input is already background-subtracted.
+    # For a raw (non-background-subtracted) volume, use the supplied full-tile
+    # offset. With background_offset=None, fall back to estimating from this
+    # test subvolume for debugging only.
     if raw_input:
-        volume_transform = build_volume_transform(transform, raw)
+        volume_transform = build_volume_transform(
+            transform,
+            raw,
+            percentile=0.1,
+            offset=background_offset,
+        )
         print("Per-volume transform:", volume_transform.cfg)
     else:
         volume_transform = transform
@@ -118,8 +122,8 @@ if __name__ == "__main__":
     # Checkpoint. Point session_dir at a training session (the folder holding
     # the BM4DNet-*.pth files) to auto-select the best checkpoint. Set
     # checkpoint_path to a .pth to evaluate that file explicitly instead.
-    session_dir = "/root/capsule/data/bm4dnet-training-session-20260709_1354"
-    checkpoint_path = None
+    session_dir = "/root/capsule/results/training-sessions/session-20260709_1817"
+    checkpoint_path = "/root/capsule/results/training-sessions/session-20260709_1817/BM4DNet-20260709-499--2.026414.pth"
 
     # Test image. Any zarr readable by img_util.read, including an s3:// path;
     # give the full path to a single 5D multiscale level array.
@@ -134,15 +138,17 @@ if __name__ == "__main__":
     crop_center = None
     crop_shape = (256, 256, 256)
 
-    # raw_input=True estimates a per-volume background offset (use for raw
-    # volumes that were NOT background-subtracted).
+    # Use raw_input=True for volumes that were not background-subtracted.
     raw_input = True
+    # Prefer the background offset precomputed from the full image tile's
+    # lower-resolution data. None estimates from this test subvolume instead.
+    background_offset = None
 
     # Output + misc
     output_dir = "/results/evaluation"
     # Where to persist the denoised volume as an OME-Zarr. Local path or a
     # cloud path (e.g. "s3://BUCKET/PATH/denoised.zarr"). Set to None to skip.
-    output_zarr = "s3://aind-scratch-data/cameron.arshadi/denoising-experiments/outputs/BM4DNet-20260709-405--163.534489/block_001.zarr"
+    output_zarr = "s3://aind-scratch-data/cameron.arshadi/denoising-experiments/outputs/BM4DNet-20260709-499--2.026414/block_001.zarr"
     device = "cuda"
     batch_size = 32
     clevel = 5
