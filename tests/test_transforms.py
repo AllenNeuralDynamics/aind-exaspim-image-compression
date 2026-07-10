@@ -135,6 +135,23 @@ class HelperTest(unittest.TestCase):
         self.assertAlmostEqual(shifted.scale, 32.0)
         self.assertEqual(shifted.cfg["params"]["offset"], 120.0)
 
+    def test_with_offset_shifts_linear_bounds(self):
+        """A linear baseline applies offsets without an invalid kwarg."""
+        base = build_transform(
+            {
+                "kind": "linear",
+                "params": {"mn": 10.0, "mx": 1010.0, "clip": 8.0},
+            }
+        )
+        shifted = with_offset(base, 50.0)
+        self.assertEqual(shifted.mn, 60.0)
+        self.assertEqual(shifted.mx, 1060.0)
+        values = np.array([60.0, 560.0, 1060.0], dtype=np.float32)
+        np.testing.assert_allclose(
+            shifted.forward(values), base.forward(values - 50.0)
+        )
+        self.assertNotIn("offset", shifted.cfg["params"])
+
     def test_build_transform(self):
         """Factory builds each kind and rejects unknown kinds."""
         t = build_transform({"kind": "asinh"})

@@ -456,7 +456,7 @@ def calibrate_transform(cfg, sample):
 
 def with_offset(transform, offset):
     """
-    Returns a copy of an asinh/anscombe transform with a new offset.
+    Returns a copy of an intensity transform with a new count-space offset.
 
     Used to apply a per-volume background offset at inference: estimate the
     offset from the raw volume, then rebuild the (frozen) transform with that
@@ -480,5 +480,16 @@ def with_offset(transform, offset):
         raise ValueError(
             "transform has no cfg; construct it via build_transform"
         )
-    params = {**cfg.get("params", {}), "offset": float(offset)}
+    params = dict(cfg.get("params", {}))
+    offset = float(offset)
+    if cfg["kind"] == "linear":
+        # Applying the per-volume offset before the trained linear transform,
+        # ``base.forward(x - offset)``, is equivalent to shifting both linear
+        # bounds.  Shifting both also makes inverse() restore the offset in the
+        # returned raw counts.  LinearClipTransform deliberately has no
+        # ``offset`` constructor argument.
+        params["mn"] = float(getattr(transform, "mn")) + offset
+        params["mx"] = float(getattr(transform, "mx")) + offset
+    else:
+        params["offset"] = offset
     return build_transform({**cfg, "params": params})
