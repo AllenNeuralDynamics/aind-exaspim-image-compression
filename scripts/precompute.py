@@ -31,8 +31,8 @@ A distinct RNG stream per split means the two caches never sample the same
 
 Outputs, under cache_dir (identical layout for both splits, so the val cache
 loads with CachedValidateDataset):
-    raw.npy        float16  (N, *patch_shape)   offset-subtracted counts
-    teacher.npy    float16  (N, *patch_shape)   clipped BM4D denoising
+    raw.npy        float32  (N, *patch_shape)   offset-subtracted counts
+    teacher.npy    float32  (N, *patch_shape)   clipped BM4D denoising
     fg.npy         uint8    (N, *patch_shape)   foreground mask (0/1)
     transform.json                              resolved transform cfg
     config.json                                 full precompute configuration
@@ -67,6 +67,7 @@ _WORKER_VAL = None
 _WORKER_SEED = None
 _WORKER_STREAM = 0
 _WORKER_SPLIT = "train"
+_COUNT_DTYPE = np.float32
 
 
 def _seed_task(index):
@@ -120,11 +121,6 @@ def _sample_counts(index):
     )
     fg_mask = _WORKER_TRAIN.annotation_mask(brain_id, voxel, labels=labels)
     return _WORKER_VAL.sample_counts(brain_id, voxel, fg_mask=fg_mask, raw=raw)
-
-
-def _to_float16(arr):
-    """Clips to the float16 range before casting (avoids inf at saturation)."""
-    return np.clip(arr, -65504, 65504).astype(np.float16)
 
 
 def precompute():
@@ -202,14 +198,15 @@ def precompute():
             "seed": seed,
             "seed_stream": _SEED_STREAMS[split],
             "num_workers": num_workers,
+            "count_dtype": np.dtype(_COUNT_DTYPE).name,
         },
     )
     shape = (n_patches,) + tuple(patch_shape)
     raw_mm = open_memmap(
-        f"{cache_dir}/raw.npy", mode="w+", dtype=np.float16, shape=shape
+        f"{cache_dir}/raw.npy", mode="w+", dtype=_COUNT_DTYPE, shape=shape
     )
     teacher_mm = open_memmap(
-        f"{cache_dir}/teacher.npy", mode="w+", dtype=np.float16, shape=shape
+        f"{cache_dir}/teacher.npy", mode="w+", dtype=_COUNT_DTYPE, shape=shape
     )
     fg_mm = open_memmap(
         f"{cache_dir}/fg.npy", mode="w+", dtype=np.uint8, shape=shape
@@ -226,8 +223,8 @@ def precompute():
         for i, (raw, teacher, fg) in enumerate(
             tqdm(results, total=n_patches, desc=f"Precompute ({split})")
         ):
-            raw_mm[i] = _to_float16(raw)
-            teacher_mm[i] = _to_float16(teacher)
+            raw_mm[i] = np.asarray(raw, dtype=_COUNT_DTYPE)
+            teacher_mm[i] = np.asarray(teacher, dtype=_COUNT_DTYPE)
             fg_mm[i] = np.asarray(fg, dtype=np.uint8)
 
     raw_mm.flush()
@@ -317,7 +314,7 @@ if __name__ == "__main__":
 
     # Per-split output location and pool size.
     if split == "train":
-        # ~1.3 MB/patch (fp16 raw+teacher + uint8 fg), so 30000 ~= 40 GB.
+        # ~2.4 MB/patch (fp32 raw+teacher + uint8 fg), so 30000 ~= 71 GB.
         cache_dir = "/results/patch_cache"
         n_patches = 30000
     else:

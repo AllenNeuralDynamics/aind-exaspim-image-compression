@@ -10,8 +10,8 @@ structures (noise, off-target label)?
 Works on either cache produced by scripts/precompute.py (train or val); both
 share the same layout::
 
-    raw.npy      float16  (N, *patch_shape)   offset-subtracted counts
-    teacher.npy  float16  (N, *patch_shape)   clipped BM4D denoising
+    raw.npy      float32  (N, *patch_shape)   offset-subtracted counts
+    teacher.npy  float32  (N, *patch_shape)   clipped BM4D denoising
     fg.npy       uint8    (N, *patch_shape)   foreground mask (0/1)
 
 Each patch is one row with five count-space panels:

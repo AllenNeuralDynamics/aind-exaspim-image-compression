@@ -3,6 +3,7 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import runpy
 import unittest
 
@@ -65,11 +66,19 @@ class PrecomputeConfigTest(unittest.TestCase):
         write_json.assert_called_once()
         path, config = write_json.call_args.args
         self.assertEqual(path, "/cache/config.json")
-        expected_keys = set(settings) | {"seed_stream"}
+        expected_keys = set(settings) | {"count_dtype", "seed_stream"}
         self.assertEqual(set(config), expected_keys)
         for key, value in settings.items():
             self.assertEqual(config[key], value)
         self.assertEqual(config["seed_stream"], 0)
+        self.assertEqual(config["count_dtype"], "float32")
+        self.assertEqual(
+            precompute.__globals__["_COUNT_DTYPE"], np.float32
+        )
+        self.assertEqual(
+            precompute.__globals__["open_memmap"].call_args.kwargs["dtype"],
+            np.float32,
+        )
 
 
 if __name__ == "__main__":
