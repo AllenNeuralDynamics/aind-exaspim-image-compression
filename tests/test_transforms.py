@@ -9,6 +9,7 @@ from aind_exaspim_image_compression.machine_learning.transforms import (
     AsinhTransform,
     IntensityTransform,
     LinearClipTransform,
+    OffsetTransform,
     build_transform,
     calibrate_transform,
     estimate_offset,
@@ -128,12 +129,52 @@ class HelperTest(unittest.TestCase):
         )
 
     def test_with_offset(self):
-        """with_offset rebuilds a transform with a new offset only."""
+        """with_offset wraps the frozen transform without renormalizing it."""
         base = build_transform({"kind": "asinh", "params": {"scale": 32}})
         shifted = with_offset(base, 120.0)
+        self.assertIsInstance(shifted, OffsetTransform)
         self.assertAlmostEqual(shifted.offset, 120.0)
         self.assertAlmostEqual(shifted.scale, 32.0)
         self.assertEqual(shifted.cfg["params"]["offset"], 120.0)
+        self.assertEqual(shifted.cfg["base"], base.cfg)
+
+        values = np.array([120.0, 152.0, 1120.0, 60120.0])
+        np.testing.assert_array_equal(
+            shifted.forward(values), base.forward(values - 120.0)
+        )
+
+    def test_with_offset_inverse_restores_pedestal(self):
+        """The composed inverse restores the offset after the frozen inverse."""
+        base = build_transform({"kind": "asinh", "params": {"scale": 32}})
+        shifted = with_offset(base, 120.0)
+        values = np.array([120.0, 152.0, 1120.0, 60120.0])
+        np.testing.assert_allclose(
+            shifted.inverse(shifted.forward(values)), values, atol=1
+        )
+
+    def test_with_offset_is_exact_for_anscombe(self):
+        """Anscombe inference also retains its trained normalization factor."""
+        base = build_transform(
+            {
+                "kind": "anscombe",
+                "params": {"gain": 8, "read_noise": 5},
+            }
+        )
+        shifted = with_offset(base, 120.0)
+        values = np.array([120.0, 500.0, 2000.0, 20000.0])
+        np.testing.assert_array_equal(
+            shifted.forward(values), base.forward(values - 120.0)
+        )
+
+    def test_offset_transform_config_round_trip(self):
+        """The exact composed transform can be reconstructed from its config."""
+        base = build_transform({"kind": "asinh", "params": {"scale": 32}})
+        shifted = with_offset(base, 120.0)
+        rebuilt = build_transform(shifted.cfg)
+        values = np.array([120.0, 1000.0, 60000.0])
+        np.testing.assert_array_equal(
+            rebuilt.forward(values), shifted.forward(values)
+        )
 
     def test_with_offset_shifts_linear_bounds(self):
         """A linear baseline applies offsets without an invalid kwarg."""
@@ -196,12 +237,14 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(out["params"], {"gain": 2})
 
     def test_base_class_not_implemented(self):
-        """The abstract base raises for both directions."""
+        """The abstract base raises for all transform directions."""
         t = IntensityTransform()
         with self.assertRaises(NotImplementedError):
             t.forward(np.zeros(1))
         with self.assertRaises(NotImplementedError):
             t.inverse(np.zeros(1))
+        with self.assertRaises(NotImplementedError):
+            t.inverse_float(np.zeros(1))
 
 
 if __name__ == "__main__":

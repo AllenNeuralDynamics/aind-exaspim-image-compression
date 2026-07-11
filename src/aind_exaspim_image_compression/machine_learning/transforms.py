@@ -57,6 +57,10 @@ class IntensityTransform:
         """
         raise NotImplementedError
 
+    def inverse_float(self, y):
+        """Maps normalized values to unclipped floating-point counts."""
+        raise NotImplementedError
+
 
 class AsinhTransform(IntensityTransform):
     """
@@ -124,6 +128,11 @@ class AsinhTransform(IntensityTransform):
         y = np.arcsinh((x - self.offset) / self.scale) / self._norm
         return y.astype(np.float32)
 
+    def inverse_float(self, y):
+        """Maps normalized asinh values to floating-point counts."""
+        y = np.asarray(y, dtype=np.float32)
+        return self.offset + self.scale * np.sinh(y * self._norm)
+
     def inverse(self, y):
         """
         Maps normalized asinh values back to raw uint16 counts.
@@ -138,8 +147,7 @@ class AsinhTransform(IntensityTransform):
         numpy.ndarray
             Image in raw counts, clipped to [0, max_count], uint16.
         """
-        y = np.asarray(y, dtype=np.float32)
-        counts = self.offset + self.scale * np.sinh(y * self._norm)
+        counts = self.inverse_float(y)
         counts = np.clip(counts, 0, self.max_count)
         return np.rint(counts).astype(np.uint16)
 
@@ -250,6 +258,14 @@ class AnscombeTransform(IntensityTransform):
         gat = self._gat(np.asarray(x, dtype=np.float32))
         return (gat / self._norm).astype(np.float32)
 
+    def inverse_float(self, y):
+        """Maps normalized Anscombe values to floating-point counts."""
+        d = np.clip(np.asarray(y, dtype=np.float32), 0.0, None) * self._norm
+        arg = (d * self.gain / 2.0) ** 2
+        return self.offset + (
+            arg - self._c_inv * self.gain ** 2 - self.read_noise ** 2
+        ) / self.gain
+
     def inverse(self, y):
         """
         Maps normalized Anscombe values back to raw uint16 counts.
@@ -264,11 +280,7 @@ class AnscombeTransform(IntensityTransform):
         numpy.ndarray
             Image in raw counts, clipped to [0, max_count], uint16.
         """
-        d = np.clip(np.asarray(y, dtype=np.float32), 0.0, None) * self._norm
-        arg = (d * self.gain / 2.0) ** 2
-        counts = self.offset + (
-            arg - self._c_inv * self.gain ** 2 - self.read_noise ** 2
-        ) / self.gain
+        counts = self.inverse_float(y)
         counts = np.clip(counts, 0, self.max_count)
         return np.rint(counts).astype(np.uint16)
 
@@ -335,6 +347,11 @@ class LinearClipTransform(IntensityTransform):
         y = (x - self.mn) / (self.mx - self.mn + 1e-8)
         return np.clip(y, 0.0, self.clip).astype(np.float32)
 
+    def inverse_float(self, y):
+        """Maps normalized linear values to floating-point counts."""
+        y = np.asarray(y, dtype=np.float32)
+        return y * (self.mx - self.mn) + self.mn
+
     def inverse(self, y):
         """
         Maps normalized values back to raw uint16 counts.
@@ -349,8 +366,47 @@ class LinearClipTransform(IntensityTransform):
         numpy.ndarray
             Image in raw counts, clipped to [0, max_count], uint16.
         """
-        y = np.asarray(y, dtype=np.float32)
-        counts = y * (self.mx - self.mn) + self.mn
+        counts = self.inverse_float(y)
+        counts = np.clip(counts, 0, self.max_count)
+        return np.rint(counts).astype(np.uint16)
+
+
+class OffsetTransform(IntensityTransform):
+    """Applies a raw-count offset around a frozen trained transform.
+
+    This exact composition is used for inference on images that still contain
+    their background pedestal. It deliberately leaves the base transform's
+    normalization constants unchanged::
+
+        forward(x) = base.forward(x - offset)
+        inverse(y) = base.inverse_float(y) + offset
+
+    Changing an AsinhTransform or AnscombeTransform's own ``offset`` parameter
+    would also change its normalization denominator and therefore would not
+    reproduce the mapping used for offset-subtracted training patches.
+    """
+
+    def __init__(self, base_transform, offset=0.0):
+        self.base_transform = base_transform
+        self.offset = float(offset)
+        self.max_count = float(base_transform.max_count)
+
+    def __getattr__(self, name):
+        """Expose non-offset parameters such as scale and gain from the base."""
+        return getattr(self.base_transform, name)
+
+    def forward(self, x):
+        """Subtracts the pedestal, then applies the trained transform."""
+        x = np.asarray(x, dtype=np.float32)
+        return self.base_transform.forward(x - self.offset)
+
+    def inverse_float(self, y):
+        """Inverts through the trained transform and restores the pedestal."""
+        return self.base_transform.inverse_float(y) + self.offset
+
+    def inverse(self, y):
+        """Returns pedestal-restored, physically clipped uint16 counts."""
+        counts = self.inverse_float(y)
         counts = np.clip(counts, 0, self.max_count)
         return np.rint(counts).astype(np.uint16)
 
@@ -396,7 +452,8 @@ def build_transform(cfg):
     ----------
     cfg : dict
         Config of the form ``{"kind": "asinh" | "anscombe" | "linear",
-        "params": {...}}``.
+        "params": {...}}``. An offset composition is represented as
+        ``{"kind": "offset", "base": <transform cfg>, "params": {...}}``.
 
     Returns
     -------
@@ -416,6 +473,8 @@ def build_transform(cfg):
         transform = AnscombeTransform(**params)
     elif kind == "linear":
         transform = LinearClipTransform(**params)
+    elif kind == "offset":
+        transform = OffsetTransform(build_transform(cfg["base"]), **params)
     else:
         raise ValueError(f"Unknown transform kind: {kind}")
     transform.cfg = {**cfg, "params": dict(params)}
@@ -456,12 +515,13 @@ def calibrate_transform(cfg, sample):
 
 def with_offset(transform, offset):
     """
-    Returns a copy of an intensity transform with a new count-space offset.
+    Composes a raw-count background offset around a trained transform.
 
-    Used to apply a per-volume background offset at inference: estimate the
-    offset from the raw volume, then rebuild the (frozen) transform with that
-    offset while keeping its kind, scale, and max_count. This mirrors the
-    per-brain offset subtracted during training.
+    Used at inference when training patches had their per-brain offsets
+    subtracted before the frozen transform. The returned mapping is exactly
+    ``transform.forward(x - offset)``; the inverse adds the offset back after
+    applying the frozen inverse. In particular, this does not alter the asinh
+    or Anscombe normalization denominator.
 
     Parameters
     ----------
@@ -475,12 +535,13 @@ def with_offset(transform, offset):
     IntensityTransform
         A new transform with the given offset.
     """
+    if isinstance(transform, OffsetTransform):
+        transform = transform.base_transform
     cfg = getattr(transform, "cfg", None)
     if cfg is None:
         raise ValueError(
             "transform has no cfg; construct it via build_transform"
         )
-    params = dict(cfg.get("params", {}))
     offset = float(offset)
     if cfg["kind"] == "linear":
         # Applying the per-volume offset before the trained linear transform,
@@ -488,8 +549,14 @@ def with_offset(transform, offset):
         # bounds.  Shifting both also makes inverse() restore the offset in the
         # returned raw counts.  LinearClipTransform deliberately has no
         # ``offset`` constructor argument.
-        params["mn"] = float(getattr(transform, "mn")) + offset
-        params["mx"] = float(getattr(transform, "mx")) + offset
-    else:
-        params["offset"] = offset
-    return build_transform({**cfg, "params": params})
+        params = dict(cfg.get("params", {}))
+        params["mn"] = float(transform.mn) + offset
+        params["mx"] = float(transform.mx) + offset
+        return build_transform({**cfg, "params": params})
+    return build_transform(
+        {
+            "kind": "offset",
+            "base": cfg,
+            "params": {"offset": offset},
+        }
+    )

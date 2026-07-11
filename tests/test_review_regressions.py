@@ -65,6 +65,10 @@ class InferenceRegressionTest(unittest.TestCase):
             transform = build_volume_transform(base, offset=73.5)
         estimate.assert_not_called()
         self.assertAlmostEqual(transform.offset, 73.5)
+        raw = np.array([73.5, 105.5, 1073.5, 60073.5])
+        np.testing.assert_array_equal(
+            transform.forward(raw), base.forward(raw - 73.5)
+        )
 
     def test_volume_transform_requires_image_without_offset(self):
         """Fallback estimation requires an explicit test image."""
