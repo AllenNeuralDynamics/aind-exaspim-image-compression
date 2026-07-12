@@ -8,8 +8,10 @@ from scipy import ndimage
 
 from aind_exaspim_image_compression.machine_learning.metrics import (
     DEFAULT_CHECKPOINT_WEIGHTS,
+    aggregate_stratified_metrics,
     checkpoint_score,
     evaluate_example,
+    evaluate_stratified_example,
     false_bright_rate,
     foreground_background_mae,
     highfreq_energy_fraction,
@@ -176,6 +178,105 @@ class EvaluateTest(unittest.TestCase):
         weights = dict(DEFAULT_CHECKPOINT_WEIGHTS, cratio=1.0)
         with_cratio = checkpoint_score(metrics, cratio=3.0, weights=weights)
         self.assertAlmostEqual(with_cratio, expected - 3.0)
+
+
+class StratifiedMetricTest(unittest.TestCase):
+    """Tests provenance strata, saturation masks, and halo distance bands."""
+
+    @staticmethod
+    def _record(
+        brain_id="bright",
+        foreground=True,
+        pred_scale=1.0,
+        saturated=True,
+    ):
+        """Construct one synthetic bright or blank validation record."""
+        shape = (41, 41, 41)
+        raw = np.full(shape, 100.0, dtype=np.float32)
+        grid = np.indices(shape).sum(axis=0)
+        raw += np.where(grid % 2, 20.0, -20.0).astype(np.float32)
+        fg = np.zeros(shape, dtype=bool)
+        if foreground:
+            fg[17:24, 17:24, 17:24] = True
+            raw[fg] = 10000.0
+        if saturated:
+            raw[19:22, 19:22, 19:22] = 65535.0
+        pred = ndimage.gaussian_filter(raw, sigma=1.0) * pred_scale
+        target = ndimage.gaussian_filter(raw, sigma=1.0)
+        return evaluate_stratified_example(
+            pred,
+            raw,
+            target,
+            fg,
+            brain_id=brain_id,
+            center=(100, 200, 300),
+            offset=0,
+            noise_params=np.array([1.8, 400], dtype=np.float32),
+            saturation_margin=64,
+        )
+
+    def test_brightness_noise_saturation_and_provenance_strata(self):
+        """Patch records retain source and fixed global stratum labels."""
+        record = self._record()
+        self.assertEqual(record["provenance"]["brain_id"], "bright")
+        self.assertEqual(record["provenance"]["center"], [100, 200, 300])
+        self.assertEqual(record["strata"]["foreground_presence"], "foreground")
+        self.assertEqual(
+            record["strata"]["foreground_intensity_bin"], "60k+"
+        )
+        self.assertEqual(record["strata"]["background_noise_bin"], "0-25")
+        self.assertEqual(record["strata"]["saturation"], "saturated")
+        self.assertEqual(record["patch_metrics"]["saturated_voxel_count"], 27)
+        self.assertAlmostEqual(
+            record["patch_metrics"]["calibrated_background_sigma"], 20.0
+        )
+
+    def test_halo_bands_cover_patch_and_report_cleanup_and_bias(self):
+        """Distance bands report weighted noise, intensity, and edge metrics."""
+        record = self._record()
+        halo = record["halo"]
+        self.assertEqual(set(halo), {"0-2", "2-5", "5-10", "10-20", "20+"})
+        self.assertEqual(
+            sum(values["voxel_count"] for values in halo.values()),
+            41 ** 3,
+        )
+        self.assertGreater(halo["0-2"]["voxel_count"], 27)
+        self.assertTrue(np.isfinite(halo["0-2"]["intensity_preservation"]))
+        self.assertTrue(
+            np.isfinite(halo["0-2"]["saturated_core_preservation"])
+        )
+        self.assertTrue(np.isfinite(halo["0-2"]["mean_intensity_bias"]))
+        self.assertLess(
+            halo["20+"]["output_hf_std"], halo["20+"]["input_hf_std"]
+        )
+
+    def test_unsaturated_patch_has_zero_count_halo_bands(self):
+        """Unsaturated patches remain a stratum without fabricated halo data."""
+        record = self._record(saturated=False)
+        self.assertEqual(record["strata"]["saturation"], "unsaturated")
+        self.assertTrue(
+            all(values["voxel_count"] == 0 for values in record["halo"].values())
+        )
+
+    def test_aggregation_is_per_brain_and_excludes_blank_foreground_error(self):
+        """Blank patches do not dilute foreground MAE with artificial zeros."""
+        foreground = self._record(brain_id="a", pred_scale=0.9)
+        blank = self._record(
+            brain_id="b", foreground=False, saturated=False
+        )
+        self.assertGreater(foreground["legacy"]["fg_mae"], 0)
+        self.assertEqual(blank["legacy"]["fg_mae"], 0)
+        report = aggregate_stratified_metrics([foreground, blank])
+        self.assertEqual(set(report["by_brain"]), {"a", "b"})
+        self.assertEqual(set(report["halo_by_brain"]), {"a", "b"})
+        self.assertAlmostEqual(
+            report["overall"]["fg_mae"], foreground["legacy"]["fg_mae"]
+        )
+        self.assertEqual(report["overall"]["foreground_patch_count"], 1)
+        self.assertEqual(
+            report["by_foreground_presence"]["blank"]["foreground_patch_count"],
+            0,
+        )
 
 
 if __name__ == "__main__":

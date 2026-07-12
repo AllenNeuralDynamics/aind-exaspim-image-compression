@@ -28,6 +28,39 @@ DEFAULT_CHECKPOINT_WEIGHTS = {
     "cratio": 0.0,
 }
 
+LEGACY_METRIC_KEYS = (
+    "fg_mae",
+    "bg_mae",
+    "top_pct_error",
+    "top_pct_preservation",
+    "mip_max_error",
+    "false_bright_rate",
+)
+
+FOREGROUND_INTENSITY_BINS = (
+    (0.0, 1000.0, "0-1k"),
+    (1000.0, 5000.0, "1k-5k"),
+    (5000.0, 20000.0, "5k-20k"),
+    (20000.0, 60000.0, "20k-60k"),
+    (60000.0, np.inf, "60k+"),
+)
+
+BACKGROUND_NOISE_BINS = (
+    (0.0, 25.0, "0-25"),
+    (25.0, 50.0, "25-50"),
+    (50.0, 100.0, "50-100"),
+    (100.0, 200.0, "100-200"),
+    (200.0, np.inf, "200+"),
+)
+
+HALO_DISTANCE_BANDS = (
+    (0.0, 2.0, "0-2"),
+    (2.0, 5.0, "2-5"),
+    (5.0, 10.0, "5-10"),
+    (10.0, 20.0, "10-20"),
+    (20.0, np.inf, "20+"),
+)
+
 
 def make_foreground_mask(raw, k=6.0, dilate=1):
     """
@@ -421,6 +454,311 @@ def evaluate_example(pred, raw, target, fg_mask, pct=0.1):
         "top_pct_preservation": pred_top / (raw_top + 1e-8),
         "mip_max_error": mip_max_error(pred, raw),
         "false_bright_rate": false_bright_rate(pred, raw, fg_mask),
+    }
+
+
+def _value_bin(value, bins):
+    """Return the fixed half-open bin label containing a scalar value."""
+    for lower, upper, label in bins:
+        if lower <= value < upper:
+            return label
+    return bins[-1][2]
+
+
+def _flat_background_mask(raw, foreground, saturation, percentile=50.0):
+    """Select low-gradient background for high-frequency noise estimates."""
+    gradient = ndimage.gaussian_gradient_magnitude(
+        np.asarray(raw, dtype=np.float32), sigma=1.0
+    )
+    candidates = ~foreground & ~saturation
+    if not candidates.any():
+        return candidates
+    threshold = float(np.percentile(gradient[candidates], percentile))
+    return candidates & (gradient <= threshold)
+
+
+def _edge_metrics(raw_mask, pred_mask, region):
+    """Measure symmetric bright-edge displacement and regional width change."""
+    raw_mask = np.asarray(raw_mask, dtype=bool)
+    pred_mask = np.asarray(pred_mask, dtype=bool)
+    region = np.asarray(region, dtype=bool)
+    raw_edge = raw_mask ^ ndimage.binary_erosion(raw_mask)
+    pred_edge = pred_mask ^ ndimage.binary_erosion(pred_mask)
+    raw_edge &= region
+    pred_edge &= region
+    distances = list()
+    if raw_edge.any() and pred_mask.any():
+        distances.extend(ndimage.distance_transform_edt(~pred_mask)[raw_edge])
+    if pred_edge.any() and raw_mask.any():
+        distances.extend(ndimage.distance_transform_edt(~raw_mask)[pred_edge])
+    edge_displacement = (
+        float(np.mean(distances)) if len(distances) else float("nan")
+    )
+    raw_width = int(np.count_nonzero(raw_mask & region))
+    pred_width = int(np.count_nonzero(pred_mask & region))
+    width_change = (
+        (pred_width - raw_width) / raw_width
+        if raw_width
+        else float("nan")
+    )
+    return edge_displacement, float(width_change)
+
+
+def evaluate_stratified_example(
+    pred,
+    raw,
+    target,
+    fg_mask,
+    brain_id,
+    center,
+    offset=0.0,
+    noise_params=None,
+    max_count=65535.0,
+    saturation_margin=64.0,
+):
+    """Compute legacy, brightness, provenance, saturation, and halo metrics."""
+    pred = np.asarray(pred, dtype=np.float32)
+    raw = np.asarray(raw, dtype=np.float32)
+    target = np.asarray(target, dtype=np.float32)
+    foreground = np.asarray(fg_mask, dtype=bool)
+    offset = float(offset)
+    raw_sensor = raw + offset
+    pred_sensor = pred + offset
+    saturation_threshold = float(max_count) - float(saturation_margin)
+    saturation = raw_sensor >= saturation_threshold
+    flat_background = _flat_background_mask(raw, foreground, saturation)
+    raw_hf = raw - ndimage.gaussian_filter(raw, sigma=1.0)
+    pred_hf = pred - ndimage.gaussian_filter(pred, sigma=1.0)
+    background_noise_std = (
+        float(np.std(raw_hf[flat_background]))
+        if flat_background.any()
+        else float("nan")
+    )
+    foreground_present = bool(foreground.any())
+    foreground_intensity = (
+        float(np.percentile(raw[foreground], 95.0))
+        if foreground_present
+        else float("nan")
+    )
+    foreground_bin = (
+        _value_bin(foreground_intensity, FOREGROUND_INTENSITY_BINS)
+        if foreground_present
+        else "blank"
+    )
+    background_noise_bin = (
+        _value_bin(background_noise_std, BACKGROUND_NOISE_BINS)
+        if np.isfinite(background_noise_std)
+        else "unmeasured"
+    )
+    calibrated_background_sigma = float("nan")
+    if noise_params is not None:
+        params = np.asarray(noise_params, dtype=np.float32)
+        if params.shape == (2,) and np.isfinite(params[1]) and params[1] >= 0:
+            calibrated_background_sigma = float(np.sqrt(params[1]))
+
+    halo = dict()
+    if saturation.any():
+        distance = ndimage.distance_transform_edt(~saturation)
+        core_raw_mean = float(np.mean(raw[saturation]))
+        core_pred_mean = float(np.mean(pred[saturation]))
+        core_preservation = core_pred_mean / (core_raw_mean + 1e-8)
+        bright_threshold = max(
+            float(np.percentile(raw_sensor, 99.0)),
+            saturation_threshold * 0.5,
+        )
+        raw_bright = raw_sensor >= bright_threshold
+        pred_bright = pred_sensor >= bright_threshold
+        for lower, upper, label in HALO_DISTANCE_BANDS:
+            band = (distance >= lower) & (distance < upper)
+            flat_band = band & (
+                flat_background | (saturation if lower == 0 else False)
+            )
+            input_hf_std = (
+                float(np.std(raw_hf[flat_band]))
+                if flat_band.any()
+                else float("nan")
+            )
+            output_hf_std = (
+                float(np.std(pred_hf[flat_band]))
+                if flat_band.any()
+                else float("nan")
+            )
+            edge_displacement, width_change = _edge_metrics(
+                raw_bright, pred_bright, band
+            )
+            raw_mean = float(np.mean(raw[band])) if band.any() else float("nan")
+            pred_mean = (
+                float(np.mean(pred[band])) if band.any() else float("nan")
+            )
+            halo[label] = {
+                "voxel_count": int(np.count_nonzero(band)),
+                "flat_voxel_count": int(np.count_nonzero(flat_band)),
+                "input_hf_std": input_hf_std,
+                "output_hf_std": output_hf_std,
+                "output_input_hf_ratio": output_hf_std / (input_hf_std + 1e-8),
+                "mean_intensity_bias": pred_mean - raw_mean,
+                "intensity_preservation": pred_mean / (raw_mean + 1e-8),
+                "saturated_core_preservation": (
+                    core_preservation if lower == 0 else float("nan")
+                ),
+                "bright_edge_displacement": edge_displacement,
+                "bright_width_change": width_change,
+            }
+    else:
+        for _, _, label in HALO_DISTANCE_BANDS:
+            halo[label] = {
+                "voxel_count": 0,
+                "flat_voxel_count": 0,
+                "input_hf_std": float("nan"),
+                "output_hf_std": float("nan"),
+                "output_input_hf_ratio": float("nan"),
+                "mean_intensity_bias": float("nan"),
+                "intensity_preservation": float("nan"),
+                "saturated_core_preservation": float("nan"),
+                "bright_edge_displacement": float("nan"),
+                "bright_width_change": float("nan"),
+            }
+
+    return {
+        "legacy": evaluate_example(pred, raw, target, foreground),
+        "provenance": {
+            "brain_id": str(brain_id),
+            "center": [int(value) for value in center],
+        },
+        "strata": {
+            "foreground_presence": (
+                "foreground" if foreground_present else "blank"
+            ),
+            "foreground_intensity_bin": foreground_bin,
+            "background_noise_bin": background_noise_bin,
+            "saturation": "saturated" if saturation.any() else "unsaturated",
+        },
+        "patch_metrics": {
+            "foreground_voxel_count": int(np.count_nonzero(foreground)),
+            "foreground_intensity_p95": foreground_intensity,
+            "background_noise_std": background_noise_std,
+            "calibrated_background_sigma": calibrated_background_sigma,
+            "saturated_voxel_count": int(np.count_nonzero(saturation)),
+        },
+        "halo": halo,
+    }
+
+
+def _aggregate_record_group(records):
+    """Aggregate legacy and patch scalars without blank-foreground dilution."""
+    legacy = dict()
+    for key in LEGACY_METRIC_KEYS:
+        eligible = records
+        if key == "fg_mae":
+            eligible = [
+                record
+                for record in records
+                if record["strata"]["foreground_presence"] == "foreground"
+            ]
+        values = [record["legacy"][key] for record in eligible]
+        values = [value for value in values if np.isfinite(value)]
+        legacy[key] = float(np.mean(values)) if values else float("nan")
+    patch_metrics = dict()
+    for key in (
+        "foreground_intensity_p95",
+        "background_noise_std",
+        "calibrated_background_sigma",
+        "saturated_voxel_count",
+    ):
+        values = [record["patch_metrics"][key] for record in records]
+        values = [value for value in values if np.isfinite(value)]
+        patch_metrics[key] = (
+            float(np.mean(values)) if values else float("nan")
+        )
+    return {
+        **legacy,
+        **patch_metrics,
+        "patch_count": len(records),
+        "foreground_patch_count": sum(
+            record["strata"]["foreground_presence"] == "foreground"
+            for record in records
+        ),
+    }
+
+
+def aggregate_stratified_metrics(records):
+    """Aggregate validation records by brain, brightness, noise, and saturation."""
+    if not records:
+        return {"overall": {}, "patches": []}
+
+    def grouped_records(path):
+        groups = dict()
+        for record in records:
+            value = record
+            for key in path:
+                value = value[key]
+            groups.setdefault(str(value), []).append(record)
+        return groups
+
+    def grouped(path):
+        return {
+            label: _aggregate_record_group(group)
+            for label, group in sorted(grouped_records(path).items())
+        }
+
+    def aggregate_halo(group):
+        halo = dict()
+        for _, _, label in HALO_DISTANCE_BANDS:
+            band_rows = [record["halo"][label] for record in group]
+            aggregate = {
+                "voxel_count": int(
+                    sum(row["voxel_count"] for row in band_rows)
+                ),
+                "flat_voxel_count": int(
+                    sum(row["flat_voxel_count"] for row in band_rows)
+                ),
+            }
+            for key in (
+                "input_hf_std",
+                "output_hf_std",
+                "output_input_hf_ratio",
+                "mean_intensity_bias",
+                "intensity_preservation",
+                "saturated_core_preservation",
+                "bright_edge_displacement",
+                "bright_width_change",
+            ):
+                weighted = [
+                    (row[key], row["voxel_count"])
+                    for row in band_rows
+                    if row["voxel_count"] and np.isfinite(row[key])
+                ]
+                denominator = sum(weight for _, weight in weighted)
+                aggregate[key] = (
+                    float(
+                        sum(value * weight for value, weight in weighted)
+                        / denominator
+                    )
+                    if denominator
+                    else float("nan")
+                )
+            halo[label] = aggregate
+        return halo
+
+    brain_groups = grouped_records(("provenance", "brain_id"))
+
+    return {
+        "overall": _aggregate_record_group(records),
+        "by_brain": grouped(("provenance", "brain_id")),
+        "by_foreground_presence": grouped(
+            ("strata", "foreground_presence")
+        ),
+        "by_foreground_intensity": grouped(
+            ("strata", "foreground_intensity_bin")
+        ),
+        "by_background_noise": grouped(("strata", "background_noise_bin")),
+        "by_saturation": grouped(("strata", "saturation")),
+        "halo_distance_bands": aggregate_halo(records),
+        "halo_by_brain": {
+            brain_id: aggregate_halo(group)
+            for brain_id, group in sorted(brain_groups.items())
+        },
+        "patches": records,
     }
 
 

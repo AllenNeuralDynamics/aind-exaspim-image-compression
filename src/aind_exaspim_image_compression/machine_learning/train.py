@@ -28,8 +28,9 @@ from aind_exaspim_image_compression.machine_learning.losses import (
     SignalPreservingLoss,
 )
 from aind_exaspim_image_compression.machine_learning.metrics import (
+    aggregate_stratified_metrics,
     checkpoint_score,
-    evaluate_example,
+    evaluate_stratified_example,
 )
 from aind_exaspim_image_compression.utils import img_util, util
 
@@ -291,30 +292,29 @@ class Trainer:
 
         losses = list()
         cratios = list()
-        metric_rows = list()
+        metric_records = list()
         with torch.no_grad():
             self.model.eval()
             for batch in val_dataloader:
                 # Run model
-                y = batch["target"]
-                raw = batch["raw"]
-                fg_mask = batch["foreground"]
                 hat_y, loss = self.forward_pass(batch)
 
                 # Evaluate result
                 losses.append(loss.detach().cpu())
                 cratios.extend(self.compute_cratios(hat_y))
-                metric_rows.extend(
-                    self.compute_metrics(hat_y, y, raw, fg_mask)
+                metric_records.extend(
+                    self.compute_metrics(
+                        hat_y,
+                        batch,
+                        getattr(val_dataloader.dataset, "brain_ids", []),
+                    )
                 )
 
         # Aggregate results
         loss = float(np.mean(losses))
         cratio = float(np.median(cratios))
-        agg = {
-            k: float(np.mean([row[k] for row in metric_rows]))
-            for k in metric_rows[0]
-        }
+        metric_report = aggregate_stratified_metrics(metric_records)
+        agg = metric_report["overall"]
         score = checkpoint_score(agg, cratio, self.checkpoint_weights)
 
         # Log results
@@ -322,7 +322,15 @@ class Trainer:
         self.writer.add_scalar("val_cratio", cratio, epoch)
         self.writer.add_scalar("val_score", score, epoch)
         for name, value in agg.items():
-            self.writer.add_scalar(f"val_{name}", value, epoch)
+            if np.isscalar(value) and np.isfinite(value):
+                self.writer.add_scalar(f"val_{name}", value, epoch)
+        self._log_stratified_metrics(metric_report, epoch)
+        util.write_json(
+            os.path.join(
+                self.log_dir, f"validation-metrics-epoch-{epoch}.json"
+            ),
+            metric_report,
+        )
 
         # Save every validated checkpoint so the best can be chosen offline.
         # Skip epoch 0: the untrained net emits a near-constant, trivially
@@ -389,7 +397,52 @@ class Trainer:
                 save_mip_png(f"{i}.png", img)
         return cratios
 
-    def compute_metrics(self, hat_y, y, raw, fg_mask):
+    def _metric_saturation_margin(self, brain_id):
+        """Resolve a per-brain margin, falling back to the loss configuration."""
+        provenance = (
+            (self.run_config or {}).get("provenance", {}).get(
+                "noise_models", {}
+            )
+        )
+        margins = provenance.get("saturation_margins") or {}
+        if str(brain_id) in margins:
+            return float(margins[str(brain_id)])
+        count_cfg = (self.loss_config or {}).get("count") or {}
+        return float(count_cfg.get("saturation_margin", 64.0))
+
+    def _log_stratified_metrics(self, report, epoch):
+        """Write compact per-stratum and halo summaries to TensorBoard."""
+        sections = (
+            "by_brain",
+            "by_foreground_presence",
+            "by_foreground_intensity",
+            "by_background_noise",
+            "by_saturation",
+            "halo_distance_bands",
+        )
+        for section in sections:
+            for label, metrics in report.get(section, {}).items():
+                safe_label = str(label).replace("/", "_")
+                for name, value in metrics.items():
+                    if np.isscalar(value) and np.isfinite(value):
+                        self.writer.add_scalar(
+                            f"val_strata/{section}/{safe_label}/{name}",
+                            value,
+                            epoch,
+                        )
+        for brain_id, bands in report.get("halo_by_brain", {}).items():
+            safe_brain_id = str(brain_id).replace("/", "_")
+            for band, metrics in bands.items():
+                for name, value in metrics.items():
+                    if np.isscalar(value) and np.isfinite(value):
+                        self.writer.add_scalar(
+                            f"val_strata/halo_by_brain/{safe_brain_id}/"
+                            f"{band}/{name}",
+                            value,
+                            epoch,
+                        )
+
+    def compute_metrics(self, hat_y, batch, brain_ids):
         """
         Computes per-example neurite-preservation metrics in count space.
 
@@ -397,29 +450,46 @@ class Trainer:
         ----------
         hat_y : torch.Tensor
             Model predictions in the normalized transform domain.
-        y : torch.Tensor
-            BM4D targets in the normalized transform domain.
-        raw : torch.Tensor
-            Raw noisy patches in counts.
-        fg_mask : torch.Tensor
-            Foreground masks (float 0/1).
+        batch : dict[str, torch.Tensor]
+            Validation batch containing targets, raw counts, and provenance.
+        brain_ids : list[str]
+            Indexed brain IDs associated with ``brain_index`` metadata.
 
         Returns
         -------
-        List[dict]
-            One metric dictionary per example in the batch.
+        list[dict]
+            One structured metric/provenance record per example.
         """
         rows = list()
         preds = np.array(hat_y.detach().cpu())
-        targets = np.array(y.detach().cpu())
-        raws = np.array(raw.detach().cpu())
-        masks = np.array(fg_mask.detach().cpu())
+        targets = np.array(batch["target"].detach().cpu())
+        raws = np.array(batch["raw"].detach().cpu())
+        masks = np.array(batch["foreground"].detach().cpu())
+        brain_indices = np.array(batch["brain_index"].detach().cpu())
+        centers = np.array(batch["center"].detach().cpu())
+        offsets = np.array(batch["offset"].detach().cpu())
+        noise_params = np.array(batch["noise_params"].detach().cpu())
         for i in range(preds.shape[0]):
             pred = self.transform.inverse(preds[i, 0, ...])
             target = self.transform.inverse(targets[i, 0, ...])
+            brain_index = int(brain_indices[i])
+            brain_id = (
+                brain_ids[brain_index]
+                if 0 <= brain_index < len(brain_ids)
+                else "legacy"
+            )
             rows.append(
-                evaluate_example(
-                    pred, raws[i, 0, ...], target, masks[i, 0, ...] > 0.5
+                evaluate_stratified_example(
+                    pred,
+                    raws[i, 0, ...],
+                    target,
+                    masks[i, 0, ...] > 0.5,
+                    brain_id=brain_id,
+                    center=centers[i],
+                    offset=offsets[i],
+                    noise_params=noise_params[i],
+                    max_count=self.transform.max_count,
+                    saturation_margin=self._metric_saturation_margin(brain_id),
                 )
             )
         return rows
