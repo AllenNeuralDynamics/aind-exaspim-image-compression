@@ -3,6 +3,7 @@
 import unittest
 
 import numpy as np
+import torch
 
 from aind_exaspim_image_compression.machine_learning.transforms import (
     AnscombeTransform,
@@ -49,6 +50,22 @@ class AsinhTransformTest(unittest.TestCase):
         )
         self.assertLess(abs(float(t.forward(np.array(35.0)))), 0.05)
         self.assertLess(float(t.forward(np.array(0.0))), 0.0)
+
+    def test_inverse_tensor_matches_numpy_and_forces_float32(self):
+        """Differentiable inverse agrees with the floating NumPy inverse."""
+        t = AsinhTransform(offset=35, scale=32)
+        y = torch.tensor([-0.01, 0.0, 0.3, 0.9, 1.0], dtype=torch.float16)
+        actual = t.inverse_tensor(y)
+        expected = t.inverse_float(y.float().numpy())
+        self.assertEqual(actual.dtype, torch.float32)
+        np.testing.assert_allclose(actual.detach().numpy(), expected, rtol=1e-6)
+
+    def test_inverse_tensor_has_finite_saturation_gradients(self):
+        """Asinh inversion remains differentiable around sensor saturation."""
+        t = AsinhTransform(offset=0, scale=32)
+        y = torch.tensor([0.99, 1.0, 1.01], requires_grad=True)
+        t.inverse_tensor(y).sum().backward()
+        self.assertTrue(torch.isfinite(y.grad).all())
 
 
 class AnscombeTransformTest(unittest.TestCase):
@@ -101,6 +118,24 @@ class AnscombeTransformTest(unittest.TestCase):
         self.assertAlmostEqual(
             t.unit_noise_std * t.normalization_constant, 1.0
         )
+
+    def test_inverse_tensor_matches_numpy_and_forces_float32(self):
+        """Tensor GAT inverse matches the configured NumPy denoising inverse."""
+        t = AnscombeTransform(
+            gain=1.8, read_noise=20, offset=0, unbiased_inverse=True
+        )
+        y = torch.tensor([-0.01, 0.0, 0.3, 0.9, 1.0], dtype=torch.float16)
+        actual = t.inverse_tensor(y)
+        expected = t.inverse_float(y.float().numpy())
+        self.assertEqual(actual.dtype, torch.float32)
+        np.testing.assert_allclose(actual.detach().numpy(), expected, rtol=1e-6)
+
+    def test_inverse_tensor_has_finite_saturation_gradients(self):
+        """GAT inversion remains differentiable around sensor saturation."""
+        t = AnscombeTransform(gain=1.8, read_noise=0, offset=0)
+        y = torch.tensor([0.99, 1.0, 1.01], requires_grad=True)
+        t.inverse_tensor(y).sum().backward()
+        self.assertTrue(torch.isfinite(y.grad).all())
 
 
 class LinearClipTransformTest(unittest.TestCase):
@@ -159,6 +194,29 @@ class HelperTest(unittest.TestCase):
         np.testing.assert_allclose(
             shifted.inverse(shifted.forward(values)), values, atol=1
         )
+
+    def test_inverse_tensor_stays_float32_under_autocast(self):
+        """Inverse calculations do not inherit reduced AMP precision."""
+        transforms = (
+            AsinhTransform(scale=32),
+            AnscombeTransform(gain=1.8, read_noise=20),
+            LinearClipTransform(mn=0, mx=1000),
+        )
+        y = torch.tensor([0.5, 1.0], dtype=torch.bfloat16)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            outputs = [transform.inverse_tensor(y) for transform in transforms]
+        for output in outputs:
+            self.assertEqual(output.dtype, torch.float32)
+
+    def test_offset_inverse_tensor_matches_numpy(self):
+        """Composed tensor inversion restores the inference pedestal."""
+        shifted = with_offset(build_transform({"kind": "asinh"}), 120.0)
+        y = torch.tensor([0.0, 0.5, 1.0], requires_grad=True)
+        actual = shifted.inverse_tensor(y)
+        expected = shifted.inverse_float(y.detach().numpy())
+        np.testing.assert_allclose(actual.detach().numpy(), expected, rtol=1e-6)
+        actual.sum().backward()
+        self.assertTrue(torch.isfinite(y.grad).all())
 
     def test_with_offset_is_exact_for_anscombe(self):
         """Anscombe inference also retains its trained normalization factor."""

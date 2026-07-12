@@ -18,6 +18,7 @@ invertible value instead of being flattened by a percentile clip.
 """
 
 import numpy as np
+import torch
 
 
 class IntensityTransform:
@@ -59,6 +60,10 @@ class IntensityTransform:
 
     def inverse_float(self, y):
         """Maps normalized values to unclipped floating-point counts."""
+        raise NotImplementedError
+
+    def inverse_tensor(self, y):
+        """Differentiably maps normalized tensors to float32 counts."""
         raise NotImplementedError
 
 
@@ -132,6 +137,11 @@ class AsinhTransform(IntensityTransform):
         """Maps normalized asinh values to floating-point counts."""
         y = np.asarray(y, dtype=np.float32)
         return self.offset + self.scale * np.sinh(y * self._norm)
+
+    def inverse_tensor(self, y):
+        """Differentiably maps normalized asinh values to float32 counts."""
+        y = y.float()
+        return self.offset + self.scale * torch.sinh(y * self._norm)
 
     def inverse(self, y):
         """
@@ -276,6 +286,15 @@ class AnscombeTransform(IntensityTransform):
             arg - self._c_inv * self.gain ** 2 - self.read_noise ** 2
         ) / self.gain
 
+    def inverse_tensor(self, y):
+        """Differentiably maps normalized Anscombe values to float32 counts."""
+        y = y.float()
+        d = torch.clamp(y, min=0.0) * self._norm
+        arg = (d * self.gain / 2.0) ** 2
+        return self.offset + (
+            arg - self._c_inv * self.gain ** 2 - self.read_noise ** 2
+        ) / self.gain
+
     def inverse(self, y):
         """
         Maps normalized Anscombe values back to raw uint16 counts.
@@ -362,6 +381,11 @@ class LinearClipTransform(IntensityTransform):
         y = np.asarray(y, dtype=np.float32)
         return y * (self.mx - self.mn) + self.mn
 
+    def inverse_tensor(self, y):
+        """Differentiably maps normalized linear values to float32 counts."""
+        y = y.float()
+        return y * (self.mx - self.mn) + self.mn
+
     def inverse(self, y):
         """
         Maps normalized values back to raw uint16 counts.
@@ -413,6 +437,10 @@ class OffsetTransform(IntensityTransform):
     def inverse_float(self, y):
         """Inverts through the trained transform and restores the pedestal."""
         return self.base_transform.inverse_float(y) + self.offset
+
+    def inverse_tensor(self, y):
+        """Differentiably inverts and restores the pedestal in float32."""
+        return self.base_transform.inverse_tensor(y).float() + self.offset
 
     def inverse(self, y):
         """Returns pedestal-restored, physically clipped uint16 counts."""
