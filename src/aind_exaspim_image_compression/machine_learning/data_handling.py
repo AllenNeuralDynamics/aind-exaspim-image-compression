@@ -9,7 +9,6 @@ Routines for loading data during training and inference.
 """
 
 from aind_exaspim_dataset_utils.s3_util import get_img_prefix
-from bm4d import bm4d
 from concurrent.futures import (
     as_completed, ProcessPoolExecutor, ThreadPoolExecutor,
 )
@@ -32,6 +31,13 @@ from aind_exaspim_image_compression.machine_learning.metrics import (
     make_segmentation_mask,
     make_skeleton_mask,
     patch_has_incoherent_segment,
+)
+from aind_exaspim_image_compression.machine_learning.noise_models import (
+    validate_noise_models,
+)
+from aind_exaspim_image_compression.machine_learning.teachers import (
+    TEACHER_MODES,
+    build_teacher,
 )
 from aind_exaspim_image_compression.machine_learning.transforms import (
     build_transform,
@@ -114,6 +120,9 @@ class TrainDataset(Dataset):
         segmentation_dilate=0,
         sigma_bm4d=16,
         skeleton_radius=2,
+        teacher_mode="raw_bm4d",
+        noise_models=None,
+        gat_sigma_multiplier=1.0,
         transform=None,
     ):
         # Call parent class
@@ -140,6 +149,11 @@ class TrainDataset(Dataset):
         self.segmentation_dilate = segmentation_dilate
         self.sigma_bm4d = sigma_bm4d
         self.skeleton_radius = skeleton_radius
+        if teacher_mode not in TEACHER_MODES:
+            raise ValueError(f"unknown teacher mode {teacher_mode!r}")
+        self.teacher_mode = teacher_mode
+        self.noise_models = validate_noise_models(noise_models or {})
+        self.gat_sigma_multiplier = gat_sigma_multiplier
         self.transform = transform or build_transform({"kind": "asinh"})
         self.swc_reader = Reader()
 
@@ -325,8 +339,14 @@ class TrainDataset(Dataset):
             offset subtracted; teacher is the clipped BM4D denoising.
         """
         brain_id, voxel, raw, labels = self.sample_clean(self.read_counts)
-        teacher = bm4d(raw, self.sigma_bm4d)
-        teacher = np.clip(teacher, 0, self.transform.max_count)
+        teacher = build_teacher(
+            raw,
+            self.teacher_mode,
+            self.sigma_bm4d,
+            noise_model=self.noise_models.get(str(brain_id)),
+            max_count=self.transform.max_count,
+            gat_sigma_multiplier=self.gat_sigma_multiplier,
+        )
         fg_mask = self.foreground_mask(brain_id, voxel, raw, labels=labels)
         return raw, teacher, fg_mask
 
@@ -795,7 +815,8 @@ class ValidateDataset(Dataset):
 
     def __init__(
         self, patch_shape, sigma_bm4d=16, transform=None,
-        preserve_foreground=True, offsets=None,
+        preserve_foreground=True, offsets=None, teacher_mode="raw_bm4d",
+        noise_models=None, gat_sigma_multiplier=1.0,
     ):
         """
         Instantiates a ValidateDataset object.
@@ -816,6 +837,13 @@ class ValidateDataset(Dataset):
         offsets : dict, optional
             Per-brain background offsets subtracted from raw patches before
             the transform. Default is None (no subtraction).
+        teacher_mode : str, optional
+            ``raw_bm4d`` for the legacy teacher or ``gat_bm4d`` for the
+            per-brain variance-stabilized teacher. Default is ``raw_bm4d``.
+        noise_models : dict, optional
+            Per-brain noise calibrations required by ``gat_bm4d``.
+        gat_sigma_multiplier : float, optional
+            Multiplier for the calibrated GAT-domain BM4D sigma. Default is 1.
         """
         # Call parent class
         super(ValidateDataset, self).__init__()
@@ -826,6 +854,11 @@ class ValidateDataset(Dataset):
         self.transform = transform or build_transform({"kind": "asinh"})
         self.preserve_foreground = preserve_foreground
         self.offsets = offsets or dict()
+        if teacher_mode not in TEACHER_MODES:
+            raise ValueError(f"unknown teacher mode {teacher_mode!r}")
+        self.teacher_mode = teacher_mode
+        self.noise_models = validate_noise_models(noise_models or {})
+        self.gat_sigma_multiplier = gat_sigma_multiplier
 
         # Data structures
         self.example_ids = list()
@@ -915,8 +948,14 @@ class ValidateDataset(Dataset):
         """
         if raw is None:
             raw = self.read_counts(brain_id, voxel)
-        teacher = bm4d(raw, self.sigma_bm4d)
-        teacher = np.clip(teacher, 0, self.transform.max_count)
+        teacher = build_teacher(
+            raw,
+            self.teacher_mode,
+            self.sigma_bm4d,
+            noise_model=self.noise_models.get(str(brain_id)),
+            max_count=self.transform.max_count,
+            gat_sigma_multiplier=self.gat_sigma_multiplier,
+        )
         if fg_mask is None:
             fg_mask = make_foreground_mask(raw)
         return raw, teacher, fg_mask
@@ -1309,12 +1348,20 @@ def init_datasets(
     segmentation_prefixes_path=None,
     segmentation_dilate=0,
     sigma_bm4d=16,
+    teacher_mode="raw_bm4d",
+    noise_models=None,
+    gat_sigma_multiplier=1.0,
     skeleton_radius=2,
     swc_pointers=None,
     transform_cfg=None,
     preserve_foreground=True,
     offsets=None,
 ):
+    if teacher_mode == "gat_bm4d":
+        noise_models = validate_noise_models(
+            noise_models or {}, required_brain_ids=brain_ids
+        )
+
     # Initializations
     if transform_cfg is None:
         transform_cfg = {"kind": "asinh"}
@@ -1336,12 +1383,18 @@ def init_datasets(
         segmentation_dilate=segmentation_dilate,
         sigma_bm4d=sigma_bm4d,
         skeleton_radius=skeleton_radius,
+        teacher_mode=teacher_mode,
+        noise_models=noise_models,
+        gat_sigma_multiplier=gat_sigma_multiplier,
     )
     val_dataset = ValidateDataset(
         patch_shape,
         sigma_bm4d=sigma_bm4d,
         preserve_foreground=preserve_foreground,
         offsets=offsets,
+        teacher_mode=teacher_mode,
+        noise_models=noise_models,
+        gat_sigma_multiplier=gat_sigma_multiplier,
     )
 
     # Read segmentation path lookup (if applicable)

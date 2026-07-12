@@ -94,6 +94,14 @@ class AnscombeTransformTest(unittest.TestCase):
         expected = 2.0 * np.sqrt(x + 3.0 / 8.0)
         np.testing.assert_allclose(t._gat(x), expected, rtol=1e-5)
 
+    def test_normalized_unit_noise_scale(self):
+        """Normalized noise scale preserves unit GAT-domain variance."""
+        t = AnscombeTransform(gain=1.8, read_noise=20, offset=0)
+        self.assertEqual(t.normalization_constant, t._norm)
+        self.assertAlmostEqual(
+            t.unit_noise_std * t.normalization_constant, 1.0
+        )
+
 
 class LinearClipTransformTest(unittest.TestCase):
     """Tests for LinearClipTransform."""

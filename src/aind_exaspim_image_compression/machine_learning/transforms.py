@@ -220,6 +220,16 @@ class AnscombeTransform(IntensityTransform):
             self._gat(np.asarray(self.max_count, dtype=np.float32))
         )
 
+    @property
+    def normalization_constant(self):
+        """Scale mapping the unnormalized GAT domain to normalized values."""
+        return self._norm
+
+    @property
+    def unit_noise_std(self):
+        """Expected unit-noise standard deviation after normalization."""
+        return 1.0 / self._norm
+
     def _gat(self, x):
         """
         Evaluates the unnormalized generalized Anscombe transform.

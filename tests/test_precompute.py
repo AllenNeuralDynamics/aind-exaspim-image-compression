@@ -66,12 +66,27 @@ class PrecomputeConfigTest(unittest.TestCase):
         write_json.assert_called_once()
         path, config = write_json.call_args.args
         self.assertEqual(path, "/cache/config.json")
-        expected_keys = set(settings) | {"count_dtype", "seed_stream"}
+        expected_keys = set(settings) | {
+            "code_version",
+            "count_dtype",
+            "gat_sigma_multiplier",
+            "noise_models",
+            "noise_models_path",
+            "saturation_margins",
+            "seed_stream",
+            "teacher_mode",
+        }
         self.assertEqual(set(config), expected_keys)
         for key, value in settings.items():
             self.assertEqual(config[key], value)
         self.assertEqual(config["seed_stream"], 0)
         self.assertEqual(config["count_dtype"], "float32")
+        self.assertEqual(config["teacher_mode"], "raw_bm4d")
+        self.assertEqual(config["gat_sigma_multiplier"], 1.0)
+        self.assertEqual(config["sigma_bm4d"], 24)
+        self.assertIsNone(config["noise_models"])
+        self.assertIsNone(config["noise_models_path"])
+        self.assertIsNone(config["saturation_margins"])
         self.assertEqual(
             precompute.__globals__["_COUNT_DTYPE"], np.float32
         )

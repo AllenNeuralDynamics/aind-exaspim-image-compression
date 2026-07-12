@@ -35,26 +35,34 @@ loads with CachedValidateDataset):
     teacher.npy    float32  (N, *patch_shape)   clipped BM4D denoising
     fg.npy         uint8    (N, *patch_shape)   foreground mask (0/1)
     transform.json                              resolved transform cfg
-    config.json                                 full precompute configuration
+    config.json                                 teacher + full cache provenance
 
-The transform cfg is stamped alongside the patches so the training run rebuilds
-the identical transform without touching the cloud. Each worker builds its
-datasets once (via init_datasets) so the large skeleton arrays and cloud
-handles are not re-pickled per patch.
+The transform cfg, teacher mode, BM4D sigma or calibrated per-brain noise
+models, count dtype, and repository commit are stamped alongside the patches.
+Each worker builds its datasets once (via init_datasets) so the large skeleton
+arrays and cloud handles are not re-pickled per patch.
 
 """
 
 import argparse
 import random
+import subprocess
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor
 from numpy.lib.format import open_memmap
 from tqdm import tqdm
 
 from aind_exaspim_image_compression.machine_learning import data_handling
+from aind_exaspim_image_compression.machine_learning.noise_models import (
+    load_noise_models,
+)
 from aind_exaspim_image_compression.machine_learning.transforms import (
     build_transform,
+)
+from aind_exaspim_image_compression.machine_learning.teachers import (
+    TEACHER_MODES,
 )
 from aind_exaspim_image_compression.utils import util
 
@@ -68,6 +76,26 @@ _WORKER_SEED = None
 _WORKER_STREAM = 0
 _WORKER_SPLIT = "train"
 _COUNT_DTYPE = np.float32
+
+# Legacy behavior remains the import-time default for callers/tests that invoke
+# precompute() programmatically instead of entering the CLI block below.
+teacher_mode = "raw_bm4d"
+noise_models_path = None
+gat_sigma_multiplier = 1.0
+
+
+def _code_version():
+    """Return the repository commit identifier when one is available."""
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
 
 
 def _seed_task(index):
@@ -124,6 +152,18 @@ def _sample_counts(index):
 
 
 def precompute():
+    if teacher_mode not in TEACHER_MODES:
+        raise ValueError(
+            f"unknown teacher mode {teacher_mode!r}; expected one of "
+            f"{TEACHER_MODES}"
+        )
+    if teacher_mode == "gat_bm4d" and not noise_models_path:
+        raise ValueError("gat_bm4d requires noise_models_path")
+    if teacher_mode == "gat_bm4d" and (
+        not np.isfinite(gat_sigma_multiplier) or gat_sigma_multiplier <= 0
+    ):
+        raise ValueError("gat_sigma_multiplier must be finite and positive")
+
     # Offset calibration would need a cloud sample the cache is meant to avoid,
     # and each worker would calibrate on its own random sample -- so the cache
     # would mix inconsistent offsets and none would match the stamped cfg. The
@@ -139,7 +179,27 @@ def precompute():
     # is 0 (we draw validation voxels ourselves) and the transform offset stays
     # 0 because per-brain offsets are subtracted per patch.
     brain_ids = util.read_txt(brain_ids_path)
+    noise_models = (
+        load_noise_models(noise_models_path, required_brain_ids=brain_ids)
+        if noise_models_path
+        else None
+    )
     offsets = util.read_json(offsets_path) if offsets_path else None
+    if noise_models is not None:
+        calibrated_offsets = {
+            brain_id: model.offset for brain_id, model in noise_models.items()
+        }
+        if offsets is None:
+            offsets = calibrated_offsets
+        else:
+            for brain_id in brain_ids:
+                if not np.isclose(
+                    offsets[str(brain_id)], calibrated_offsets[str(brain_id)]
+                ):
+                    raise ValueError(
+                        f"offset for brain {brain_id!r} disagrees between "
+                        "offsets_path and noise_models_path"
+                    )
     resolved_transform_cfg = build_transform(transform_cfg).cfg
     init_kwargs = dict(
         brain_ids=brain_ids,
@@ -160,6 +220,9 @@ def precompute():
         segmentation_prefixes_path=segmentation_prefixes_path,
         segmentation_dilate=segmentation_dilate,
         sigma_bm4d=sigma_bm4d,
+        teacher_mode=teacher_mode,
+        noise_models=noise_models,
+        gat_sigma_multiplier=gat_sigma_multiplier,
         skeleton_radius=skeleton_radius,
         swc_pointers=swc_pointers,
         transform_cfg=resolved_transform_cfg,
@@ -185,7 +248,28 @@ def precompute():
             "patch_shape": patch_shape,
             "skeleton_radius": skeleton_radius,
             "segmentation_dilate": segmentation_dilate,
-            "sigma_bm4d": sigma_bm4d,
+            "sigma_bm4d": (
+                sigma_bm4d if teacher_mode == "raw_bm4d" else None
+            ),
+            "teacher_mode": teacher_mode,
+            "gat_sigma_multiplier": gat_sigma_multiplier,
+            "noise_models_path": noise_models_path,
+            "noise_models": (
+                {
+                    brain_id: model.to_dict()
+                    for brain_id, model in sorted(noise_models.items())
+                }
+                if noise_models is not None
+                else None
+            ),
+            "saturation_margins": (
+                {
+                    brain_id: model.saturation_margin
+                    for brain_id, model in sorted(noise_models.items())
+                }
+                if noise_models is not None
+                else None
+            ),
             "reject_incoherent_patches": reject_incoherent_patches,
             "coherence_min_autocorr": coherence_min_autocorr,
             "coherence_max_highfreq_frac": coherence_max_highfreq_frac,
@@ -199,6 +283,7 @@ def precompute():
             "seed_stream": _SEED_STREAMS[split],
             "num_workers": num_workers,
             "count_dtype": np.dtype(_COUNT_DTYPE).name,
+            "code_version": _code_version(),
         },
     )
     shape = (n_patches,) + tuple(patch_shape)
@@ -254,6 +339,7 @@ if __name__ == "__main__":
     img_prefixes_path = "/data/exaspim_image_prefixes.json"
     segmentation_prefixes_path = "/data/exaspim_segmentation_prefixes.json"
     offsets_path = "/data/exaspim_background_offsets.json"
+    noise_models_path = None
 
     # SWC pointer (shared)
     swc_pointers = {
@@ -270,6 +356,13 @@ if __name__ == "__main__":
         "kind": "asinh",
         "params": {"offset": 0.0, "scale": 32.0},
     }
+
+    # Teacher experiment. raw_bm4d preserves the existing count-space teacher.
+    # For gat_bm4d, point noise_models_path at estimate_noise_models.py output;
+    # its per-brain offsets are used when offsets_path is None. Values above 1
+    # for gat_sigma_multiplier intentionally smooth more than the fitted noise.
+    teacher_mode = "raw_bm4d"
+    gat_sigma_multiplier = 1.0
 
     # Sampling / patch parameters (shared)
     foreground_sampling_rate = 0.5
