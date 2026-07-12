@@ -18,7 +18,7 @@ class CachedTrainingTest(unittest.TestCase):
         script = Path(__file__).parents[1] / "scripts" / "train_bm4dnet.py"
         cls.namespace = runpy.run_path(str(script))
 
-    def _make_cache(self, root, name, transform=None, omit=()):
+    def _make_cache(self, root, name, transform=None, config=None, omit=()):
         """Creates the minimal on-disk cache contract for a test."""
         cache_dir = root / name
         cache_dir.mkdir()
@@ -32,6 +32,8 @@ class CachedTrainingTest(unittest.TestCase):
             "fg.npy": b"",
             "transform.json": json.dumps(transform),
         }
+        if config is not None:
+            files["config.json"] = json.dumps(config)
         for filename, contents in files.items():
             if filename in omit:
                 continue
@@ -90,6 +92,31 @@ class CachedTrainingTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "different transforms"):
                 load_transform(str(train_cache), str(val_cache))
+
+    def test_cache_provenance_hash_is_stable_and_mismatch_is_rejected(self):
+        """Cache IDs are deterministic and teacher mismatches fail early."""
+        cache_provenance = self.namespace["_cache_provenance"]
+        experiment_provenance = self.namespace["_experiment_provenance"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {
+                "teacher_mode": "raw_bm4d",
+                "sigma_bm4d": 24,
+                "count_dtype": "float32",
+            }
+            train_cache = self._make_cache(root, "train", config=config)
+            val_cache = self._make_cache(root, "val", config=config)
+            train_record = cache_provenance(str(train_cache))
+            val_record = cache_provenance(str(val_cache))
+            self.assertEqual(
+                train_record["config_sha256"], val_record["config_sha256"]
+            )
+
+            (val_cache / "config.json").write_text(
+                json.dumps({**config, "sigma_bm4d": 16})
+            )
+            with self.assertRaisesRegex(ValueError, "sigma_bm4d"):
+                experiment_provenance(str(train_cache), str(val_cache))
 
     def test_training_uses_only_cached_datasets(self):
         """Training constructs both cache adapters and records cache config."""
@@ -159,6 +186,9 @@ class CachedTrainingTest(unittest.TestCase):
                 self.assertEqual(config["train_cache_dir"], str(train_cache))
                 self.assertEqual(config["val_cache_dir"], str(val_cache))
                 self.assertEqual(config["transform_cfg"], transform.cfg)
+                self.assertIn("provenance", config)
+                self.assertIn("train", config["provenance"]["caches"])
+                self.assertIn("validation", config["provenance"]["caches"])
                 self.assertNotIn("brain_ids_path", config)
                 self.assertNotIn("sigma_bm4d", config)
         finally:

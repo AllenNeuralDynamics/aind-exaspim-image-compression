@@ -131,6 +131,12 @@ class ArchitectureRegressionTest(unittest.TestCase):
             )
             try:
                 trainer.transform = checkpoint_transform
+                trainer.save_config(
+                    {
+                        "transform_cfg": checkpoint_transform.cfg,
+                        "provenance": {"caches": {"train": "cache-id"}},
+                    }
+                )
                 trainer.save_model(epoch=0, score=1.0)
                 checkpoint_path = os.path.join(
                     trainer.log_dir,
@@ -142,6 +148,14 @@ class ArchitectureRegressionTest(unittest.TestCase):
                 )
                 checkpoint = torch.load(checkpoint_path, map_location="cpu")
                 self.assertEqual(checkpoint["model_config"], model.config)
+                self.assertEqual(
+                    checkpoint["run_config"]["transform_cfg"],
+                    checkpoint_transform.cfg,
+                )
+                self.assertEqual(
+                    checkpoint["provenance"]["caches"]["train"],
+                    "cache-id",
+                )
 
                 trainer.load_pretrained_weights(checkpoint_path)
                 different_transform = build_transform(
@@ -150,6 +164,47 @@ class ArchitectureRegressionTest(unittest.TestCase):
                 dataset = SimpleNamespace(transform=different_transform)
                 with self.assertRaisesRegex(ValueError, "transform"):
                     trainer.run(dataset, dataset)
+            finally:
+                trainer.writer.close()
+
+    def test_resume_rejects_input_channel_mismatch(self):
+        """Input-channel incompatibility is reported before loading weights."""
+        class ConfiguredModel(torch.nn.Module):
+            def __init__(self, in_channels):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+                self.config = {
+                    "width_multiplier": 1,
+                    "trilinear": True,
+                    "residual": True,
+                    "in_channels": in_channels,
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = Trainer(
+                directory,
+                device="cpu",
+                model=ConfiguredModel(2),
+                max_epochs=0,
+                use_amp=False,
+            )
+            checkpoint = {
+                "model": {},
+                "model_config": {
+                    "width_multiplier": 1,
+                    "trilinear": True,
+                    "residual": True,
+                    "in_channels": 1,
+                },
+            }
+            try:
+                with patch(
+                    "aind_exaspim_image_compression.machine_learning."
+                    "train.torch.load",
+                    return_value=checkpoint,
+                ):
+                    with self.assertRaisesRegex(ValueError, "input-channel"):
+                        trainer.load_pretrained_weights("checkpoint.pth")
             finally:
                 trainer.writer.close()
 

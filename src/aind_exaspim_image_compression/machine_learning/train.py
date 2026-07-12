@@ -120,6 +120,7 @@ class Trainer:
         self.num_workers = num_workers
         self.prefetch = prefetch
         self.val_every = max(1, int(val_every))
+        self.run_config = None
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
         self.criterion = (
@@ -149,6 +150,7 @@ class Trainer:
         self.best_score = np.inf
         self.model = model.to(device) if model else UNet().to(device)
         self._resume_transform_cfg = None
+        self._resume_run_config = None
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
         # T_max spans the whole run so the cosine anneals once. With a small
         # T_max the LR returns to its peak every 2*T_max epochs, and each
@@ -437,13 +439,36 @@ class Trainer:
             current_model_cfg = getattr(self.model, "config", None)
             if (
                 checkpoint_model_cfg is not None
-                and checkpoint_model_cfg != current_model_cfg
+                and current_model_cfg is not None
+            ):
+                checkpoint_input_channels = checkpoint_model_cfg.get(
+                    "in_channels", 1
+                )
+                current_input_channels = current_model_cfg.get(
+                    "in_channels", 1
+                )
+                if checkpoint_input_channels != current_input_channels:
+                    raise ValueError(
+                        "resume checkpoint input-channel configuration does "
+                        "not match the configured model"
+                    )
+                normalized_checkpoint_cfg = dict(checkpoint_model_cfg)
+                normalized_current_cfg = dict(current_model_cfg)
+                normalized_checkpoint_cfg.setdefault("in_channels", 1)
+                normalized_current_cfg.setdefault("in_channels", 1)
+            else:
+                normalized_checkpoint_cfg = checkpoint_model_cfg
+                normalized_current_cfg = current_model_cfg
+            if (
+                normalized_checkpoint_cfg is not None
+                and normalized_checkpoint_cfg != normalized_current_cfg
             ):
                 raise ValueError(
                     "resume checkpoint model configuration does not match "
                     "the configured model"
                 )
             self._resume_transform_cfg = ckpt.get("transform")
+            self._resume_run_config = ckpt.get("run_config")
             state_dict = ckpt["model"]
         else:
             state_dict = ckpt
@@ -479,6 +504,7 @@ class Trainer:
             "model_config": getattr(self.model, "config", None),
         }
         record.update(config)
+        self.run_config = record
         util.write_json(os.path.join(self.log_dir, "config.json"), record)
 
     def save_model(self, epoch, score):
@@ -502,6 +528,12 @@ class Trainer:
                 "model_config": getattr(self.model, "config", None),
                 "transform": getattr(self.transform, "cfg", None),
                 "loss_config": self.loss_config,
+                "run_config": self.run_config,
+                "provenance": (
+                    self.run_config.get("provenance")
+                    if self.run_config is not None
+                    else None
+                ),
             },
             path,
         )

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 
 from aind_exaspim_image_compression.machine_learning import data_handling
@@ -13,6 +15,101 @@ os.environ["GRPC_VERBOSITY"] = "ERROR"
 os.environ["GRPC_TRACE"] = ""
 
 _REQUIRED_CACHE_FILES = ("raw.npy", "teacher.npy", "fg.npy", "transform.json")
+
+
+def _cache_provenance(cache_dir):
+    """Return a stable config hash and complete cache-generation record."""
+    config_path = os.path.join(cache_dir, "config.json")
+    config = util.read_json(config_path) if os.path.isfile(config_path) else None
+    transform = util.read_json(os.path.join(cache_dir, "transform.json"))
+    hash_payload = {"config": config, "transform": transform}
+    digest = hashlib.sha256(
+        json.dumps(
+            hash_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "path": os.path.abspath(cache_dir),
+        "config_sha256": digest,
+        "config": config,
+    }
+
+
+def _validate_cache_provenance(train_record, val_record):
+    """Reject train/validation caches with incompatible generation settings."""
+    train_cfg = train_record["config"]
+    val_cfg = val_record["config"]
+    if train_cfg is None or val_cfg is None:
+        return
+    shared_keys = (
+        "transform_cfg",
+        "teacher_mode",
+        "sigma_bm4d",
+        "gat_sigma_multiplier",
+        "noise_models",
+        "saturation_margins",
+        "count_dtype",
+        "heldout_regions",
+    )
+    mismatched = [
+        key
+        for key in shared_keys
+        if key in train_cfg and key in val_cfg and train_cfg[key] != val_cfg[key]
+    ]
+    if mismatched:
+        raise ValueError(
+            "train and validation caches have incompatible provenance: "
+            + ", ".join(mismatched)
+        )
+
+
+def _experiment_provenance(train_cache_dir, val_cache_dir):
+    """Assemble cache, teacher, noise, sampling, and held-out provenance."""
+    train_record = _cache_provenance(train_cache_dir)
+    val_record = _cache_provenance(val_cache_dir)
+    _validate_cache_provenance(train_record, val_record)
+    train_source = train_record["config"] or {}
+    val_source = val_record["config"] or {}
+
+    def sampling_record(source):
+        return {
+            key: source.get(key)
+            for key in (
+                "brain_sampling_weights",
+                "brain_sampling_distribution",
+                "sampling_rois_path",
+                "sampling_rois",
+                "bright_sampling_weights",
+                "exclude_heldout",
+            )
+        }
+
+    return {
+        "caches": {"train": train_record, "validation": val_record},
+        "teacher": {
+            key: train_source.get(key)
+            for key in (
+                "teacher_mode",
+                "sigma_bm4d",
+                "gat_sigma_multiplier",
+            )
+        },
+        "noise_models": {
+            "source_path": train_source.get("noise_models_path"),
+            "models": train_source.get("noise_models"),
+            "saturation_margins": train_source.get("saturation_margins"),
+        },
+        "sampling": {
+            "train": sampling_record(train_source),
+            "validation": sampling_record(val_source),
+        },
+        "heldout_regions": {
+            "source_path": train_source.get("heldout_regions_path"),
+            "regions": train_source.get("heldout_regions"),
+        },
+    }
 
 
 def _load_cached_transform(train_cache_dir, val_cache_dir):
@@ -55,6 +152,7 @@ def train(train_cache_dir, val_cache_dir):
     # Per-brain offsets and the BM4D teacher are already baked into the cached
     # counts. Both caches must use the identical count-space transform.
     transform = _load_cached_transform(train_cache_dir, val_cache_dir)
+    provenance = _experiment_provenance(train_cache_dir, val_cache_dir)
     configured_loss = globals().get(
         "loss_cfg",
         {
@@ -118,6 +216,7 @@ def train(train_cache_dir, val_cache_dir):
             "n_train_examples_per_epoch": n_train_examples_per_epoch,
             "preserve_foreground": preserve_foreground,
             "loss_config": criterion.cfg,
+            "provenance": provenance,
         }
     )
 
