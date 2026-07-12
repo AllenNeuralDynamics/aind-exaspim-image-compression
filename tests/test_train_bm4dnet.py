@@ -44,6 +44,50 @@ class CachedTrainingTest(unittest.TestCase):
                 path.write_text(contents)
         return cache_dir
 
+    @staticmethod
+    def _experiment_config(train_cache, val_cache):
+        """Return a minimal serializable experiment configuration."""
+        return {
+            "paths": {
+                "output_dir": "/results",
+                "train_cache_dir": str(train_cache),
+                "val_cache_dir": str(val_cache),
+                "resume_path": None,
+            },
+            "teacher": {"mode": None},
+            "transform": {"override": None},
+            "loss": {
+                "legacy_weight": 1.0,
+                "count_weight": 0.0,
+                "legacy": {"fg_weight": 0.0},
+            },
+            "model": {
+                "in_channels": 1,
+                "width_multiplier": 1,
+                "trilinear": True,
+                "residual": True,
+            },
+            "noise_model_path": None,
+            "sampling": {
+                "brain_sampling_weights": None,
+                "sampling_rois": None,
+                "train_regions": None,
+                "validation_regions": None,
+            },
+            "seed": 42,
+            "training": {
+                "batch_size": 2,
+                "device": "cpu",
+                "use_amp": False,
+                "lr": 1e-3,
+                "max_epochs": 3,
+                "n_train_examples_per_epoch": 7,
+                "val_every": 2,
+            },
+            "target": {"preserve_foreground": True},
+            "checkpoint_weights": {"fg_mae": 1.0},
+        }
+
     def test_both_cache_paths_are_required(self):
         """Neither cache may be omitted from a training run."""
         load_transform = self.namespace["_load_cached_transform"]
@@ -93,6 +137,60 @@ class CachedTrainingTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different transforms"):
                 load_transform(str(train_cache), str(val_cache))
 
+    def test_explicit_transform_override_records_original_and_resolved(self):
+        """A permitted override is applied only after cache validation."""
+        resolve = self.namespace["_resolve_cached_transform"]
+        override = {
+            "kind": "asinh",
+            "params": {"offset": 0.0, "scale": 60.0},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train_cache = self._make_cache(root, "train")
+            val_cache = self._make_cache(root, "val")
+            transform, record = resolve(
+                str(train_cache), str(val_cache), override
+            )
+        self.assertEqual(transform.scale, 60.0)
+        self.assertEqual(record["cache_transform_cfg"]["params"]["scale"], 32.0)
+        self.assertEqual(record["transform_override_cfg"], override)
+        self.assertEqual(record["resolved_transform_cfg"], override)
+
+    def test_override_cannot_hide_cache_mismatch(self):
+        """Original cache transforms are compared before override application."""
+        resolve = self.namespace["_resolve_cached_transform"]
+        override = {"kind": "asinh", "params": {"scale": 60.0}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train_cache = self._make_cache(root, "train")
+            val_cache = self._make_cache(
+                root,
+                "val",
+                transform={"kind": "asinh", "params": {"scale": 16.0}},
+            )
+            with self.assertRaisesRegex(ValueError, "different transforms"):
+                resolve(str(train_cache), str(val_cache), override)
+
+    def test_override_cannot_change_offset_or_physical_range(self):
+        """Only mappings of the existing offset-subtracted count range apply."""
+        resolve = self.namespace["_resolve_cached_transform"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train_cache = self._make_cache(root, "train")
+            val_cache = self._make_cache(root, "val")
+            with self.assertRaisesRegex(ValueError, "offset must be zero"):
+                resolve(
+                    str(train_cache),
+                    str(val_cache),
+                    {"kind": "asinh", "params": {"offset": 1.0}},
+                )
+            with self.assertRaisesRegex(ValueError, "max_count"):
+                resolve(
+                    str(train_cache),
+                    str(val_cache),
+                    {"kind": "asinh", "params": {"max_count": 1000}},
+                )
+
     def test_cache_provenance_hash_is_stable_and_mismatch_is_rejected(self):
         """Cache IDs are deterministic and teacher mismatches fail early."""
         cache_provenance = self.namespace["_cache_provenance"]
@@ -121,82 +219,74 @@ class CachedTrainingTest(unittest.TestCase):
     def test_training_uses_only_cached_datasets(self):
         """Training constructs both cache adapters and records cache config."""
         train = self.namespace["train"]
-        globals_ = train.__globals__
-        settings = {
-            "output_dir": "/results",
-            "batch_size": 2,
-            "lr": 1e-3,
-            "max_epochs": 3,
-            "model": object(),
-            "fg_weight": 0,
-            "checkpoint_weights": {"fg_mae": 1.0},
-            "val_every": 2,
-            "preserve_foreground": True,
-            "n_train_examples_per_epoch": 7,
-            "resume_path": None,
-        }
-        previous = {key: globals_.get(key) for key in settings}
-        globals_.update(settings)
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                train_cache = self._make_cache(root, "train")
-                val_cache = self._make_cache(root, "val")
-                transform = self.namespace["_load_cached_transform"](
-                    str(train_cache), str(val_cache)
-                )
-                train_dataset = SimpleNamespace(
-                    raw=[object(), object()], transform=transform
-                )
-                val_dataset = MagicMock()
-                val_dataset.__len__.return_value = 3
-                val_dataset.transform = transform
-                trainer = MagicMock()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train_cache = self._make_cache(root, "train")
+            val_cache = self._make_cache(root, "val")
+            experiment = self._experiment_config(train_cache, val_cache)
+            transform = self.namespace["_load_cached_transform"](
+                str(train_cache), str(val_cache)
+            )
+            train_dataset = SimpleNamespace(
+                raw=[object(), object()], transform=transform
+            )
+            val_dataset = MagicMock()
+            val_dataset.__len__.return_value = 3
+            val_dataset.transform = transform
+            trainer = MagicMock()
 
-                data_handling = self.namespace["data_handling"]
-                with patch.object(
-                    data_handling,
-                    "CachedPatchDataset",
-                    return_value=train_dataset,
-                ) as cached_train, patch.object(
-                    data_handling,
-                    "CachedValidateDataset",
-                    return_value=val_dataset,
-                ) as cached_val, patch.object(
-                    data_handling, "init_datasets"
-                ) as init_datasets, patch.dict(
-                    globals_, {"Trainer": MagicMock(return_value=trainer)}
-                ):
-                    train(str(train_cache), str(val_cache))
+            data_handling = self.namespace["data_handling"]
+            with patch.object(
+                data_handling,
+                "CachedPatchDataset",
+                return_value=train_dataset,
+            ) as cached_train, patch.object(
+                data_handling,
+                "CachedValidateDataset",
+                return_value=val_dataset,
+            ) as cached_val, patch.object(
+                self.namespace["util"], "mkdir"
+            ), patch.dict(
+                train.__globals__,
+                {
+                    "Trainer": MagicMock(return_value=trainer),
+                    "UNet": MagicMock(return_value=object()),
+                },
+            ):
+                train(experiment)
 
-                init_datasets.assert_not_called()
-                cached_train.assert_called_once_with(
-                    str(train_cache),
-                    transform=ANY,
-                    preserve_foreground=True,
-                    n_examples_per_epoch=7,
-                )
-                cached_val.assert_called_once_with(
-                    str(val_cache),
-                    transform=ANY,
-                    preserve_foreground=True,
-                )
-                trainer.run.assert_called_once_with(train_dataset, val_dataset)
-                config = trainer.save_config.call_args.args[0]
-                self.assertEqual(config["train_cache_dir"], str(train_cache))
-                self.assertEqual(config["val_cache_dir"], str(val_cache))
-                self.assertEqual(config["transform_cfg"], transform.cfg)
-                self.assertIn("provenance", config)
-                self.assertIn("train", config["provenance"]["caches"])
-                self.assertIn("validation", config["provenance"]["caches"])
-                self.assertNotIn("brain_ids_path", config)
-                self.assertNotIn("sigma_bm4d", config)
-        finally:
-            for key, value in previous.items():
-                if value is None:
-                    globals_.pop(key, None)
-                else:
-                    globals_[key] = value
+            cached_train.assert_called_once_with(
+                str(train_cache),
+                transform=ANY,
+                preserve_foreground=True,
+                n_examples_per_epoch=7,
+            )
+            cached_val.assert_called_once_with(
+                str(val_cache),
+                transform=ANY,
+                preserve_foreground=True,
+            )
+            trainer.run.assert_called_once_with(train_dataset, val_dataset)
+            config = trainer.save_config.call_args.args[0]
+            self.assertEqual(config["train_cache_dir"], str(train_cache))
+            self.assertEqual(config["val_cache_dir"], str(val_cache))
+            self.assertEqual(config["transform_cfg"], transform.cfg)
+            self.assertEqual(config["experiment"], experiment)
+            self.assertIsNone(
+                config["transform_record"]["transform_override_cfg"]
+            )
+            self.assertIn("provenance", config)
+
+    def test_top_level_experiment_configuration_has_required_sections(self):
+        """The executable script exposes one complete serializable object."""
+        config = self.namespace["EXPERIMENT_CONFIG"]
+        self.namespace["_validate_experiment_config"](config)
+        self.assertEqual(config["model"]["in_channels"], 1)
+        self.assertIn("teacher", config)
+        self.assertIn("noise_model_path", config)
+        self.assertIn("train_regions", config["sampling"])
+        self.assertIn("validation_regions", config["sampling"])
+        json.dumps(config)
 
 
 if __name__ == "__main__":
