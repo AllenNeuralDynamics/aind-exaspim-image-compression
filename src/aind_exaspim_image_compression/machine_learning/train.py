@@ -24,6 +24,7 @@ from skimage import io
 from aind_exaspim_image_compression.machine_learning.unet3d import UNet
 from aind_exaspim_image_compression.machine_learning.data_handling import DataLoader
 from aind_exaspim_image_compression.machine_learning.losses import (
+    CompositeDenoisingLoss,
     SignalPreservingLoss,
 )
 from aind_exaspim_image_compression.machine_learning.metrics import (
@@ -73,6 +74,7 @@ class Trainer:
         use_amp=True,
         checkpoint_weights=None,
         fg_weight=20.0,
+        criterion=None,
         num_workers=None,
         prefetch=2,
         val_every=1,
@@ -96,6 +98,9 @@ class Trainer:
             Model to be trained on the given datasets. Default is None.
         use_amp : bool, optional
             Indication of whether to use mixed precision. Default is True.
+        criterion : torch.nn.Module, optional
+            Configured denoising criterion. When omitted, the legacy
+            SignalPreservingLoss is constructed from ``fg_weight``.
         val_every : int, optional
             Run validation (and checkpoint selection) every this many epochs;
             the final epoch is always validated. The count-space metrics are
@@ -117,7 +122,29 @@ class Trainer:
         self.val_every = max(1, int(val_every))
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
-        self.criterion = SignalPreservingLoss(fg_weight=fg_weight)
+        self.criterion = (
+            criterion
+            if criterion is not None
+            else SignalPreservingLoss(fg_weight=fg_weight)
+        )
+        self.loss_config = getattr(self.criterion, "cfg", None)
+        if self.loss_config is None:
+            self.loss_config = {
+                "legacy_weight": 1.0,
+                "count_weight": 0.0,
+                "legacy": {
+                    "fg_weight": self.criterion.fg_weight,
+                    "eps": self.criterion.eps,
+                },
+                "count": {
+                    "sigma_floor": 2.0,
+                    "saturation_margin": 64,
+                    "saturation_dilate": 0,
+                    "max_count": 65535.0,
+                    "standardized_error_cap": None,
+                    "eps": 1e-3,
+                },
+            }
         self.checkpoint_weights = checkpoint_weights
         self.best_score = np.inf
         self.model = model.to(device) if model else UNet().to(device)
@@ -223,9 +250,7 @@ class Trainer:
         self.model.train()
         for batch in train_dataloader:
             # Forward pass
-            hat_y, loss = self.forward_pass(
-                batch["input"], batch["target"], batch["foreground"]
-            )
+            hat_y, loss = self.forward_pass(batch)
 
             # Backward pass (loss-scaled for AMP stability)
             self.optimizer.zero_grad()
@@ -272,9 +297,7 @@ class Trainer:
                 y = batch["target"]
                 raw = batch["raw"]
                 fg_mask = batch["foreground"]
-                hat_y, loss = self.forward_pass(
-                    batch["input"], y, fg_mask
-                )
+                hat_y, loss = self.forward_pass(batch)
 
                 # Evaluate result
                 losses.append(loss.detach().cpu())
@@ -311,18 +334,14 @@ class Trainer:
             self.save_model(epoch, score)
         return loss, cratio, is_best
 
-    def forward_pass(self, x, y, fg_mask):
+    def forward_pass(self, batch):
         """
         Performs a forward pass through the model and computes loss.
 
         Parameters
         ----------
-        x : torch.Tensor
-            Input tensor with shape (B, C, D, H, W).
-        y : torch.Tensor
-            Target tensor with shape (B, C, D, H, W).
-        fg_mask : torch.Tensor
-            Foreground mask (0/1) with shape (B, C, D, H, W).
+        batch : dict[str, torch.Tensor]
+            Dictionary containing model fields and optional count metadata.
 
         Returns
         -------
@@ -332,11 +351,29 @@ class Trainer:
             Computed loss value.
         """
         with self.autocast:
-            x = x.to(self.device)
-            y = y.to(self.device)
-            fg_mask = fg_mask.to(self.device)
+            x = batch["input"].to(self.device)
+            y = batch["target"].to(self.device)
+            fg_mask = batch["foreground"].to(self.device)
             hat_y = self.model(x)
-            loss = self.criterion(hat_y, y, fg_mask)
+            if isinstance(self.criterion, CompositeDenoisingLoss):
+                optional = {
+                    name: batch[name].to(self.device)
+                    for name in (
+                        "target_counts", "raw", "noise_params", "offset"
+                    )
+                    if name in batch
+                }
+                loss = self.criterion(
+                    hat_y,
+                    y,
+                    fg_mask,
+                    target_counts=optional.get("target_counts"),
+                    raw_counts=optional.get("raw"),
+                    noise_params=optional.get("noise_params"),
+                    offset=optional.get("offset"),
+                )
+            else:
+                loss = self.criterion(hat_y, y, fg_mask)
             return hat_y, loss
 
     # --- Helpers ---
@@ -435,6 +472,7 @@ class Trainer:
             "prefetch": self.prefetch,
             "val_every": self.val_every,
             "fg_weight": getattr(self.criterion, "fg_weight", None),
+            "loss_config": self.loss_config,
             "checkpoint_weights": self.checkpoint_weights,
             "lr": self.optimizer.param_groups[0]["lr"],
             "model": type(self.model).__name__,
@@ -463,6 +501,7 @@ class Trainer:
                 "model": self.model.state_dict(),
                 "model_config": getattr(self.model, "config", None),
                 "transform": getattr(self.transform, "cfg", None),
+                "loss_config": self.loss_config,
             },
             path,
         )

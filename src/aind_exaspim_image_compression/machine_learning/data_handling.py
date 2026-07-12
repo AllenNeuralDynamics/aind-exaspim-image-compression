@@ -224,6 +224,12 @@ def build_training_example(
 
 def build_example_record(transform, preserve_foreground, record):
     """Add transformed model fields to a count-space patch record."""
+    foreground_mask = np.asarray(record["foreground"]).astype(bool)
+    target_counts = (
+        np.where(foreground_mask, record["raw"], record["teacher"])
+        if preserve_foreground
+        else record["teacher"]
+    )
     x, y, foreground = build_training_example(
         transform,
         preserve_foreground,
@@ -234,6 +240,7 @@ def build_example_record(transform, preserve_foreground, record):
     return {
         "input": x,
         "target": y,
+        "target_counts": np.asarray(target_counts, dtype=np.float32),
         "raw": np.asarray(record["raw"], dtype=np.float32),
         "teacher": np.asarray(record["teacher"], dtype=np.float32),
         "foreground": foreground,
@@ -1864,7 +1871,12 @@ class DataLoader:
             raise ValueError("dataset examples have inconsistent fields")
 
         patch_fields = {
-            "input", "target", "raw", "teacher", "foreground"
+            "input",
+            "target",
+            "target_counts",
+            "raw",
+            "teacher",
+            "foreground",
         }
         batch = dict()
         for key in keys:

@@ -1,6 +1,7 @@
 import os
 
 from aind_exaspim_image_compression.machine_learning import data_handling
+from aind_exaspim_image_compression.machine_learning.losses import build_loss
 from aind_exaspim_image_compression.machine_learning.train import Trainer
 from aind_exaspim_image_compression.machine_learning.transforms import (
     build_transform,
@@ -54,16 +55,33 @@ def train(train_cache_dir, val_cache_dir):
     # Per-brain offsets and the BM4D teacher are already baked into the cached
     # counts. Both caches must use the identical count-space transform.
     transform = _load_cached_transform(train_cache_dir, val_cache_dir)
+    configured_loss = globals().get(
+        "loss_cfg",
+        {
+            "legacy_weight": 1.0,
+            "count_weight": 0.0,
+            "legacy": {"fg_weight": fg_weight},
+        },
+    )
+    criterion = build_loss(configured_loss, transform)
+    require_noise_metadata = criterion.requires_count_metadata
+    train_kwargs = {}
+    val_kwargs = {}
+    if require_noise_metadata:
+        train_kwargs["require_noise_metadata"] = True
+        val_kwargs["require_noise_metadata"] = True
     train_dataset = data_handling.CachedPatchDataset(
         train_cache_dir,
         transform=transform,
         preserve_foreground=preserve_foreground,
         n_examples_per_epoch=n_train_examples_per_epoch,
+        **train_kwargs,
     )
     val_dataset = data_handling.CachedValidateDataset(
         val_cache_dir,
         transform=transform,
         preserve_foreground=preserve_foreground,
+        **val_kwargs,
     )
     print("Transform:", transform.cfg)
     print(
@@ -83,6 +101,7 @@ def train(train_cache_dir, val_cache_dir):
         max_epochs=max_epochs,
         model=model,
         fg_weight=fg_weight,
+        criterion=criterion,
         checkpoint_weights=checkpoint_weights,
         num_workers=0,
         val_every=val_every,
@@ -98,6 +117,7 @@ def train(train_cache_dir, val_cache_dir):
             "transform_cfg": transform.cfg,
             "n_train_examples_per_epoch": n_train_examples_per_epoch,
             "preserve_foreground": preserve_foreground,
+            "loss_config": criterion.cfg,
         }
     )
 
@@ -148,6 +168,22 @@ if __name__ == "__main__":
     # background denoising, not foreground copying, dominates the loss.
     fg_weight = 0
     preserve_foreground = True
+
+    # Loss A/B mode. Keep cache paths, sampling, seeds, and held-out regions
+    # fixed when comparing these weights. count_weight > 0 requires a Part 3
+    # cache with finite per-patch noise metadata.
+    loss_cfg = {
+        "legacy_weight": 1.0,
+        "count_weight": 0.0,
+        "legacy": {"fg_weight": fg_weight, "eps": 1e-3},
+        "count": {
+            "sigma_floor": 2.0,
+            "saturation_margin": 64,
+            "saturation_dilate": 1,
+            "standardized_error_cap": None,
+            "eps": 1e-3,
+        },
+    }
 
     # Checkpoint selection (Part C). None => fidelity-only (cratio weight 0),
     # which cannot see compression and happily selects a non-denoising model

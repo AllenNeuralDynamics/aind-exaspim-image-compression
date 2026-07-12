@@ -51,6 +51,7 @@ class CacheMetadataTest(unittest.TestCase):
             {
                 "input",
                 "target",
+                "target_counts",
                 "raw",
                 "teacher",
                 "foreground",
@@ -73,6 +74,28 @@ class CacheMetadataTest(unittest.TestCase):
         self.assertFalse(dataset.has_metadata)
         self.assertEqual(int(example["brain_index"]), -1)
         self.assertTrue(np.isnan(example["noise_params"]).all())
+
+    def test_count_target_respects_foreground_preservation(self):
+        """Count-space supervision matches transformed target construction."""
+        with tempfile.TemporaryDirectory() as root:
+            cache = self._write_cache(root, n=1)
+            np.save(
+                cache / "fg.npy",
+                np.ones((1, 2, 3, 4), dtype=np.uint8),
+            )
+            preserved = CachedValidateDataset(
+                str(cache), preserve_foreground=True
+            )[0]
+            denoised = CachedValidateDataset(
+                str(cache), preserve_foreground=False
+            )[0]
+
+        np.testing.assert_array_equal(
+            preserved["target_counts"], preserved["raw"]
+        )
+        np.testing.assert_array_equal(
+            denoised["target_counts"], denoised["teacher"]
+        )
 
     def test_noise_aware_run_rejects_legacy_cache(self):
         """Noise-aware consumers fail clearly rather than using placeholders."""
@@ -117,6 +140,7 @@ class CacheMetadataTest(unittest.TestCase):
             batch = next(iter(DataLoader(dataset, batch_size=2, num_workers=0)))
 
         self.assertEqual(batch["input"].shape, (2, 1, 2, 3, 4))
+        self.assertEqual(batch["target_counts"].shape, (2, 1, 2, 3, 4))
         self.assertEqual(batch["offset"].shape, (2,))
         self.assertEqual(batch["brain_index"].shape, (2,))
         self.assertEqual(batch["center"].shape, (2, 3))
