@@ -67,13 +67,21 @@ class PrecomputeConfigTest(unittest.TestCase):
         path, config = write_json.call_args_list[0].args
         self.assertEqual(path, "/cache/config.json")
         expected_keys = set(settings) | {
+            "brain_sampling_distribution",
+            "brain_sampling_weights",
+            "bright_sampling_weights",
             "cache_metadata_version",
             "code_version",
             "count_dtype",
+            "exclude_heldout",
             "gat_sigma_multiplier",
+            "heldout_regions",
+            "heldout_regions_path",
             "noise_models",
             "noise_models_path",
             "saturation_margins",
+            "sampling_rois",
+            "sampling_rois_path",
             "seed_stream",
             "teacher_mode",
         }
@@ -89,6 +97,13 @@ class PrecomputeConfigTest(unittest.TestCase):
         self.assertIsNone(config["noise_models_path"])
         self.assertIsNone(config["saturation_margins"])
         self.assertEqual(config["cache_metadata_version"], 1)
+        self.assertEqual(config["brain_sampling_weights"], {"brain": 1.0})
+        self.assertEqual(
+            config["brain_sampling_distribution"], {"brain": 1.0}
+        )
+        self.assertIsNone(config["sampling_rois"])
+        self.assertIsNone(config["heldout_regions"])
+        self.assertTrue(config["exclude_heldout"])
         brain_ids_path, brain_ids = write_json.call_args_list[1].args
         self.assertEqual(brain_ids_path, "/cache/brain_ids.json")
         self.assertEqual(brain_ids, ["brain"])

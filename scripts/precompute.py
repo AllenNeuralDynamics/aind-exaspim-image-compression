@@ -87,6 +87,10 @@ _COUNT_DTYPE = np.float32
 teacher_mode = "raw_bm4d"
 noise_models_path = None
 gat_sigma_multiplier = 1.0
+brain_sampling_weights = None
+sampling_rois_path = None
+heldout_regions_path = None
+bright_sampling_weights = None
 
 
 def _code_version():
@@ -189,6 +193,23 @@ def precompute():
         if noise_models_path
         else None
     )
+    sampling_rois = (
+        util.read_json(sampling_rois_path) if sampling_rois_path else None
+    )
+    heldout_regions = (
+        util.read_json(heldout_regions_path) if heldout_regions_path else None
+    )
+    resolved_brain_weights = brain_sampling_weights
+    if resolved_brain_weights is None and noise_models is not None:
+        resolved_brain_weights = {
+            brain_id: model.sampling_weight
+            for brain_id, model in noise_models.items()
+        }
+    resolved_brain_weights, brain_sampling_distribution = (
+        data_handling.resolve_brain_sampling_weights(
+            brain_ids, resolved_brain_weights
+        )
+    )
     offsets = util.read_json(offsets_path) if offsets_path else None
     if noise_models is not None:
         calibrated_offsets = {
@@ -228,6 +249,11 @@ def precompute():
         teacher_mode=teacher_mode,
         noise_models=noise_models,
         gat_sigma_multiplier=gat_sigma_multiplier,
+        brain_sampling_weights=resolved_brain_weights,
+        sampling_rois=sampling_rois,
+        heldout_regions=heldout_regions,
+        exclude_heldout=(split == "train"),
+        bright_sampling_weights=bright_sampling_weights,
         skeleton_radius=skeleton_radius,
         swc_pointers=swc_pointers,
         transform_cfg=resolved_transform_cfg,
@@ -258,6 +284,14 @@ def precompute():
             ),
             "teacher_mode": teacher_mode,
             "gat_sigma_multiplier": gat_sigma_multiplier,
+            "brain_sampling_weights": resolved_brain_weights,
+            "brain_sampling_distribution": brain_sampling_distribution,
+            "sampling_rois_path": sampling_rois_path,
+            "sampling_rois": sampling_rois,
+            "bright_sampling_weights": bright_sampling_weights,
+            "heldout_regions_path": heldout_regions_path,
+            "heldout_regions": heldout_regions,
+            "exclude_heldout": split == "train",
             "noise_models_path": noise_models_path,
             "noise_models": (
                 {
@@ -386,6 +420,8 @@ if __name__ == "__main__":
     segmentation_prefixes_path = "/data/exaspim_segmentation_prefixes.json"
     offsets_path = "/data/exaspim_background_offsets.json"
     noise_models_path = None
+    sampling_rois_path = None
+    heldout_regions_path = None
 
     # SWC pointer (shared)
     swc_pointers = {
@@ -409,6 +445,24 @@ if __name__ == "__main__":
     # for gat_sigma_multiplier intentionally smooth more than the fitted noise.
     teacher_mode = "raw_bm4d"
     gat_sigma_multiplier = 1.0
+
+    # Sampling weights default to NoiseModel.sampling_weight when calibrated
+    # models are loaded. Explicit values override that source. A bright-brain
+    # mixture can deliberately balance saturated cores, unsaturated halos,
+    # bright unsaturated signal, and ordinary background.
+    brain_sampling_weights = None
+    bright_sampling_weights = None
+    # Example targeting roughly one-third bright-brain patches among ten
+    # brains, with a deliberate within-brain condition mixture:
+    # brain_sampling_weights = {"734348": 4.0}
+    # bright_sampling_weights = {
+    #     "734348": {
+    #         "saturated_core": 0.30,
+    #         "halo": 0.25,
+    #         "bright_unsaturated": 0.20,
+    #         "background": 0.25,
+    #     }
+    # }
 
     # Sampling / patch parameters (shared)
     foreground_sampling_rate = 0.5

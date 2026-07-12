@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 import logging
 import fastremap
+import math
 import numpy as np
 import os
 import queue
@@ -47,6 +48,142 @@ from aind_exaspim_image_compression.utils import img_util, util
 
 
 logger = logging.getLogger(__name__)
+
+
+_BRIGHT_CONDITIONS = {
+    "saturated_core", "halo", "bright_unsaturated", "background"
+}
+
+
+def resolve_brain_sampling_weights(brain_ids, weights=None):
+    """Validate brain weights and return normalized ID-keyed distributions."""
+    brain_ids = [str(brain_id) for brain_id in brain_ids]
+    weights = {} if weights is None else {str(k): v for k, v in weights.items()}
+    unknown = set(weights) - set(brain_ids)
+    if unknown:
+        raise ValueError(
+            "brain sampling weights contain unknown brains: "
+            + ", ".join(sorted(unknown))
+        )
+    resolved = dict()
+    for brain_id in brain_ids:
+        value = float(weights.get(brain_id, 1.0))
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"brain sampling weight for {brain_id!r} must be finite "
+                "and positive"
+            )
+        resolved[brain_id] = value
+    total = sum(resolved.values())
+    distribution = {
+        brain_id: value / total for brain_id, value in resolved.items()
+    }
+    return resolved, distribution
+
+
+def validate_sampling_regions(regions, allow_weight=True, name="regions"):
+    """Validate brain-keyed half-open level-0 spatial regions."""
+    if regions is None:
+        return {}
+    if not isinstance(regions, dict):
+        raise ValueError(f"{name} must be a brain-ID keyed object")
+    validated = dict()
+    for brain_id, brain_regions in regions.items():
+        if not isinstance(brain_regions, list) or not brain_regions:
+            raise ValueError(f"{name}[{brain_id!r}] must be a nonempty list")
+        validated_regions = list()
+        for index, region in enumerate(brain_regions):
+            if not isinstance(region, dict):
+                raise ValueError(
+                    f"{name}[{brain_id!r}][{index}] must be an object"
+                )
+            allowed = {"start", "stop", "weight"} if allow_weight else {
+                "start", "stop"
+            }
+            unknown = set(region) - allowed
+            if unknown:
+                raise ValueError(
+                    f"{name}[{brain_id!r}][{index}] has unknown fields: "
+                    + ", ".join(sorted(unknown))
+                )
+            try:
+                start_values = np.asarray(region["start"])
+                stop_values = np.asarray(region["stop"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"{name}[{brain_id!r}][{index}] needs integer start/stop"
+                ) from error
+            if start_values.shape != (3,) or stop_values.shape != (3,):
+                raise ValueError(
+                    f"{name}[{brain_id!r}][{index}] start/stop must have 3 values"
+                )
+            try:
+                numeric_start = start_values.astype(np.float64)
+                numeric_stop = stop_values.astype(np.float64)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"{name}[{brain_id!r}][{index}] needs integer start/stop"
+                ) from error
+            if (
+                not np.all(np.isfinite(numeric_start))
+                or not np.all(np.isfinite(numeric_stop))
+                or not np.all(numeric_start == np.floor(numeric_start))
+                or not np.all(numeric_stop == np.floor(numeric_stop))
+            ):
+                raise ValueError(
+                    f"{name}[{brain_id!r}][{index}] needs integer start/stop"
+                )
+            start = numeric_start.astype(np.int64)
+            stop = numeric_stop.astype(np.int64)
+            if np.any(stop <= start):
+                raise ValueError(
+                    f"{name}[{brain_id!r}][{index}] stop must exceed start"
+                )
+            item = {"start": start, "stop": stop}
+            if allow_weight:
+                weight = float(region.get("weight", 1.0))
+                if not math.isfinite(weight) or weight <= 0:
+                    raise ValueError(
+                        f"{name}[{brain_id!r}][{index}] weight must be "
+                        "finite and positive"
+                    )
+                item["weight"] = weight
+            validated_regions.append(item)
+        validated[str(brain_id)] = validated_regions
+    return validated
+
+
+def validate_bright_sampling_weights(weights):
+    """Validate per-brain mixtures over the four bright sampling conditions."""
+    if weights is None:
+        return {}
+    if not isinstance(weights, dict):
+        raise ValueError("bright_sampling_weights must be brain-ID keyed")
+    validated = dict()
+    for brain_id, mixture in weights.items():
+        if not isinstance(mixture, dict):
+            raise ValueError(f"bright mixture for {brain_id!r} must be an object")
+        unknown = set(mixture) - _BRIGHT_CONDITIONS
+        if unknown:
+            raise ValueError(
+                f"bright mixture for {brain_id!r} has unknown conditions: "
+                + ", ".join(sorted(unknown))
+            )
+        resolved = {
+            condition: float(mixture.get(condition, 0))
+            for condition in sorted(_BRIGHT_CONDITIONS)
+        }
+        invalid = any(
+            not math.isfinite(value) or value < 0
+            for value in resolved.values()
+        )
+        if invalid or sum(resolved.values()) <= 0:
+            raise ValueError(
+                f"bright mixture for {brain_id!r} must have finite, "
+                "nonnegative weights with a positive sum"
+            )
+        validated[str(brain_id)] = resolved
+    return validated
 
 
 def build_training_example(
@@ -145,6 +282,11 @@ class TrainDataset(Dataset):
         teacher_mode="raw_bm4d",
         noise_models=None,
         gat_sigma_multiplier=1.0,
+        brain_sampling_weights=None,
+        sampling_rois=None,
+        heldout_regions=None,
+        exclude_heldout=True,
+        bright_sampling_weights=None,
         transform=None,
     ):
         # Call parent class
@@ -176,6 +318,21 @@ class TrainDataset(Dataset):
         self.teacher_mode = teacher_mode
         self.noise_models = validate_noise_models(noise_models or {})
         self.gat_sigma_multiplier = gat_sigma_multiplier
+        self.brain_sampling_weights = {
+            str(key): value
+            for key, value in (brain_sampling_weights or {}).items()
+        }
+        self.brain_sampling_distribution = {}
+        self.sampling_rois = validate_sampling_regions(
+            sampling_rois, name="sampling_rois"
+        )
+        self.heldout_regions = validate_sampling_regions(
+            heldout_regions, allow_weight=False, name="heldout_regions"
+        )
+        self.exclude_heldout = bool(exclude_heldout)
+        self.bright_sampling_weights = validate_bright_sampling_weights(
+            bright_sampling_weights
+        )
         self.transform = transform or build_transform({"kind": "asinh"})
         self.swc_reader = Reader()
 
@@ -206,6 +363,16 @@ class TrainDataset(Dataset):
         if str(brain_id) not in self.brain_indices:
             self.brain_indices[str(brain_id)] = len(self.brain_ids)
             self.brain_ids.append(str(brain_id))
+            _, self.brain_sampling_distribution = (
+                resolve_brain_sampling_weights(
+                    self.brain_ids,
+                    {
+                        key: value
+                        for key, value in self.brain_sampling_weights.items()
+                        if key in self.brain_ids
+                    },
+                )
+            )
         self.imgs[brain_id] = img_util.read(img_path)
         self._load_segmentation(brain_id, segmentation_path)
         self._load_swcs(brain_id, swc_pointer)
@@ -572,7 +739,17 @@ class TrainDataset(Dataset):
         brain_id : str
             Unique identifier of the sampled whole-brain.
         """
-        return util.sample_once(self.imgs.keys())
+        brain_ids = list(self.imgs)
+        resolved, distribution = resolve_brain_sampling_weights(
+            brain_ids,
+            self.brain_sampling_weights,
+        )
+        self.brain_sampling_distribution = distribution
+        return random.choices(
+            brain_ids,
+            weights=[resolved[str(brain_id)] for brain_id in brain_ids],
+            k=1,
+        )[0]
 
     def sample_voxel(self, brain_id):
         """
@@ -589,10 +766,24 @@ class TrainDataset(Dataset):
             Voxel coordinate chosen according to the foreground or interior
             sampling strategy.
         """
-        if random.random() < self.foreground_sampling_rate:
-            return self.sample_foreground_voxel(brain_id)
-        else:
-            return self.sample_interior_voxel(brain_id)
+        mixture = self.bright_sampling_weights.get(str(brain_id))
+        if mixture:
+            conditions = list(mixture)
+            condition = random.choices(
+                conditions,
+                weights=[mixture[name] for name in conditions],
+                k=1,
+            )[0]
+            return self.sample_bright_condition_voxel(brain_id, condition)
+
+        for _ in range(max(1, self.max_resample_attempts)):
+            if random.random() < self.foreground_sampling_rate:
+                voxel = self.sample_foreground_voxel(brain_id)
+            else:
+                voxel = self.sample_interior_voxel(brain_id)
+            if self._center_is_allowed(brain_id, voxel):
+                return tuple(int(value) for value in voxel)
+        return self.sample_interior_voxel(brain_id)
 
     def sample_foreground_voxel(self, brain_id):
         """
@@ -631,11 +822,152 @@ class TrainDataset(Dataset):
             Voxel coordinate sampled uniformly at random within the valid
             interior region of the image volume.
         """
-        voxel = list()
-        for s in self.imgs[brain_id].shape[2::]:
-            upper = s - self.boundary_buffer
-            voxel.append(random.randint(self.boundary_buffer, upper))
-        return tuple(voxel)
+        brain_rois = self.sampling_rois.get(str(brain_id), [])
+        for _ in range(max(100, self.max_resample_attempts)):
+            if brain_rois:
+                region = random.choices(
+                    brain_rois,
+                    weights=[item["weight"] for item in brain_rois],
+                    k=1,
+                )[0]
+                lower = region["start"].copy()
+                upper = region["stop"].copy() - 1
+            else:
+                lower = np.full(3, self.boundary_buffer, dtype=np.int64)
+                upper = (
+                    np.asarray(self.imgs[brain_id].shape[2:], dtype=np.int64)
+                    - self.boundary_buffer
+                )
+            half = np.asarray(self.patch_shape, dtype=np.int64) // 2
+            image_shape = np.asarray(
+                self.imgs[brain_id].shape[2:], dtype=np.int64
+            )
+            patch_stop_margin = np.asarray(self.patch_shape) - half
+            lower = np.maximum(lower, half)
+            upper = np.minimum(upper, image_shape - patch_stop_margin)
+            if np.any(upper < lower):
+                raise ValueError(
+                    f"sampling region for brain {brain_id!r} cannot fit patch "
+                    f"shape {self.patch_shape}"
+                )
+            voxel = tuple(
+                random.randint(int(lo), int(hi))
+                for lo, hi in zip(lower, upper)
+            )
+            if self._center_is_allowed(brain_id, voxel):
+                return voxel
+        raise ValueError(
+            f"could not sample brain {brain_id!r} without intersecting heldout "
+            "regions"
+        )
+
+    def _center_is_allowed(self, brain_id, center):
+        """Check image bounds, configured ROIs, and held-out intersections."""
+        center = np.asarray(center, dtype=np.int64)
+        half = np.asarray(self.patch_shape, dtype=np.int64) // 2
+        patch_start = center - half
+        patch_stop = patch_start + np.asarray(self.patch_shape, dtype=np.int64)
+        image_shape = np.asarray(self.imgs[brain_id].shape[2:], dtype=np.int64)
+        if np.any(patch_start < 0) or np.any(patch_stop > image_shape):
+            return False
+        rois = self.sampling_rois.get(str(brain_id), [])
+        if rois and not any(
+            np.all(center >= region["start"])
+            and np.all(center < region["stop"])
+            for region in rois
+        ):
+            return False
+        if self.exclude_heldout:
+            for region in self.heldout_regions.get(str(brain_id), []):
+                if np.all(patch_start < region["stop"]) and np.all(
+                    patch_stop > region["start"]
+                ):
+                    return False
+        return True
+
+    def _bright_candidates(self, brain_id):
+        """Read a reproducible batch of ROI-aware candidate patches."""
+        centers = [
+            self.sample_interior_voxel(brain_id)
+            for _ in range(self.prefetch_foreground_sampling)
+        ]
+        with ThreadPoolExecutor() as executor:
+            patches = list(
+                executor.map(
+                    lambda center: np.asarray(
+                        self.read_patch(brain_id, center), dtype=np.float32
+                    ),
+                    centers,
+                )
+            )
+        return list(zip(centers, patches))
+
+    def _saturation_threshold(self, brain_id):
+        """Return the calibrated nearly-saturated raw-count threshold."""
+        model = self.noise_models.get(str(brain_id))
+        margin = model.saturation_margin if model is not None else 64
+        return float(self.transform.max_count) - margin
+
+    def sample_bright_condition_voxel(self, brain_id, condition):
+        """Sample a saturated core, halo, bright neurite, or background patch."""
+        if condition not in _BRIGHT_CONDITIONS:
+            raise ValueError(f"unknown bright sampling condition {condition!r}")
+        candidates = self._bright_candidates(brain_id)
+        threshold = self._saturation_threshold(brain_id)
+        if condition == "background":
+            return min(
+                candidates,
+                key=lambda item: float(np.percentile(item[1], 99.9)),
+            )[0]
+        if condition == "bright_unsaturated":
+            unsaturated = [
+                item for item in candidates if float(np.max(item[1])) < threshold
+            ]
+            pool = unsaturated or candidates
+            return max(
+                pool, key=lambda item: float(np.percentile(item[1], 99.9))
+            )[0]
+
+        core_center, core_patch = max(
+            candidates,
+            key=lambda item: (
+                int(np.count_nonzero(item[1] >= threshold)),
+                float(np.max(item[1])),
+            ),
+        )
+        local_peak = np.asarray(
+            np.unravel_index(np.argmax(core_patch), core_patch.shape)
+        )
+        core_voxel = (
+            np.asarray(core_center) + local_peak
+            - np.asarray(self.patch_shape) // 2
+        )
+        if condition == "saturated_core":
+            if self._center_is_allowed(brain_id, core_voxel):
+                return tuple(int(value) for value in core_voxel)
+            return core_center
+
+        halo_candidates = list()
+        half = np.asarray(self.patch_shape, dtype=np.int64) // 2
+        for axis in range(3):
+            for sign in (-1, 1):
+                center = core_voxel.copy()
+                center[axis] += sign * max(1, int(half[axis]))
+                if self._center_is_allowed(brain_id, center):
+                    patch = np.asarray(
+                        self.read_patch(brain_id, tuple(center)),
+                        dtype=np.float32,
+                    )
+                    if not np.any(patch >= threshold):
+                        halo_candidates.append((tuple(center), patch))
+        if halo_candidates:
+            return max(
+                halo_candidates,
+                key=lambda item: float(np.percentile(item[1], 99.9)),
+            )[0]
+        return self.sample_bright_condition_voxel(
+            brain_id, "bright_unsaturated"
+        )
 
     def sample_skeleton_voxel(self, brain_id):
         """
@@ -1572,16 +1904,37 @@ def init_datasets(
     teacher_mode="raw_bm4d",
     noise_models=None,
     gat_sigma_multiplier=1.0,
+    brain_sampling_weights=None,
+    sampling_rois=None,
+    heldout_regions=None,
+    exclude_heldout=True,
+    bright_sampling_weights=None,
     skeleton_radius=2,
     swc_pointers=None,
     transform_cfg=None,
     preserve_foreground=True,
     offsets=None,
 ):
+    brain_ids = list(brain_ids)
     if teacher_mode == "gat_bm4d":
         noise_models = validate_noise_models(
             noise_models or {}, required_brain_ids=brain_ids
         )
+    brain_sampling_weights, _ = resolve_brain_sampling_weights(
+        brain_ids, brain_sampling_weights
+    )
+    known_brains = {str(brain_id) for brain_id in brain_ids}
+    for name, values in (
+        ("sampling_rois", sampling_rois or {}),
+        ("heldout_regions", heldout_regions or {}),
+        ("bright_sampling_weights", bright_sampling_weights or {}),
+    ):
+        unknown = {str(brain_id) for brain_id in values} - known_brains
+        if unknown:
+            raise ValueError(
+                f"{name} contains unknown brains: "
+                + ", ".join(sorted(unknown))
+            )
 
     # Initializations
     if transform_cfg is None:
@@ -1607,6 +1960,11 @@ def init_datasets(
         teacher_mode=teacher_mode,
         noise_models=noise_models,
         gat_sigma_multiplier=gat_sigma_multiplier,
+        brain_sampling_weights=brain_sampling_weights,
+        sampling_rois=sampling_rois,
+        heldout_regions=heldout_regions,
+        exclude_heldout=exclude_heldout,
+        bright_sampling_weights=bright_sampling_weights,
     )
     val_dataset = ValidateDataset(
         patch_shape,
