@@ -156,6 +156,10 @@ class ArchitectureRegressionTest(unittest.TestCase):
                     checkpoint["provenance"]["caches"]["train"],
                     "cache-id",
                 )
+                self.assertEqual(
+                    checkpoint["checkpoint_selection_config"],
+                    {"mode": "legacy"},
+                )
 
                 trainer.load_pretrained_weights(checkpoint_path)
                 different_transform = build_transform(

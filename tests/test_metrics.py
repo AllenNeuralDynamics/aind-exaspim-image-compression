@@ -20,6 +20,7 @@ from aind_exaspim_image_compression.machine_learning.metrics import (
     make_skeleton_mask,
     mip_max_error,
     patch_has_incoherent_segment,
+    select_checkpoint,
 )
 
 
@@ -277,6 +278,115 @@ class StratifiedMetricTest(unittest.TestCase):
             report["by_foreground_presence"]["blank"]["foreground_patch_count"],
             0,
         )
+
+
+class ConstrainedCheckpointSelectionTest(unittest.TestCase):
+    """Tests constraint-first checkpoint validity and objective ranking."""
+
+    @staticmethod
+    def _report(bright_fg_mae=100.0, halo_bias=-20.0, bg_mae=5.0):
+        """Return the structured subset needed by checkpoint selection."""
+        return {
+            "overall": {
+                "fg_mae": bright_fg_mae,
+                "bg_mae": bg_mae,
+                "top_pct_error": 10.0,
+            },
+            "by_foreground_intensity": {
+                "60k+": {"fg_mae": bright_fg_mae}
+            },
+            "halo_distance_bands": {
+                "2-5": {"mean_intensity_bias": halo_bias}
+            },
+        }
+
+    @staticmethod
+    def _config(objective=None):
+        """Require bright fidelity and absolute halo bias limits."""
+        return {
+            "mode": "constrained",
+            "constraints": [
+                {
+                    "name": "bright_neurite_mae",
+                    "path": [
+                        "by_foreground_intensity",
+                        "60k+",
+                        "fg_mae",
+                    ],
+                    "max": 200.0,
+                },
+                {
+                    "name": "halo_bias",
+                    "path": [
+                        "halo_distance_bands",
+                        "2-5",
+                        "mean_intensity_bias",
+                    ],
+                    "absolute": True,
+                    "max": 50.0,
+                },
+            ],
+            "objective": objective
+            or {"path": "cratio", "direction": "maximize"},
+        }
+
+    def test_valid_checkpoint_is_ranked_by_compression_only(self):
+        """Passing constraints produces lower scores for higher compression."""
+        config = self._config()
+        low = select_checkpoint(self._report(), 5.0, config)
+        high = select_checkpoint(self._report(), 10.0, config)
+        self.assertTrue(high["valid"])
+        self.assertEqual(high["score"], -10.0)
+        self.assertLess(high["score"], low["score"])
+        self.assertTrue(all(row["passed"] for row in high["constraints"]))
+
+    def test_legacy_mode_preserves_additive_checkpoint_score(self):
+        """Existing experiments retain their exact legacy ranking path."""
+        report = self._report()
+        weights = dict(DEFAULT_CHECKPOINT_WEIGHTS, cratio=1.0)
+        selection = select_checkpoint(
+            report,
+            cratio=3.0,
+            config={"mode": "legacy"},
+            legacy_weights=weights,
+        )
+        self.assertEqual(
+            selection["score"],
+            checkpoint_score(report["overall"], 3.0, weights),
+        )
+
+    def test_constraint_failure_makes_checkpoint_ineligible(self):
+        """Compression cannot rescue excessive bright or halo error."""
+        selection = select_checkpoint(
+            self._report(bright_fg_mae=250, halo_bias=-75),
+            cratio=1000,
+            config=self._config(),
+        )
+        self.assertFalse(selection["valid"])
+        self.assertTrue(np.isinf(selection["score"]))
+        self.assertFalse(selection["constraints"][0]["passed"])
+        self.assertFalse(selection["constraints"][1]["passed"])
+
+    def test_report_metric_can_be_minimized_as_objective(self):
+        """A valid checkpoint may rank by background cleanup instead."""
+        config = self._config(
+            {"path": ["overall", "bg_mae"], "direction": "minimize"}
+        )
+        selection = select_checkpoint(self._report(bg_mae=4.0), 10.0, config)
+        self.assertTrue(selection["valid"])
+        self.assertEqual(selection["score"], 4.0)
+
+    def test_missing_required_metric_fails_but_optional_metric_passes(self):
+        """Unavailable bright strata are explicit validity decisions."""
+        report = self._report()
+        del report["by_foreground_intensity"]["60k+"]
+        required = select_checkpoint(report, 10.0, self._config())
+        self.assertFalse(required["valid"])
+
+        config = self._config()
+        config["constraints"][0]["required"] = False
+        optional = select_checkpoint(report, 10.0, config)
+        self.assertTrue(optional["valid"])
 
 
 if __name__ == "__main__":

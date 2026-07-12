@@ -29,8 +29,8 @@ from aind_exaspim_image_compression.machine_learning.losses import (
 )
 from aind_exaspim_image_compression.machine_learning.metrics import (
     aggregate_stratified_metrics,
-    checkpoint_score,
     evaluate_stratified_example,
+    select_checkpoint,
 )
 from aind_exaspim_image_compression.utils import img_util, util
 
@@ -74,6 +74,7 @@ class Trainer:
         model=None,
         use_amp=True,
         checkpoint_weights=None,
+        checkpoint_selection=None,
         fg_weight=20.0,
         criterion=None,
         num_workers=None,
@@ -102,6 +103,9 @@ class Trainer:
         criterion : torch.nn.Module, optional
             Configured denoising criterion. When omitted, the legacy
             SignalPreservingLoss is constructed from ``fg_weight``.
+        checkpoint_selection : dict, optional
+            Legacy or constraint-first checkpoint-selection configuration.
+            Default is legacy additive scoring.
         val_every : int, optional
             Run validation (and checkpoint selection) every this many epochs;
             the final epoch is always validated. The count-space metrics are
@@ -148,6 +152,12 @@ class Trainer:
                 },
             }
         self.checkpoint_weights = checkpoint_weights
+        self.checkpoint_selection = (
+            {"mode": "legacy"}
+            if checkpoint_selection is None
+            else checkpoint_selection
+        )
+        self.last_checkpoint_selection = None
         self.best_score = np.inf
         self.model = model.to(device) if model else UNet().to(device)
         self._resume_transform_cfg = None
@@ -315,12 +325,31 @@ class Trainer:
         cratio = float(np.median(cratios))
         metric_report = aggregate_stratified_metrics(metric_records)
         agg = metric_report["overall"]
-        score = checkpoint_score(agg, cratio, self.checkpoint_weights)
+        selection = select_checkpoint(
+            metric_report,
+            cratio,
+            config=self.checkpoint_selection,
+            legacy_weights=self.checkpoint_weights,
+        )
+        score = selection["score"]
+        self.last_checkpoint_selection = selection
+        metric_report["checkpoint_selection"] = selection
 
         # Log results
         self.writer.add_scalar("val_loss", loss, epoch)
         self.writer.add_scalar("val_cratio", cratio, epoch)
         self.writer.add_scalar("val_score", score, epoch)
+        self.writer.add_scalar(
+            "val_checkpoint_constraints_valid",
+            float(selection["valid"]),
+            epoch,
+        )
+        if np.isfinite(selection["objective_value"]):
+            self.writer.add_scalar(
+                "val_checkpoint_objective",
+                selection["objective_value"],
+                epoch,
+            )
         for name, value in agg.items():
             if np.isscalar(value) and np.isfinite(value):
                 self.writer.add_scalar(f"val_{name}", value, epoch)
@@ -337,7 +366,7 @@ class Trainer:
         # compressible volume whose cratio-weighted score would beat every
         # trained checkpoint despite its high loss. is_best is tracked only for
         # the "New Best!" log line.
-        is_best = epoch > 0 and score < self.best_score
+        is_best = epoch > 0 and selection["valid"] and score < self.best_score
         if is_best:
             self.best_score = score
         if epoch > 0:
@@ -569,6 +598,7 @@ class Trainer:
             "fg_weight": getattr(self.criterion, "fg_weight", None),
             "loss_config": self.loss_config,
             "checkpoint_weights": self.checkpoint_weights,
+            "checkpoint_selection": self.checkpoint_selection,
             "lr": self.optimizer.param_groups[0]["lr"],
             "model": type(self.model).__name__,
             "model_config": getattr(self.model, "config", None),
@@ -590,7 +620,10 @@ class Trainer:
             embedded in the filename so checkpoints can be ranked offline.
         """
         date = datetime.today().strftime("%Y%m%d")
-        filename = f"BM4DNet-{date}-{epoch}-{score:.6f}.pth"
+        filename_score = (
+            score if np.isfinite(score) else float(np.finfo(np.float32).max)
+        )
+        filename = f"BM4DNet-{date}-{epoch}-{filename_score:.6f}.pth"
         path = os.path.join(self.log_dir, filename)
         torch.save(
             {
@@ -604,6 +637,9 @@ class Trainer:
                     if self.run_config is not None
                     else None
                 ),
+                "checkpoint_selection_config": self.checkpoint_selection,
+                "checkpoint_selection_result": self.last_checkpoint_selection,
+                "checkpoint_score": float(score),
             },
             path,
         )

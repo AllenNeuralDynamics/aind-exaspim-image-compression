@@ -208,6 +208,7 @@ def _validate_experiment_config(config):
         "training",
         "target",
         "checkpoint_weights",
+        "checkpoint_selection",
     }
     missing = required - set(config)
     if missing:
@@ -357,6 +358,7 @@ def train(experiment_config):
         criterion=criterion,
         use_amp=training.get("use_amp", True),
         checkpoint_weights=config["checkpoint_weights"],
+        checkpoint_selection=config["checkpoint_selection"],
         num_workers=0,
         val_every=training["val_every"],
     )
@@ -450,6 +452,14 @@ EXPERIMENT_CONFIG = {
         "top_pct_error": 0.5,
         "cratio": 2.0,
     },
+    # Switch mode to "constrained" to enforce bright/halo limits before
+    # ranking valid checkpoints with one objective. Example constraints:
+    # {"name": "bright_fg_mae", "path":
+    #  ["by_foreground_intensity", "60k+", "fg_mae"], "max": 500},
+    # {"name": "halo_bias", "path":
+    #  ["halo_distance_bands", "2-5", "mean_intensity_bias"],
+    #  "absolute": True, "max": 100}.
+    "checkpoint_selection": {"mode": "legacy"},
 }
 
 

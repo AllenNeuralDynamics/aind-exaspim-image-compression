@@ -86,6 +86,7 @@ class CachedTrainingTest(unittest.TestCase):
             },
             "target": {"preserve_foreground": True},
             "checkpoint_weights": {"fg_mae": 1.0},
+            "checkpoint_selection": {"mode": "legacy"},
         }
 
     def test_both_cache_paths_are_required(self):
@@ -286,6 +287,7 @@ class CachedTrainingTest(unittest.TestCase):
         self.assertIn("noise_model_path", config)
         self.assertIn("train_regions", config["sampling"])
         self.assertIn("validation_regions", config["sampling"])
+        self.assertIn("checkpoint_selection", config)
         json.dumps(config)
 
 

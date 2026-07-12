@@ -791,3 +791,139 @@ def checkpoint_score(metrics, cratio, weights=None):
         + w.get("top_pct_error", 0.0) * metrics["top_pct_error"]
         - w.get("cratio", 0.0) * cratio
     )
+
+
+def _metric_path_value(report, path, cratio):
+    """Resolve a structured report path or the special compression metric."""
+    if path == "cratio" or path == ["cratio"]:
+        return float(cratio)
+    if isinstance(path, str):
+        path = path.split(".")
+    if not isinstance(path, (list, tuple)) or not path:
+        raise ValueError("metric path must be 'cratio', dotted text, or a list")
+    value = report
+    try:
+        for key in path:
+            value = value[key]
+    except (KeyError, TypeError) as error:
+        raise KeyError(".".join(str(key) for key in path)) from error
+    return float(value)
+
+
+def select_checkpoint(metric_report, cratio, config=None, legacy_weights=None):
+    """Evaluate legacy or constraint-first checkpoint selection.
+
+    Constrained mode first checks every configured metric bound. Only a valid
+    checkpoint receives a rank from the single configured objective, avoiding
+    additive mixing of count errors and compression ratios with unrelated
+    scales. Returned scores retain the existing lower-is-better convention.
+    """
+    config = {"mode": "legacy"} if config is None else config
+    mode = config.get("mode", "legacy")
+    if mode == "legacy":
+        score = checkpoint_score(
+            metric_report["overall"], cratio, weights=legacy_weights
+        )
+        return {
+            "mode": "legacy",
+            "valid": bool(np.isfinite(score)),
+            "score": float(score),
+            "objective_value": float(score),
+            "objective": "legacy_additive_score",
+            "constraints": [],
+        }
+    if mode != "constrained":
+        raise ValueError(
+            "checkpoint selection mode must be 'legacy' or 'constrained'"
+        )
+
+    configured_constraints = config.get("constraints", [])
+    if (
+        not isinstance(configured_constraints, list)
+        or not configured_constraints
+    ):
+        raise ValueError(
+            "constrained selection requires a nonempty constraints list"
+        )
+    results = list()
+    all_valid = True
+    for index, constraint in enumerate(configured_constraints):
+        if not isinstance(constraint, dict) or "path" not in constraint:
+            raise ValueError(f"checkpoint constraint {index} requires a path")
+        name = constraint.get("name", f"constraint_{index}")
+        required = bool(constraint.get("required", True))
+        minimum = constraint.get("min")
+        maximum = constraint.get("max")
+        if minimum is None and maximum is None:
+            raise ValueError(
+                f"checkpoint constraint {name!r} requires min and/or max"
+            )
+        try:
+            raw_value = _metric_path_value(
+                metric_report, constraint["path"], cratio
+            )
+            measured = (
+                abs(raw_value)
+                if constraint.get("absolute", False)
+                else raw_value
+            )
+            available = bool(np.isfinite(measured))
+        except (KeyError, TypeError, ValueError):
+            raw_value = float("nan")
+            measured = float("nan")
+            available = False
+        passed = available
+        if available and minimum is not None:
+            passed = passed and measured >= float(minimum)
+        if available and maximum is not None:
+            passed = passed and measured <= float(maximum)
+        if not available and not required:
+            passed = True
+        all_valid = all_valid and passed
+        results.append(
+            {
+                "name": str(name),
+                "path": constraint["path"],
+                "value": raw_value,
+                "evaluated_value": measured,
+                "absolute": bool(constraint.get("absolute", False)),
+                "min": minimum,
+                "max": maximum,
+                "required": required,
+                "available": available,
+                "passed": bool(passed),
+            }
+        )
+
+    objective = config.get("objective")
+    if not isinstance(objective, dict) or "path" not in objective:
+        raise ValueError("constrained selection requires an objective path")
+    direction = objective.get("direction", "minimize")
+    if direction not in ("minimize", "maximize"):
+        raise ValueError("checkpoint objective direction is invalid")
+    try:
+        objective_value = _metric_path_value(
+            metric_report, objective["path"], cratio
+        )
+    except (KeyError, TypeError, ValueError):
+        objective_value = float("nan")
+    objective_available = bool(np.isfinite(objective_value))
+    valid = bool(all_valid and objective_available)
+    if valid:
+        score = (
+            objective_value if direction == "minimize" else -objective_value
+        )
+    else:
+        score = float("inf")
+    return {
+        "mode": "constrained",
+        "valid": valid,
+        "score": float(score),
+        "objective_value": float(objective_value),
+        "objective": {
+            "path": objective["path"],
+            "direction": direction,
+            "available": objective_available,
+        },
+        "constraints": results,
+    }
