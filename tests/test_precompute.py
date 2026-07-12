@@ -63,10 +63,11 @@ class PrecomputeConfigTest(unittest.TestCase):
             with self.assertRaises(_StopAfterConfig):
                 precompute()
 
-        write_json.assert_called_once()
-        path, config = write_json.call_args.args
+        self.assertEqual(write_json.call_count, 2)
+        path, config = write_json.call_args_list[0].args
         self.assertEqual(path, "/cache/config.json")
         expected_keys = set(settings) | {
+            "cache_metadata_version",
             "code_version",
             "count_dtype",
             "gat_sigma_multiplier",
@@ -87,6 +88,10 @@ class PrecomputeConfigTest(unittest.TestCase):
         self.assertIsNone(config["noise_models"])
         self.assertIsNone(config["noise_models_path"])
         self.assertIsNone(config["saturation_margins"])
+        self.assertEqual(config["cache_metadata_version"], 1)
+        brain_ids_path, brain_ids = write_json.call_args_list[1].args
+        self.assertEqual(brain_ids_path, "/cache/brain_ids.json")
+        self.assertEqual(brain_ids, ["brain"])
         self.assertEqual(
             precompute.__globals__["_COUNT_DTYPE"], np.float32
         )

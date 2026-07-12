@@ -34,6 +34,11 @@ loads with CachedValidateDataset):
     raw.npy        float32  (N, *patch_shape)   offset-subtracted counts
     teacher.npy    float32  (N, *patch_shape)   clipped BM4D denoising
     fg.npy         uint8    (N, *patch_shape)   foreground mask (0/1)
+    brain_index.npy int32   (N,)                 index into brain_ids.json
+    center.npy     int64    (N, 3)               level-0 patch centers
+    offset.npy     float32  (N,)                 subtracted brain offset
+    noise_params.npy float32 (N, 2)              variance slope/intercept
+    brain_ids.json                              indexed source brain IDs
     transform.json                              resolved transform cfg
     config.json                                 teacher + full cache provenance
 
@@ -284,7 +289,12 @@ def precompute():
             "num_workers": num_workers,
             "count_dtype": np.dtype(_COUNT_DTYPE).name,
             "code_version": _code_version(),
+            "cache_metadata_version": 1,
         },
+    )
+    util.write_json(
+        f"{cache_dir}/brain_ids.json",
+        [str(brain_id) for brain_id in brain_ids],
     )
     shape = (n_patches,) + tuple(patch_shape)
     raw_mm = open_memmap(
@@ -296,6 +306,30 @@ def precompute():
     fg_mm = open_memmap(
         f"{cache_dir}/fg.npy", mode="w+", dtype=np.uint8, shape=shape
     )
+    brain_index_mm = open_memmap(
+        f"{cache_dir}/brain_index.npy",
+        mode="w+",
+        dtype=np.int32,
+        shape=(n_patches,),
+    )
+    center_mm = open_memmap(
+        f"{cache_dir}/center.npy",
+        mode="w+",
+        dtype=np.int64,
+        shape=(n_patches, 3),
+    )
+    offset_mm = open_memmap(
+        f"{cache_dir}/offset.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(n_patches,),
+    )
+    noise_params_mm = open_memmap(
+        f"{cache_dir}/noise_params.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(n_patches, 2),
+    )
 
     with ProcessPoolExecutor(
         max_workers=num_workers,
@@ -305,16 +339,28 @@ def precompute():
         results = executor.map(
             _sample_counts, range(n_patches), chunksize=1
         )
-        for i, (raw, teacher, fg) in enumerate(
+        for i, record in enumerate(
             tqdm(results, total=n_patches, desc=f"Precompute ({split})")
         ):
-            raw_mm[i] = np.asarray(raw, dtype=_COUNT_DTYPE)
-            teacher_mm[i] = np.asarray(teacher, dtype=_COUNT_DTYPE)
-            fg_mm[i] = np.asarray(fg, dtype=np.uint8)
+            raw_mm[i] = np.asarray(record["raw"], dtype=_COUNT_DTYPE)
+            teacher_mm[i] = np.asarray(
+                record["teacher"], dtype=_COUNT_DTYPE
+            )
+            fg_mm[i] = np.asarray(record["foreground"], dtype=np.uint8)
+            brain_index_mm[i] = np.int32(record["brain_index"])
+            center_mm[i] = np.asarray(record["center"], dtype=np.int64)
+            offset_mm[i] = np.float32(record["offset"])
+            noise_params_mm[i] = np.asarray(
+                record["noise_params"], dtype=np.float32
+            )
 
     raw_mm.flush()
     teacher_mm.flush()
     fg_mm.flush()
+    brain_index_mm.flush()
+    center_mm.flush()
+    offset_mm.flush()
+    noise_params_mm.flush()
 
     # Stamp the resolved transform cfg so training rebuilds it exactly without
     # touching the cloud.

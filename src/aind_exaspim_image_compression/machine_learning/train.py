@@ -221,9 +221,11 @@ class Trainer:
         """
         losses = list()
         self.model.train()
-        for x, y, fg_mask in train_dataloader:
+        for batch in train_dataloader:
             # Forward pass
-            hat_y, loss = self.forward_pass(x, y, fg_mask)
+            hat_y, loss = self.forward_pass(
+                batch["input"], batch["target"], batch["foreground"]
+            )
 
             # Backward pass (loss-scaled for AMP stability)
             self.optimizer.zero_grad()
@@ -265,9 +267,14 @@ class Trainer:
         metric_rows = list()
         with torch.no_grad():
             self.model.eval()
-            for x, y, raw, fg_mask in val_dataloader:
+            for batch in val_dataloader:
                 # Run model
-                hat_y, loss = self.forward_pass(x, y, fg_mask)
+                y = batch["target"]
+                raw = batch["raw"]
+                fg_mask = batch["foreground"]
+                hat_y, loss = self.forward_pass(
+                    batch["input"], y, fg_mask
+                )
 
                 # Evaluate result
                 losses.append(loss.detach().cpu())

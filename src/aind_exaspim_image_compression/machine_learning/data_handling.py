@@ -83,6 +83,28 @@ def build_training_example(
         transform.forward(target),
         fg.astype(np.float32),
     )
+
+
+def build_example_record(transform, preserve_foreground, record):
+    """Add transformed model fields to a count-space patch record."""
+    x, y, foreground = build_training_example(
+        transform,
+        preserve_foreground,
+        record["raw"],
+        record["teacher"],
+        record["foreground"],
+    )
+    return {
+        "input": x,
+        "target": y,
+        "raw": np.asarray(record["raw"], dtype=np.float32),
+        "teacher": np.asarray(record["teacher"], dtype=np.float32),
+        "foreground": foreground,
+        "brain_index": np.asarray(record["brain_index"], dtype=np.int32),
+        "center": np.asarray(record["center"], dtype=np.int64),
+        "offset": np.asarray(record["offset"], dtype=np.float32),
+        "noise_params": np.asarray(record["noise_params"], dtype=np.float32),
+    }
 from aind_exaspim_image_compression.utils.swc_util import Reader
 
 
@@ -161,6 +183,8 @@ class TrainDataset(Dataset):
         self.segmentations = dict()
         self.skeletons = dict()
         self.imgs = dict()
+        self.brain_ids = list()
+        self.brain_indices = dict()
 
     # --- Ingest data ---
     def ingest_brain(self, brain_id, img_path, segmentation_path, swc_pointer):
@@ -179,6 +203,9 @@ class TrainDataset(Dataset):
         swc_path : str
             Path to SWC files.
         """
+        if str(brain_id) not in self.brain_indices:
+            self.brain_indices[str(brain_id)] = len(self.brain_ids)
+            self.brain_ids.append(str(brain_id))
         self.imgs[brain_id] = img_util.read(img_path)
         self._load_segmentation(brain_id, segmentation_path)
         self._load_swcs(brain_id, swc_pointer)
@@ -310,16 +337,13 @@ class TrainDataset(Dataset):
 
         Returns
         -------
-        x : numpy.ndarray
-            Noisy image patch in the normalized transform domain.
-        y : numpy.ndarray
-            Target image patch in the normalized transform domain.
-        fg_mask : numpy.ndarray
-            Foreground mask (float 0/1) for the signal-preserving loss.
+        dict
+            Transformed model fields, count-space arrays, and patch-source
+            metadata.
         """
-        raw, teacher, fg_mask = self._sample_counts()
-        return build_training_example(
-            self.transform, self.preserve_foreground, raw, teacher, fg_mask
+        record = self._sample_counts()
+        return build_example_record(
+            self.transform, self.preserve_foreground, record
         )
 
     def _sample_counts(self):
@@ -334,9 +358,8 @@ class TrainDataset(Dataset):
 
         Returns
         -------
-        Tuple[numpy.ndarray]
-            (raw, teacher, fg_mask) in count space. raw has the per-brain
-            offset subtracted; teacher is the clipped BM4D denoising.
+        dict
+            Named count-space patch record including source metadata.
         """
         brain_id, voxel, raw, labels = self.sample_clean(self.read_counts)
         teacher = build_teacher(
@@ -348,7 +371,27 @@ class TrainDataset(Dataset):
             gat_sigma_multiplier=self.gat_sigma_multiplier,
         )
         fg_mask = self.foreground_mask(brain_id, voxel, raw, labels=labels)
-        return raw, teacher, fg_mask
+        model = self.noise_models.get(str(brain_id))
+        noise_params = (
+            (model.variance_slope, model.variance_intercept)
+            if model is not None
+            else (np.nan, np.nan)
+        )
+        return {
+            "raw": np.asarray(raw, dtype=np.float32),
+            "teacher": np.asarray(teacher, dtype=np.float32),
+            "foreground": np.asarray(fg_mask, dtype=np.uint8),
+            "brain_index": np.int32(self.brain_indices[str(brain_id)]),
+            "center": np.asarray(voxel, dtype=np.int64),
+            "offset": np.float32(self._brain_offset(brain_id)),
+            "noise_params": np.asarray(noise_params, dtype=np.float32),
+        }
+
+    def _brain_offset(self, brain_id):
+        """Return a per-brain offset with string-key compatibility."""
+        return self.offsets.get(
+            brain_id, self.offsets.get(str(brain_id), 0.0)
+        )
 
     def read_counts(self, brain_id, center):
         """
@@ -367,7 +410,7 @@ class TrainDataset(Dataset):
             Offset-subtracted raw counts.
         """
         raw = np.asarray(self.read_patch(brain_id, center)).astype(np.float32)
-        return raw - self.offsets.get(brain_id, 0.0)
+        return raw - self._brain_offset(brain_id)
 
     def sample_clean(self, read_counts):
         """
@@ -867,6 +910,9 @@ class ValidateDataset(Dataset):
         self.noise = list()
         self.raws = list()
         self.fg_masks = list()
+        self.records = list()
+        self.brain_ids = list()
+        self.brain_indices = dict()
 
     def __len__(self):
         """
@@ -890,7 +936,16 @@ class ValidateDataset(Dataset):
         img_path : str or Path
             Path to whole-brain image to be read.
         """
+        if str(brain_id) not in self.brain_indices:
+            self.brain_indices[str(brain_id)] = len(self.brain_ids)
+            self.brain_ids.append(str(brain_id))
         self.imgs[brain_id] = img_util.read(img_path)
+
+    def _brain_offset(self, brain_id):
+        """Return a per-brain offset with string-key compatibility."""
+        return self.offsets.get(
+            brain_id, self.offsets.get(str(brain_id), 0.0)
+        )
 
     def read_counts(self, brain_id, voxel):
         """
@@ -913,7 +968,7 @@ class ValidateDataset(Dataset):
             Offset-subtracted raw counts.
         """
         raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
-        return raw - self.offsets.get(brain_id, 0.0)
+        return raw - self._brain_offset(brain_id)
 
     def sample_counts(self, brain_id, voxel, fg_mask=None, raw=None):
         """
@@ -942,9 +997,8 @@ class ValidateDataset(Dataset):
 
         Returns
         -------
-        Tuple[numpy.ndarray]
-            (raw, teacher, fg_mask) in count space. raw has the per-brain
-            offset subtracted; teacher is the clipped BM4D denoising.
+        dict
+            Named count-space patch record including source metadata.
         """
         if raw is None:
             raw = self.read_counts(brain_id, voxel)
@@ -958,7 +1012,21 @@ class ValidateDataset(Dataset):
         )
         if fg_mask is None:
             fg_mask = make_foreground_mask(raw)
-        return raw, teacher, fg_mask
+        model = self.noise_models.get(str(brain_id))
+        noise_params = (
+            (model.variance_slope, model.variance_intercept)
+            if model is not None
+            else (np.nan, np.nan)
+        )
+        return {
+            "raw": np.asarray(raw, dtype=np.float32),
+            "teacher": np.asarray(teacher, dtype=np.float32),
+            "foreground": np.asarray(fg_mask, dtype=np.uint8),
+            "brain_index": np.int32(self.brain_indices[str(brain_id)]),
+            "center": np.asarray(voxel, dtype=np.int64),
+            "offset": np.float32(self._brain_offset(brain_id)),
+            "noise_params": np.asarray(noise_params, dtype=np.float32),
+        }
 
     def ingest_example(self, brain_id, voxel, fg_mask=None, raw=None):
         """
@@ -978,9 +1046,12 @@ class ValidateDataset(Dataset):
             the caller. Avoids a redundant cloud read. Default is None.
         """
         # Sample image patch and its BM4D-denoised target
-        raw, teacher, fg_mask = self.sample_counts(
+        record = self.sample_counts(
             brain_id, voxel, fg_mask=fg_mask, raw=raw
         )
+        raw = record["raw"]
+        teacher = record["teacher"]
+        fg_mask = record["foreground"]
 
         # Preserve raw counts on the ground-truth neurite foreground
         if self.preserve_foreground:
@@ -994,6 +1065,7 @@ class ValidateDataset(Dataset):
         self.denoised.append(self.transform.forward(target))
         self.raws.append(raw)
         self.fg_masks.append(fg_mask.astype(np.float32))
+        self.records.append(record)
 
     def __getitem__(self, idx):
         """
@@ -1006,20 +1078,12 @@ class ValidateDataset(Dataset):
 
         Returns
         -------
-        x : numpy.ndarray
-            Noisy image patch in the normalized transform domain.
-        y : numpy.ndarray
-            BM4D-denoised image patch in the normalized transform domain.
-        raw : numpy.ndarray
-            Raw noisy image patch in counts (for count-space metrics).
-        fg_mask : numpy.ndarray
-            Foreground mask (float 0/1) for the metric split.
+        dict
+            Transformed model fields, count-space arrays, and patch-source
+            metadata.
         """
-        return (
-            self.noise[idx],
-            self.denoised[idx],
-            self.raws[idx],
-            self.fg_masks[idx],
+        return build_example_record(
+            self.transform, self.preserve_foreground, self.records[idx]
         )
 
     # --- Helpers ---
@@ -1043,6 +1107,147 @@ class ValidateDataset(Dataset):
         return self.imgs[brain_id][(0, 0, *slices)]
 
 
+_CACHE_CORE_FILES = {
+    "raw": "raw.npy",
+    "teacher": "teacher.npy",
+    "foreground": "fg.npy",
+}
+_CACHE_METADATA_FILES = {
+    "brain_index": "brain_index.npy",
+    "center": "center.npy",
+    "offset": "offset.npy",
+    "noise_params": "noise_params.npy",
+}
+
+
+def _load_cache(cache_dir, require_noise_metadata=False):
+    """Load and validate core arrays and optional patch-source metadata."""
+    arrays = {
+        name: np.load(os.path.join(cache_dir, filename), mmap_mode="r")
+        for name, filename in _CACHE_CORE_FILES.items()
+    }
+    lengths = {name: len(array) for name, array in arrays.items()}
+    if len(set(lengths.values())) != 1:
+        details = ", ".join(
+            f"{name}={length}" for name, length in sorted(lengths.items())
+        )
+        raise ValueError(f"cache arrays have inconsistent lengths: {details}")
+    expected_core_dtypes = {
+        "raw": np.dtype(np.float32),
+        "teacher": np.dtype(np.float32),
+        "foreground": np.dtype(np.uint8),
+    }
+    for name, expected_dtype in expected_core_dtypes.items():
+        if arrays[name].dtype != expected_dtype:
+            raise ValueError(
+                f"{_CACHE_CORE_FILES[name]} must have dtype {expected_dtype}, "
+                f"found {arrays[name].dtype}"
+            )
+
+    metadata_presence = {
+        name: os.path.isfile(os.path.join(cache_dir, filename))
+        for name, filename in _CACHE_METADATA_FILES.items()
+    }
+    brain_ids_path = os.path.join(cache_dir, "brain_ids.json")
+    metadata_presence["brain_ids"] = os.path.isfile(brain_ids_path)
+    has_metadata = all(metadata_presence.values())
+    if any(metadata_presence.values()) and not has_metadata:
+        missing = [
+            name for name, present in metadata_presence.items() if not present
+        ]
+        raise ValueError(
+            "cache has incomplete patch metadata; missing: "
+            + ", ".join(missing)
+        )
+
+    config_path = os.path.join(cache_dir, "config.json")
+    config = util.read_json(config_path) if os.path.isfile(config_path) else {}
+    noise_aware = require_noise_metadata or (
+        config.get("teacher_mode") == "gat_bm4d"
+    )
+    if noise_aware and not has_metadata:
+        raise ValueError(
+            "noise-aware run requires brain_index.npy, center.npy, offset.npy, "
+            "noise_params.npy, and brain_ids.json; this is a legacy cache"
+        )
+
+    if has_metadata:
+        metadata = {
+            name: np.load(os.path.join(cache_dir, filename), mmap_mode="r")
+            for name, filename in _CACHE_METADATA_FILES.items()
+        }
+        all_lengths = {**lengths, **{k: len(v) for k, v in metadata.items()}}
+        if len(set(all_lengths.values())) != 1:
+            details = ", ".join(
+                f"{name}={length}"
+                for name, length in sorted(all_lengths.items())
+            )
+            raise ValueError(
+                f"cache arrays have inconsistent lengths: {details}"
+            )
+        if metadata["brain_index"].ndim != 1:
+            raise ValueError("brain_index.npy must have shape (N,)")
+        if metadata["brain_index"].dtype not in (
+            np.dtype(np.int16), np.dtype(np.int32)
+        ):
+            raise ValueError("brain_index.npy must have dtype int16 or int32")
+        if metadata["center"].shape[1:] != (3,):
+            raise ValueError("center.npy must have shape (N, 3)")
+        if metadata["center"].dtype != np.dtype(np.int64):
+            raise ValueError("center.npy must have dtype int64")
+        if metadata["offset"].ndim != 1:
+            raise ValueError("offset.npy must have shape (N,)")
+        if metadata["offset"].dtype != np.dtype(np.float32):
+            raise ValueError("offset.npy must have dtype float32")
+        if metadata["noise_params"].shape[1:] != (2,):
+            raise ValueError("noise_params.npy must have shape (N, 2)")
+        if metadata["noise_params"].dtype != np.dtype(np.float32):
+            raise ValueError("noise_params.npy must have dtype float32")
+        brain_ids = util.read_json(brain_ids_path)
+        if not isinstance(brain_ids, list):
+            raise ValueError("brain_ids.json must contain an indexed list")
+        if len(metadata["brain_index"]):
+            min_index = int(np.min(metadata["brain_index"]))
+            max_index = int(np.max(metadata["brain_index"]))
+            if min_index < 0 or max_index >= len(brain_ids):
+                raise ValueError("brain_index.npy refers outside brain_ids.json")
+        if noise_aware and not np.all(np.isfinite(metadata["noise_params"])):
+            raise ValueError(
+                "noise-aware run requires finite per-patch noise parameters"
+            )
+        arrays.update(metadata)
+    else:
+        brain_ids = []
+
+    return arrays, brain_ids, config, has_metadata
+
+
+def _cached_record(arrays, idx, has_metadata):
+    """Read one count-space record, filling legacy metadata placeholders."""
+    record = {
+        "raw": np.asarray(arrays["raw"][idx], dtype=np.float32),
+        "teacher": np.asarray(arrays["teacher"][idx], dtype=np.float32),
+        "foreground": np.asarray(arrays["foreground"][idx], dtype=np.uint8),
+    }
+    if has_metadata:
+        record.update(
+            brain_index=np.int32(arrays["brain_index"][idx]),
+            center=np.asarray(arrays["center"][idx], dtype=np.int64),
+            offset=np.float32(arrays["offset"][idx]),
+            noise_params=np.asarray(
+                arrays["noise_params"][idx], dtype=np.float32
+            ),
+        )
+    else:
+        record.update(
+            brain_index=np.int32(-1),
+            center=np.full(3, -1, dtype=np.int64),
+            offset=np.float32(0),
+            noise_params=np.full(2, np.nan, dtype=np.float32),
+        )
+    return record
+
+
 class CachedPatchDataset(Dataset):
     """
     Dataset that samples precomputed count-space patches from disk.
@@ -1062,7 +1267,7 @@ class CachedPatchDataset(Dataset):
 
     def __init__(
         self, cache_dir, transform=None, preserve_foreground=True,
-        n_examples_per_epoch=None,
+        n_examples_per_epoch=None, require_noise_metadata=False,
     ):
         """
         Instantiates a CachedPatchDataset.
@@ -1081,11 +1286,16 @@ class CachedPatchDataset(Dataset):
             Number of examples drawn per epoch. Default is the pool size.
         """
         super(CachedPatchDataset, self).__init__()
-        self.raw = np.load(os.path.join(cache_dir, "raw.npy"), mmap_mode="r")
-        self.teacher = np.load(
-            os.path.join(cache_dir, "teacher.npy"), mmap_mode="r"
+        arrays, brain_ids, config, has_metadata = _load_cache(
+            cache_dir, require_noise_metadata=require_noise_metadata
         )
-        self.fg = np.load(os.path.join(cache_dir, "fg.npy"), mmap_mode="r")
+        self.raw = arrays["raw"]
+        self.teacher = arrays["teacher"]
+        self.fg = arrays["foreground"]
+        self.arrays = arrays
+        self.brain_ids = brain_ids
+        self.cache_config = config
+        self.has_metadata = has_metadata
         self.transform = transform or build_transform({"kind": "asinh"})
         self.preserve_foreground = preserve_foreground
         self.patch_shape = tuple(self.raw.shape[1:])
@@ -1108,15 +1318,13 @@ class CachedPatchDataset(Dataset):
 
         Returns
         -------
-        Tuple[numpy.ndarray]
-            (x, y, fg_mask) for the model.
+        dict
+            Model fields, count-space arrays, and source metadata.
         """
         idx = random.randint(0, len(self.raw) - 1)
-        raw = np.asarray(self.raw[idx], dtype=np.float32)
-        teacher = np.asarray(self.teacher[idx], dtype=np.float32)
-        fg_mask = np.asarray(self.fg[idx])
-        return build_training_example(
-            self.transform, self.preserve_foreground, raw, teacher, fg_mask
+        record = _cached_record(self.arrays, idx, self.has_metadata)
+        return build_example_record(
+            self.transform, self.preserve_foreground, record
         )
 
 
@@ -1142,6 +1350,7 @@ class CachedValidateDataset(Dataset):
 
     def __init__(
         self, cache_dir, transform=None, preserve_foreground=True,
+        require_noise_metadata=False,
     ):
         """
         Instantiates a CachedValidateDataset.
@@ -1158,11 +1367,16 @@ class CachedValidateDataset(Dataset):
             True.
         """
         super(CachedValidateDataset, self).__init__()
-        self.raw = np.load(os.path.join(cache_dir, "raw.npy"), mmap_mode="r")
-        self.teacher = np.load(
-            os.path.join(cache_dir, "teacher.npy"), mmap_mode="r"
+        arrays, brain_ids, config, has_metadata = _load_cache(
+            cache_dir, require_noise_metadata=require_noise_metadata
         )
-        self.fg = np.load(os.path.join(cache_dir, "fg.npy"), mmap_mode="r")
+        self.raw = arrays["raw"]
+        self.teacher = arrays["teacher"]
+        self.fg = arrays["foreground"]
+        self.arrays = arrays
+        self.brain_ids = brain_ids
+        self.cache_config = config
+        self.has_metadata = has_metadata
         self.transform = transform or build_transform({"kind": "asinh"})
         self.preserve_foreground = preserve_foreground
         self.patch_shape = tuple(self.raw.shape[1:])
@@ -1182,18 +1396,13 @@ class CachedValidateDataset(Dataset):
 
         Returns
         -------
-        Tuple[numpy.ndarray]
-            (x, y, raw, fg_mask) matching ValidateDataset.__getitem__: model
-            input, target, raw counts (for count-space metrics), and the
-            foreground mask (float 0/1).
+        dict
+            Model fields, count-space arrays, and source metadata.
         """
-        raw = np.asarray(self.raw[idx], dtype=np.float32)
-        teacher = np.asarray(self.teacher[idx], dtype=np.float32)
-        fg_mask = np.asarray(self.fg[idx])
-        x, y, fg = build_training_example(
-            self.transform, self.preserve_foreground, raw, teacher, fg_mask
+        record = _cached_record(self.arrays, idx, self.has_metadata)
+        return build_example_record(
+            self.transform, self.preserve_foreground, record
         )
-        return x, y, raw, fg
 
 
 # --- Custom Dataloader ---
@@ -1262,7 +1471,7 @@ class DataLoader:
         Returns
         -------
         iterator
-            Yields batches of tensors.
+            Yields dictionaries of tensors stacked by field shape.
         """
         starts = list(range(0, len(self.dataset), self.batch_size))
         if not starts:
@@ -1316,16 +1525,28 @@ class DataLoader:
             futures = [executor.submit(_worker_getitem, idx) for idx in indices]
             results = [f.result() for f in as_completed(futures)]
 
-        # Stack each field of the example tuple into its own batch tensor.
-        # Handles the (x, y, fg_mask) train shape and the
-        # (x, y, raw, fg_mask) validation shape alike.
-        shape = (batch_size, 1,) + self.patch_shape
-        n_fields = len(results[0])
-        batched = [np.zeros(shape) for _ in range(n_fields)]
-        for i, fields in enumerate(results):
-            for j, field in enumerate(fields):
-                batched[j][i, 0, ...] = field
-        return tuple(to_tensor(arr) for arr in batched)
+        if not isinstance(results[0], dict):
+            raise TypeError("dataset examples must be dictionaries")
+        keys = tuple(results[0])
+        if any(tuple(result) != keys for result in results[1:]):
+            raise ValueError("dataset examples have inconsistent fields")
+
+        patch_fields = {
+            "input", "target", "raw", "teacher", "foreground"
+        }
+        batch = dict()
+        for key in keys:
+            values = [np.asarray(result[key]) for result in results]
+            stacked = np.stack(values, axis=0)
+            if key in patch_fields:
+                if tuple(stacked.shape[1:]) != self.patch_shape:
+                    raise ValueError(
+                        f"patch field {key!r} has shape {stacked.shape[1:]}, "
+                        f"expected {self.patch_shape}"
+                    )
+                stacked = np.expand_dims(stacked, axis=1)
+            batch[key] = to_tensor(stacked)
+        return batch
 
 
 # --- Helpers ---
@@ -1464,4 +1685,4 @@ def to_tensor(arr):
     torch.Tensor
         Array converted to a torch tensor.
     """
-    return torch.tensor(arr, dtype=torch.float)
+    return torch.as_tensor(arr)
