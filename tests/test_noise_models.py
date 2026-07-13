@@ -1,24 +1,43 @@
-"""Tests for per-brain noise-model validation and estimation."""
+"""Tests for noise-model validation and patch-fit aggregation."""
 
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
+from aind_exaspim_image_compression.machine_learning import (
+    clipped_poisson_gaussian as estimator_module,
+)
 from aind_exaspim_image_compression.machine_learning.noise_models import (
+    NoiseEstimate,
     NoiseModel,
-    bin_lower_envelope,
-    collect_window_statistics,
-    estimate_noise_model,
-    fit_variance_law,
+    aggregate_noise_estimates,
+    clipped_normal_moments,
+    estimate_clipped_poisson_gaussian,
     load_noise_models,
-    reject_structured_windows,
+    plot_fit,
     save_noise_models,
     validate_noise_model,
     validate_noise_models,
 )
+
+
+def make_estimate(a, b, counts=(10, 20, 30)):
+    """Construct a compact normalized estimate for aggregation tests."""
+    counts = np.asarray(counts, dtype=float)
+    values = np.linspace(0.2, 0.8, len(counts))
+    return NoiseEstimate(
+        a=a,
+        b=b,
+        level_means=values,
+        level_stds=np.full(len(counts), 0.1),
+        level_counts=counts,
+        model_stds=np.full(len(counts), 0.1),
+        smooth_fraction=0.75,
+    )
 
 
 class NoiseModelSchemaTest(unittest.TestCase):
@@ -79,207 +98,215 @@ class NoiseModelSchemaTest(unittest.TestCase):
             validate_noise_models({"a": valid}, required_brain_ids=["b"])
 
 
-class WindowStatisticsTest(unittest.TestCase):
-    """Tests single-acquisition spatial-window measurements."""
+class CountSpaceAggregationTest(unittest.TestCase):
+    """Tests conversion and robust aggregation of normalized patch fits."""
 
-    def test_excludes_padding_saturation_and_nonfinite(self):
-        """Sensor-invalid windows receive explicit exclusion reasons."""
-        good = np.arange(1, 65, dtype=np.float32).reshape(4, 4, 4) + 100
-        zero = np.zeros_like(good)
-        saturated = good.copy()
-        saturated[0, 0, 0] = 65500
-        nonfinite = good.copy()
-        nonfinite[0, 0, 0] = np.nan
-        stats = collect_window_statistics(
-            [good, zero, saturated, nonfinite], window_shape=(4, 4, 4)
-        )
-        self.assertEqual(
-            stats["exclusion"].tolist(),
-            ["", "zero_padding", "near_saturation", "nonfinite"],
-        )
-        np.testing.assert_array_equal(
-            stats["eligible"], [True, False, False, False]
-        )
-
-    def test_spatial_variance_and_invalid_shapes(self):
-        """Variance is spatial and invalid window geometry is rejected."""
-        first = np.arange(1, 65, dtype=np.float32).reshape(4, 4, 4) + 100
-        stats = collect_window_statistics([first], window_shape=(4, 4, 4))
-        expected = np.var(first, ddof=1, dtype=np.float64)
-        self.assertAlmostEqual(stats["variance"][0], expected)
-        with self.assertRaises(ValueError):
-            collect_window_statistics([first[0]])
-        with self.assertRaises(ValueError):
-            collect_window_statistics([first], window_shape=(4, 4))
-        with self.assertRaises(ValueError):
-            collect_window_statistics([first], window_shape=(1, 4, 4))
-        with self.assertRaises(ValueError):
-            collect_window_statistics([first], zero_padding_fraction=0)
-
-    def test_isolated_zero_is_not_treated_as_padding(self):
-        """Clipped zeroes inside otherwise valid tissue remain eligible."""
-        patch = np.full((4, 4, 4), 10, dtype=np.float32)
-        patch[0, 0, 0] = 0
-        stats = collect_window_statistics(
-            [patch],
-            window_shape=(4, 4, 4),
-            zero_padding_fraction=0.5,
-        )
-        self.assertTrue(stats["eligible"][0])
-
-    def test_neighbor_differences_suppress_smooth_structure(self):
-        """First differences remove a linear ramp but preserve random noise."""
-        rng = np.random.default_rng(42)
-        noise = rng.normal(0, 5, size=(16, 16, 16)).astype(np.float32)
-        ramp = np.indices(noise.shape).sum(axis=0).astype(np.float32) * 20
-        patch = 1000 + ramp + noise
-        spatial = collect_window_statistics(
-            [patch],
-            window_shape=patch.shape,
-            variance_estimator="spatial",
-        )
-        differences = collect_window_statistics(
-            [patch],
-            window_shape=patch.shape,
-            variance_estimator="neighbor_difference",
-        )
-        self.assertGreater(spatial["variance"][0], 10000)
-        self.assertAlmostEqual(differences["variance"][0], 25, delta=3)
-        self.assertEqual(
-            differences["variance_estimator"], "neighbor_difference"
-        )
-        with self.assertRaises(ValueError):
-            collect_window_statistics([patch], variance_estimator="unknown")
-
-    def test_structure_filter(self):
-        """Empirical filters retain the quietest eligible windows."""
-        stats = {
-            "eligible": np.ones(4, dtype=bool),
-            "exclusion": np.array(["", "", "", ""]),
-            "mean": np.full(4, 10.0),
-            "variance": np.array([1.0, 4.0, 100.0, 1.0]),
-            "gradient_rms": np.array([1.0, 2.0, 100.0, 1.0]),
-            "structure_fraction": np.array([0.1, 0.2, 0.1, 0.9]),
-        }
-        filtered = reject_structured_windows(
-            stats, gradient_quantile=0.75, structure_quantile=0.75
-        )
-        np.testing.assert_array_equal(filtered["accepted"], [1, 1, 0, 0])
-        self.assertEqual(filtered["exclusion"][2], "strong_gradient")
-        self.assertEqual(filtered["exclusion"][3], "spatial_structure")
-        for kwargs in (
-            {"gradient_quantile": 0},
-            {"structure_quantile": 1.1},
-            {"offset": np.nan},
-            {"min_signal_above_offset": -1},
-            {"intensity_bins": 0},
-        ):
-            with self.assertRaises(ValueError):
-                reject_structured_windows(stats, **kwargs)
-
-        empty = dict(stats)
-        empty["eligible"] = np.zeros(4, dtype=bool)
-        filtered = reject_structured_windows(empty)
-        self.assertFalse(np.any(filtered["accepted"]))
-        self.assertEqual(filtered["gradient_limits"].size, 0)
-
-    def test_rejects_exterior_without_bright_noise_bias(self):
-        """Exterior is removed without bias against brighter noise."""
-        stats = {
-            "eligible": np.ones(4, dtype=bool),
-            "exclusion": np.array(["", "", "", ""]),
-            "mean": np.array([1.0, 7.0, 101.0, 1001.0]),
-            "variance": np.array([1.0, 4.0, 100.0, 10000.0]),
-            "gradient_rms": np.array([1.0, 2.0, 10.0, 100.0]),
-            "structure_fraction": np.full(4, 0.1),
-        }
-        filtered = reject_structured_windows(
-            stats,
-            gradient_quantile=1.0,
-            structure_quantile=1.0,
-            offset=1.0,
-            min_signal_above_offset=4.0,
-        )
-        np.testing.assert_array_equal(filtered["accepted"], [0, 1, 1, 1])
-        np.testing.assert_allclose(filtered["gradient_score"], 1.0)
-        self.assertEqual(filtered["exclusion"][0], "below_min_signal")
-
-
-class VarianceFitTest(unittest.TestCase):
-    """Tests lower-envelope binning and constrained robust fitting."""
-
-    def test_recovers_variance_law_with_outlier(self):
-        """Robust nonnegative fitting recovers a line despite one outlier."""
-        means = np.linspace(0, 1000, 20)
-        variances = 1.8 * means + 400
-        variances[10] += 10000
-        slope, intercept = fit_variance_law(means, variances)
-        self.assertAlmostEqual(slope, 1.8, delta=0.05)
-        self.assertAlmostEqual(intercept, 400, delta=30)
-
-    def test_lower_envelope_and_end_to_end_estimate(self):
-        """Model construction uses accepted, offset-corrected data."""
-        means = np.repeat(np.linspace(100, 1100, 11), 10)
-        variance = 2 * (means - 100) + 25
-        variance += np.tile(np.linspace(0, 9, 10), 11)
-        bin_x, bin_y, counts = bin_lower_envelope(
-            means - 100,
-            variance,
-            n_bins=10,
-            lower_quantile=0,
-            min_bin_samples=5,
-        )
-        slope, intercept = fit_variance_law(bin_x, bin_y, counts)
-        self.assertAlmostEqual(slope, 2, delta=0.05)
-        self.assertAlmostEqual(intercept, 25, delta=20)
-        stats = {
-            "accepted": np.ones_like(means, dtype=bool),
-            "mean": means,
-            "variance": variance,
-        }
-        model, fit = estimate_noise_model(
-            stats,
-            offset=100,
+    def test_conversion_and_weighted_medians(self):
+        """Retained smooth samples weight both count-space coordinates."""
+        estimates = [
+            make_estimate(0.01, 0.001, counts=(1,)),
+            make_estimate(0.02, 0.002, counts=(20,)),
+            make_estimate(0.50, 0.100, counts=(1,)),
+        ]
+        model, diagnostics = aggregate_noise_estimates(
+            estimates,
+            offset=10,
+            max_count=100,
             sampling_weight=4,
-            saturation_margin=64,
-            n_bins=10,
-            lower_quantile=0,
-            min_bin_samples=5,
+            saturation_margin=500,
         )
-        self.assertAlmostEqual(model.variance_slope, 2, delta=0.05)
-        self.assertEqual(model.sampling_weight, 4)
-        self.assertEqual(model.saturation_margin, 64)
-        self.assertEqual(len(fit["residuals"]), len(fit["bin_means"]))
+        self.assertEqual(model, NoiseModel(10, 2, 40, 4, 500))
+        np.testing.assert_allclose(diagnostics["patch_slopes"], [1, 2, 50])
+        np.testing.assert_allclose(
+            diagnostics["patch_intercepts"], [20, 40, 1500]
+        )
+        np.testing.assert_allclose(diagnostics["patch_weights"], [1, 20, 1])
+        self.assertEqual(diagnostics["valid_fits"], 3)
+        self.assertEqual(diagnostics["failed_fits"], 0)
+        self.assertEqual(diagnostics["required_valid_fits"], 3)
+        self.assertEqual(diagnostics["aggregate_slope"], 2)
+        self.assertEqual(diagnostics["aggregate_intercept"], 40)
 
-    def test_invalid_fit_inputs(self):
-        """Fit helpers reject underspecified and unphysical samples."""
-        invalid_bin_kwargs = [
-            ([1], [1], {}),
-            ([1, 2], [1, 2], {"n_bins": 1}),
-            ([1, 2], [1, 2], {"lower_quantile": -1}),
-            ([1, 2], [1, 2], {"min_bin_samples": 0}),
-            ([1, 1], [1, 2], {}),
-            ([1, 2, 100], [1, 2, 3], {"min_bin_samples": 2}),
+    def test_nonfinite_fits_are_rejected(self):
+        """Unusable parameters and level counts do not contribute."""
+        estimates = [
+            make_estimate(0.01, 0.001),
+            make_estimate(0.02, 0.002),
+            make_estimate(0.03, 0.003),
+            make_estimate(np.nan, 0.001),
+            make_estimate(0.01, 0.001, counts=(0,)),
         ]
-        for means, variances, kwargs in invalid_bin_kwargs:
-            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
-                bin_lower_envelope(means, variances, **kwargs)
+        _, diagnostics = aggregate_noise_estimates(
+            estimates, offset=0, max_count=100, requested_patches=5
+        )
+        np.testing.assert_array_equal(diagnostics["valid_indices"], [0, 1, 2])
+        np.testing.assert_array_equal(diagnostics["invalid_indices"], [3, 4])
+        self.assertEqual(diagnostics["failed_fits"], 2)
 
-        invalid_fit_args = [
-            ([1], [1], None),
-            ([1, 2], [1], None),
-            ([1, np.nan], [1, 2], None),
-            ([-1, 2], [1, 2], None),
-            ([1, 2], [1, 2], [1]),
-            ([1, 2], [1, 2], [1, 0]),
-        ]
-        for means, variances, counts in invalid_fit_args:
-            with self.subTest(counts=counts), self.assertRaises(ValueError):
-                fit_variance_law(means, variances, counts)
+    def test_nonfinite_count_space_conversion_is_rejected(self):
+        """Finite normalized fits that overflow count space are discarded."""
+        estimates = [make_estimate(0.01, 0.001)] * 3
+        estimates.append(make_estimate(1e308, 0.001))
+        with np.errstate(over="ignore"):
+            _, diagnostics = aggregate_noise_estimates(
+                estimates, offset=0, max_count=100, requested_patches=4
+            )
+        np.testing.assert_array_equal(diagnostics["invalid_indices"], [3])
 
-        slope, intercept = fit_variance_law([0, 1], [2, 5])
-        self.assertAlmostEqual(slope, 3)
-        self.assertAlmostEqual(intercept, 2)
+    def test_insufficient_valid_patch_majority_fails(self):
+        """Fewer than the required valid patch fits fails clearly."""
+        estimates = [make_estimate(0.01, 0.001)] * 2 + [None] * 4
+        with self.assertRaisesRegex(ValueError, "only 2 of 6.*at least 3"):
+            aggregate_noise_estimates(
+                estimates, offset=0, max_count=100, requested_patches=6
+            )
+        with self.assertRaisesRegex(ValueError, "at least 3"):
+            aggregate_noise_estimates(
+                [make_estimate(0.01, 0.001)] * 2,
+                offset=0,
+                max_count=100,
+            )
+
+    def test_negative_final_intercept_is_not_clamped(self):
+        """An unphysical aggregate intercept fails instead of becoming zero."""
+        estimates = [make_estimate(0.01, -0.01)] * 3
+        with self.assertRaisesRegex(ValueError, "intercept is negative"):
+            aggregate_noise_estimates(estimates, offset=0, max_count=100)
+
+    def test_invalid_aggregation_configuration(self):
+        """Invalid white levels and requested patch counts are rejected."""
+        estimates = [make_estimate(0.01, 0.001)] * 3
+        for max_count in (0, np.inf, "bad"):
+            with (
+                self.subTest(max_count=max_count),
+                self.assertRaises(ValueError),
+            ):
+                aggregate_noise_estimates(
+                    estimates, offset=0, max_count=max_count
+                )
+        for requested in (0, 1.5, True, np.inf, "bad"):
+            with (
+                self.subTest(requested=requested),
+                self.assertRaises(ValueError),
+            ):
+                aggregate_noise_estimates(
+                    estimates,
+                    offset=0,
+                    max_count=100,
+                    requested_patches=requested,
+                )
+        with self.assertRaisesRegex(ValueError, "cannot outnumber"):
+            aggregate_noise_estimates(
+                estimates, offset=0, max_count=100, requested_patches=2
+            )
+
+
+class EstimatorInterfaceTest(unittest.TestCase):
+    """Tests deterministic public estimator behavior and diagnostics."""
+
+    def test_clipped_normal_moments(self):
+        """Closed-form clipped moments match fixed reference values."""
+        mean, std = clipped_normal_moments(
+            np.array([0.0, 0.5, -0.2, 1.2]),
+            np.array([1.0, 0.2, 0.1, 0.1]),
+        )
+        np.testing.assert_allclose(
+            mean,
+            [0.3156268098137464, 0.5, 0.000849070261683, 0.999150929738317],
+            rtol=1e-12,
+            atol=1e-14,
+        )
+        np.testing.assert_allclose(
+            std,
+            [
+                0.39800627181949505,
+                0.19774326622697488,
+                0.007547605370972,
+                0.007547605370966,
+            ],
+            rtol=1e-12,
+            atol=1e-14,
+        )
+
+    def test_invalid_dimensions_modes_and_level_sets(self):
+        """Invalid geometry, modes, and flat data fail clearly."""
+        for shape in ((10,), (2, 2, 2, 2)):
+            with (
+                self.subTest(shape=shape),
+                self.assertRaisesRegex(ValueError, "2-D image or a 3-D"),
+            ):
+                estimate_clipped_poisson_gaussian(np.zeros(shape))
+        with self.assertRaisesRegex(ValueError, "mode must be"):
+            estimate_clipped_poisson_gaussian(
+                np.zeros((16, 16)), mode="temporal"
+            )
+        with self.assertRaisesRegex(RuntimeError, "Too few usable"):
+            estimate_clipped_poisson_gaussian(
+                np.zeros((32, 32)), min_samples_per_level=10
+            )
+        texture = np.random.default_rng(2).normal(size=(32, 32))
+        with self.assertRaisesRegex(RuntimeError, "Too few usable"):
+            estimate_clipped_poisson_gaussian(
+                texture, min_samples_per_level=100
+            )
+
+        ramp = np.linspace(0, 1, 64)[None, :] + np.zeros((64, 1))
+        with self.assertRaisesRegex(RuntimeError, "Too few usable"):
+            estimate_clipped_poisson_gaussian(
+                ramp, n_levels=60, min_samples_per_level=200
+            )
+        with patch.object(
+            estimator_module,
+            "_unbias_std_factor",
+            return_value=np.nan,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Too few usable"):
+                estimate_clipped_poisson_gaussian(
+                    ramp, n_levels=10, min_samples_per_level=20
+                )
+
+    def test_inverse_mean_and_boundary_initialization(self):
+        """Bisection inversion and boundary-only initialization are stable."""
+        targets = np.array([0.1, 0.5, 0.9])
+        intensities = estimator_module._invert_clipped_mean(
+            targets, 0.01, 0.001
+        )
+        sigma = np.sqrt(np.maximum(0.01 * intensities + 0.001, 0))
+        recovered, _ = clipped_normal_moments(intensities, sigma)
+        np.testing.assert_allclose(recovered, targets, atol=1e-12)
+
+        rng = np.random.default_rng(1)
+        boundary = np.clip(rng.normal(0, 0.01, (64, 64)), 0, 1)
+        with patch.object(
+            estimator_module.np.linalg,
+            "lstsq",
+            wraps=estimator_module.np.linalg.lstsq,
+        ) as least_squares:
+            estimate = estimate_clipped_poisson_gaussian(
+                boundary, n_levels=10, min_samples_per_level=20
+            )
+        self.assertEqual(least_squares.call_count, 0)
+        self.assertTrue(np.isfinite(estimate.a))
+        self.assertTrue(np.isfinite(estimate.b))
+
+    def test_noise_estimate_curves_and_plot(self):
+        """The result container evaluates and plots both fitted curves."""
+        import matplotlib.pyplot as plt
+
+        estimate = make_estimate(0.01, 0.001)
+        sigma = estimate.sigma(np.array([-1.0, 0.0, 1.0]))
+        np.testing.assert_allclose(
+            sigma, [0.0, np.sqrt(0.001), np.sqrt(0.011)]
+        )
+        means, stds = estimate.clipped_curve(np.array([0.2, 0.8]))
+        self.assertEqual(means.shape, (2,))
+        self.assertEqual(stds.shape, (2,))
+
+        axis = plot_fit(estimate, title="diagnostic")
+        self.assertEqual(axis.get_title(), "diagnostic")
+        self.assertEqual(len(axis.lines), 2)
+        self.assertEqual(len(axis.collections), 1)
+        plt.close(axis.figure)
 
 
 if __name__ == "__main__":
