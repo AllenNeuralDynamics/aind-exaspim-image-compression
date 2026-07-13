@@ -58,7 +58,6 @@ def train(train_cache_dir, val_cache_dir):
         train_cache_dir,
         transform=transform,
         preserve_foreground=preserve_foreground,
-        n_examples_per_epoch=n_train_examples_per_epoch,
     )
     val_dataset = data_handling.CachedValidateDataset(
         val_cache_dir,
@@ -86,6 +85,7 @@ def train(train_cache_dir, val_cache_dir):
         checkpoint_weights=checkpoint_weights,
         num_workers=0,
         val_every=val_every,
+        seed=seed,
     )
 
     # Persist the run configuration next to the checkpoints/tensorboard so each
@@ -96,7 +96,6 @@ def train(train_cache_dir, val_cache_dir):
             "val_cache_dir": val_cache_dir,
             "resume_path": resume_path,
             "transform_cfg": transform.cfg,
-            "n_train_examples_per_epoch": n_train_examples_per_epoch,
             "preserve_foreground": preserve_foreground,
         }
     )
@@ -112,11 +111,10 @@ if __name__ == "__main__":
     # Both patch caches are required. Build them with precompute.py --split
     # train and precompute.py --split val before starting training.
     train_cache_dir = (
-        "/root/capsule/data/denoise_net_patch_cache_2026_07_10/patch_cache"
+        "/root/capsule/data/denoise_net_patch_cache_2026_07_13/patch_cache"
     )
     val_cache_dir = (
-        "/root/capsule/data/denoise_net_patch_cache_2026_07_10/"
-        "val_patch_cache"
+        "/root/capsule/data/denoise_net_patch_cache_2026_07_13/val_patch_cache"
     )
     util.mkdir(output_dir)
 
@@ -133,12 +131,10 @@ if __name__ == "__main__":
     # Training parameters
     batch_size = 32
     lr = 1e-3
-    max_epochs = 500
-    n_train_examples_per_epoch = 300
-    # Validate (and consider a checkpoint) every this many epochs. A larger
-    # cached validation set is cheap to store but CPU-bound to score, so keep
-    # this above 1 to avoid the metrics dominating epoch time.
-    val_every = 3
+    max_epochs = 20
+    # Validate (and consider a checkpoint) after every full-cache epoch.
+    val_every = 1
+    seed = 42
 
     # Signal-preserving loss + target/sampling (Parts E/F). preserve_foreground
     # keeps raw counts on the foreground so BM4D cannot erase neurites; that
@@ -147,7 +143,7 @@ if __name__ == "__main__":
     # output compresses no better than raw. Keep fg_weight modest (~1-3) so
     # background denoising, not foreground copying, dominates the loss.
     fg_weight = 0
-    preserve_foreground = True
+    preserve_foreground = False
 
     # Checkpoint selection (Part C). None => fidelity-only (cratio weight 0),
     # which cannot see compression and happily selects a non-denoising model
@@ -156,7 +152,7 @@ if __name__ == "__main__":
     # exists for. cratio is the operating-point knob: raise it to trade
     # fidelity for compression, lower it to protect faint neurites.
     checkpoint_weights = dict(
-        fg_mae=1.0, bg_mae=0.2, top_pct_error=0.5, cratio=2.0
+        fg_mae=1.0, bg_mae=0.2, top_pct_error=0.5, cratio=5.0
     )
 
     # Main

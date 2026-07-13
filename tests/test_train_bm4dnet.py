@@ -104,8 +104,8 @@ class CachedTrainingTest(unittest.TestCase):
             "fg_weight": 0,
             "checkpoint_weights": {"fg_mae": 1.0},
             "val_every": 2,
+            "seed": 42,
             "preserve_foreground": True,
-            "n_train_examples_per_epoch": 7,
             "resume_path": None,
         }
         previous = {key: globals_.get(key) for key in settings}
@@ -125,6 +125,7 @@ class CachedTrainingTest(unittest.TestCase):
                 val_dataset.__len__.return_value = 3
                 val_dataset.transform = transform
                 trainer = MagicMock()
+                trainer_factory = MagicMock(return_value=trainer)
 
                 data_handling = self.namespace["data_handling"]
                 with patch.object(
@@ -138,7 +139,7 @@ class CachedTrainingTest(unittest.TestCase):
                 ) as cached_val, patch.object(
                     data_handling, "init_datasets"
                 ) as init_datasets, patch.dict(
-                    globals_, {"Trainer": MagicMock(return_value=trainer)}
+                    globals_, {"Trainer": trainer_factory}
                 ):
                     train(str(train_cache), str(val_cache))
 
@@ -147,7 +148,6 @@ class CachedTrainingTest(unittest.TestCase):
                     str(train_cache),
                     transform=ANY,
                     preserve_foreground=True,
-                    n_examples_per_epoch=7,
                 )
                 cached_val.assert_called_once_with(
                     str(val_cache),
@@ -159,8 +159,11 @@ class CachedTrainingTest(unittest.TestCase):
                 self.assertEqual(config["train_cache_dir"], str(train_cache))
                 self.assertEqual(config["val_cache_dir"], str(val_cache))
                 self.assertEqual(config["transform_cfg"], transform.cfg)
+                self.assertNotIn("n_train_examples_per_epoch", config)
                 self.assertNotIn("brain_ids_path", config)
                 self.assertNotIn("sigma_bm4d", config)
+                trainer_call = trainer_factory.call_args
+                self.assertEqual(trainer_call.kwargs["seed"], 42)
         finally:
             for key, value in previous.items():
                 if value is None:

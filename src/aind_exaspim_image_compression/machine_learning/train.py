@@ -76,6 +76,7 @@ class Trainer:
         num_workers=None,
         prefetch=2,
         val_every=1,
+        seed=0,
     ):
         """
         Instantiates a Trainer object.
@@ -101,6 +102,9 @@ class Trainer:
             the final epoch is always validated. The count-space metrics are
             CPU-bound, so a large validation set is only cheap if it is not run
             every epoch. Default is 1 (validate every epoch).
+        seed : int, optional
+            Seed used to reproducibly shuffle training examples by epoch.
+            Default is 0.
         """
         # Initializations
         exp_name = "session-" + datetime.today().strftime("%Y%m%d_%H%M")
@@ -115,6 +119,7 @@ class Trainer:
         self.num_workers = num_workers
         self.prefetch = prefetch
         self.val_every = max(1, int(val_every))
+        self.seed = seed
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
         self.criterion = SignalPreservingLoss(fg_weight=fg_weight)
@@ -172,18 +177,22 @@ class Trainer:
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             prefetch=self.prefetch,
+            shuffle=True,
+            seed=self.seed,
         )
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             prefetch=self.prefetch,
+            shuffle=False,
         )
 
         # Main
         self.best_score = np.inf
         for epoch in range(self.max_epochs):
             # Train
+            train_dataloader.set_epoch(epoch)
             train_loss = self.train_step(train_dataloader, epoch)
 
             # Validate every val_every epochs (and always on the final epoch);
@@ -427,6 +436,7 @@ class Trainer:
             "num_workers": self.num_workers,
             "prefetch": self.prefetch,
             "val_every": self.val_every,
+            "seed": self.seed,
             "fg_weight": getattr(self.criterion, "fg_weight", None),
             "checkpoint_weights": self.checkpoint_weights,
             "lr": self.optimizer.param_groups[0]["lr"],
