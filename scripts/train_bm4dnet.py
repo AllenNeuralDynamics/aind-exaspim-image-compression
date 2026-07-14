@@ -131,7 +131,7 @@ if __name__ == "__main__":
     # Training parameters
     batch_size = 32
     lr = 1e-3
-    max_epochs = 20
+    max_epochs = 30
     # Validate (and consider a checkpoint) after every full-cache epoch.
     val_every = 1
     seed = 42
@@ -152,7 +152,7 @@ if __name__ == "__main__":
     # exists for. cratio is the operating-point knob: raise it to trade
     # fidelity for compression, lower it to protect faint neurites.
     checkpoint_weights = dict(
-        fg_mae=1.0, bg_mae=0.2, top_pct_error=0.5, cratio=5.0
+        fg_mae=1.0, bg_mae=0.2, top_pct_error=0.5, cratio=10.0
     )
 
     # Main
