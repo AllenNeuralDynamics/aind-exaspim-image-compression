@@ -8,7 +8,6 @@ Code used to train neural network to denoise images.
 
 """
 
-from contextlib import nullcontext
 from datetime import datetime
 from numcodecs import blosc
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -71,6 +70,7 @@ class Trainer:
         max_epochs=400,
         model=None,
         use_amp=True,
+        use_amp_validation=False,
         checkpoint_weights=None,
         fg_weight=20.0,
         num_workers=None,
@@ -96,7 +96,12 @@ class Trainer:
         model : None or nn.Module, optional
             Model to be trained on the given datasets. Default is None.
         use_amp : bool, optional
-            Indication of whether to use mixed precision. Default is True.
+            Whether to use CUDA float16 autocast and gradient scaling during
+            training. Default is True.
+        use_amp_validation : bool, optional
+            Whether to use CUDA float16 autocast during validation and
+            checkpoint selection. Default is False so validation matches FP32
+            production inference.
         val_every : int, optional
             Run validation (and checkpoint selection) every this many epochs;
             the final epoch is always validated. The count-space metrics are
@@ -120,6 +125,8 @@ class Trainer:
         self.prefetch = prefetch
         self.val_every = max(1, int(val_every))
         self.seed = seed
+        self.use_amp = bool(use_amp)
+        self.use_amp_validation = bool(use_amp_validation)
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
         self.criterion = SignalPreservingLoss(fg_weight=fg_weight)
@@ -134,15 +141,10 @@ class Trainer:
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=max_epochs)
         self.writer = SummaryWriter(log_dir=log_dir)
 
-        if use_amp:
-            self.autocast = torch.autocast(device_type="cuda", dtype=torch.float16)
-        else:
-            self.autocast = nullcontext()
-
         # Scale the loss before backward so small float16 gradients do not
         # underflow (and are unscaled before the step). Disabled => no-op, so
         # the same code path is correct with and without AMP.
-        self.scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
     # --- Core Routines ---
     def run(self, train_dataset, val_dataset):
@@ -232,7 +234,9 @@ class Trainer:
         self.model.train()
         for x, y, fg_mask in train_dataloader:
             # Forward pass
-            hat_y, loss = self.forward_pass(x, y, fg_mask)
+            hat_y, loss = self.forward_pass(
+                x, y, fg_mask, use_amp=self.use_amp
+            )
 
             # Backward pass (loss-scaled for AMP stability)
             self.optimizer.zero_grad()
@@ -276,7 +280,9 @@ class Trainer:
             self.model.eval()
             for x, y, raw, fg_mask in val_dataloader:
                 # Run model
-                hat_y, loss = self.forward_pass(x, y, fg_mask)
+                hat_y, loss = self.forward_pass(
+                    x, y, fg_mask, use_amp=self.use_amp_validation
+                )
 
                 # Evaluate result
                 losses.append(loss.detach().cpu())
@@ -313,7 +319,7 @@ class Trainer:
             self.save_model(epoch, score)
         return loss, cratio, is_best
 
-    def forward_pass(self, x, y, fg_mask):
+    def forward_pass(self, x, y, fg_mask, use_amp=None):
         """
         Performs a forward pass through the model and computes loss.
 
@@ -325,6 +331,9 @@ class Trainer:
             Target tensor with shape (B, C, D, H, W).
         fg_mask : torch.Tensor
             Foreground mask (0/1) with shape (B, C, D, H, W).
+        use_amp : bool, optional
+            Whether to autocast this forward pass to float16. Defaults to the
+            training AMP setting.
 
         Returns
         -------
@@ -333,7 +342,13 @@ class Trainer:
         loss : torch.Tensor
             Computed loss value.
         """
-        with self.autocast:
+        if use_amp is None:
+            use_amp = self.use_amp
+        with torch.autocast(
+            device_type=torch.device(self.device).type,
+            dtype=torch.float16,
+            enabled=bool(use_amp),
+        ):
             x = x.to(self.device)
             y = y.to(self.device)
             fg_mask = fg_mask.to(self.device)
@@ -437,6 +452,8 @@ class Trainer:
             "prefetch": self.prefetch,
             "val_every": self.val_every,
             "seed": self.seed,
+            "use_amp": self.use_amp,
+            "use_amp_validation": self.use_amp_validation,
             "fg_weight": getattr(self.criterion, "fg_weight", None),
             "checkpoint_weights": self.checkpoint_weights,
             "lr": self.optimizer.param_groups[0]["lr"],

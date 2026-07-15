@@ -81,6 +81,8 @@ def train(train_cache_dir, val_cache_dir):
         lr=lr,
         max_epochs=max_epochs,
         model=model,
+        use_amp=use_amp,
+        use_amp_validation=use_amp_validation,
         fg_weight=fg_weight,
         checkpoint_weights=checkpoint_weights,
         num_workers=0,
@@ -97,6 +99,8 @@ def train(train_cache_dir, val_cache_dir):
             "resume_path": resume_path,
             "transform_cfg": transform.cfg,
             "preserve_foreground": preserve_foreground,
+            "use_amp": use_amp,
+            "use_amp_validation": use_amp_validation,
         }
     )
 
@@ -131,7 +135,11 @@ if __name__ == "__main__":
     # Training parameters
     batch_size = 32
     lr = 1e-3
-    max_epochs = 30
+    max_epochs = 50
+    # Use AMP for optimization, but keep validation/checkpoint selection in
+    # FP32 so its cratio matches production FP32 inference.
+    use_amp = False
+    use_amp_validation = False
     # Validate (and consider a checkpoint) after every full-cache epoch.
     val_every = 1
     seed = 42

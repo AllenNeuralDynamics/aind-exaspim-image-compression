@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -118,6 +119,42 @@ class FullCacheDataLoaderTest(unittest.TestCase):
 class TrainerShuffleTest(unittest.TestCase):
     """Tests Trainer wiring for shuffled training and ordered validation."""
 
+    def test_training_and_validation_amp_are_configured_separately(self):
+        """Training can use AMP while validation remains full precision."""
+        model = torch.nn.Linear(1, 1)
+        values = torch.zeros((1, 1, 1, 1, 1))
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = Trainer(
+                directory,
+                device="cpu",
+                model=model,
+                max_epochs=1,
+                use_amp=True,
+                use_amp_validation=False,
+            )
+            try:
+                with patch(
+                    "aind_exaspim_image_compression.machine_learning."
+                    "train.torch.autocast",
+                    side_effect=[nullcontext(), nullcontext()],
+                ) as autocast:
+                    trainer.forward_pass(
+                        values, values, values, use_amp=trainer.use_amp
+                    )
+                    trainer.forward_pass(
+                        values,
+                        values,
+                        values,
+                        use_amp=trainer.use_amp_validation,
+                    )
+
+                self.assertTrue(autocast.call_args_list[0].kwargs["enabled"])
+                self.assertFalse(
+                    autocast.call_args_list[1].kwargs["enabled"]
+                )
+            finally:
+                trainer.writer.close()
+
     def test_trainer_sets_epoch_and_persists_seed(self):
         """Trainer passes its seed, sets every epoch, and saves the seed."""
         model = torch.nn.Linear(1, 1)
@@ -177,7 +214,10 @@ class TrainerShuffleTest(unittest.TestCase):
                     os.path.join(trainer.log_dir, "config.json"),
                     encoding="utf-8",
                 ) as file:
-                    self.assertEqual(json.load(file)["seed"], 42)
+                    config = json.load(file)
+                    self.assertEqual(config["seed"], 42)
+                    self.assertFalse(config["use_amp"])
+                    self.assertFalse(config["use_amp_validation"])
             finally:
                 trainer.writer.close()
 

@@ -101,6 +101,8 @@ class CachedTrainingTest(unittest.TestCase):
             "lr": 1e-3,
             "max_epochs": 3,
             "model": object(),
+            "use_amp": True,
+            "use_amp_validation": False,
             "fg_weight": 0,
             "checkpoint_weights": {"fg_mae": 1.0},
             "val_every": 2,
@@ -159,11 +161,17 @@ class CachedTrainingTest(unittest.TestCase):
                 self.assertEqual(config["train_cache_dir"], str(train_cache))
                 self.assertEqual(config["val_cache_dir"], str(val_cache))
                 self.assertEqual(config["transform_cfg"], transform.cfg)
+                self.assertTrue(config["use_amp"])
+                self.assertFalse(config["use_amp_validation"])
                 self.assertNotIn("n_train_examples_per_epoch", config)
                 self.assertNotIn("brain_ids_path", config)
                 self.assertNotIn("sigma_bm4d", config)
                 trainer_call = trainer_factory.call_args
                 self.assertEqual(trainer_call.kwargs["seed"], 42)
+                self.assertTrue(trainer_call.kwargs["use_amp"])
+                self.assertFalse(
+                    trainer_call.kwargs["use_amp_validation"]
+                )
         finally:
             for key, value in previous.items():
                 if value is None:
