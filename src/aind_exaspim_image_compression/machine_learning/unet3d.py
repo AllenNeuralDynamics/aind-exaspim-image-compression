@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 
 class UNet(nn.Module):
-"""
+    """
     3D U-Net architecture for 3D image data, suitable for tasks such as
     denoising or segmentation.
 
@@ -137,7 +137,6 @@ class UNet(nn.Module):
             use_skip=True,
         )
 
-        # N2V2 modification: remove ONLY the highest-resolution skip
         self.up4 = Up(
             self.channels[1],
             self.channels[0],
@@ -307,7 +306,7 @@ class Down(nn.Module):
             downsample = nn.MaxPool3d(2)
 
         # Instance attributes
-        self.block = nn.Sequential(
+        self.maxpool_conv = nn.Sequential(
             downsample,
             DoubleConv(in_channels, out_channels),
         )
@@ -330,7 +329,7 @@ class Down(nn.Module):
 
 
 class Up(nn.Module):
-"""
+    """
     An upsampling block for a 3D U-Net that performs spatial upscaling
     followed by a double convolution.
 
@@ -440,6 +439,7 @@ class Up(nn.Module):
 
 
 class MaxBlurPool3D(nn.Module):
+
     def __init__(self, channels):
         super().__init__()
 
