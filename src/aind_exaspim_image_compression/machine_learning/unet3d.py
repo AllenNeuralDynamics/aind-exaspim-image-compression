@@ -18,9 +18,24 @@ import torch.nn.functional as F
 
 
 class UNet(nn.Module):
-    """
-    3D U-Net with optional MaxBlurPool and optional removal of the
-    highest-resolution skip connection.
+"""
+    3D U-Net architecture for 3D image data, suitable for tasks such as
+    denoising or segmentation.
+
+    Attributes
+    ----------
+    channels : List[int]
+        Number of channels in each layer after applying "width_multiplier".
+    trilinear : bool
+        Flag indicating whether trilinear upsampling is used.
+    inc : DoubleConv
+        Initial convolution block.
+    down1, down2, down3, down4 : Down
+        Downsampling blocks in the encoder path.
+    up1, up2, up3, up4 : Up
+        Upsampling blocks in the decoder path.
+    outc : OutConv
+        Final 1x1x1 convolution mapping features to the output channel.
     """
 
     def __init__(
@@ -31,20 +46,37 @@ class UNet(nn.Module):
         maxblurpool=False,
         remove_top_skip=False,
     ):
+        """
+        Instantiates a UNet object.
+
+        Parameters
+        ----------
+        width_multiplier : int, optional
+            Positive integer factor that scales the number of channels in each
+            layer. Default is 1.
+        trilinear : bool, optional
+            If True, use trilinear interpolation for upsampling in decoder
+            blocks; otherwise, use transposed convolutions. Default is True.
+        residual : bool, optional
+            If True, the network predicts a residual added to the input, so it
+            learns to "remove noise" rather than reconstruct the full signal.
+            Default is True.
+        """
+        # Call parent class
         super().__init__()
 
         if (
             isinstance(width_multiplier, Real)
             or width_multiplier < 1
-            or int(width_multiplier) != width_multiplier
+            or not float(width_multiplier).is_integer()
         ):
-            raise ValueError(
-                "width_multiplier must be a positive integer"
-            )
+            raise ValueError("width_multiplier must be a positive integer")
 
+        # Initializations
         base_channels = (32, 64, 128, 256, 512)
         factor = 2 if trilinear else 1
 
+        # Instance attributes
         self.width_multiplier = int(width_multiplier)
         self.channels = [
             c * self.width_multiplier
@@ -117,6 +149,7 @@ class UNet(nn.Module):
 
     @property
     def config(self):
+        """Constructor arguments needed to recreate this model."""
         return {
             "width_multiplier": self.width_multiplier,
             "trilinear": self.trilinear,
@@ -126,6 +159,20 @@ class UNet(nn.Module):
         }
 
     def forward(self, x):
+        """
+        Forward pass of the 3D U-Net.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor with shape (B, 1, D, H, W).
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor with shape (B, 1, D, H, W), representing the
+            denoised image.
+        """
         # Encoder
         x1 = self.inc(x)
         x2 = self.down1(x1)
@@ -145,6 +192,7 @@ class UNet(nn.Module):
 
         logits = self.outc(d)
 
+        # Residual denoising: predict the correction added to the input
         if self.residual:
             return x + logits
 
@@ -227,7 +275,7 @@ class DoubleConv(nn.Module):
 
 class Down(nn.Module):
     """
-    Downscaling followed by DoubleConv.
+    A downsampling module for a 3D U-Net.
     """
 
     def __init__(
@@ -236,25 +284,63 @@ class Down(nn.Module):
         out_channels,
         maxblurpool=False,
     ):
+        """
+        Instantiates a Down object.
+
+        Parameters
+        ----------
+        in_channels : int
+            Number of input channels to this module.
+        out_channels : int
+            Number of output channels produced by this module.
+        maxblurpool : bool, optional
+            True if max-blur pooling should be used to downsample. Default is
+            False.
+        """
+        # Call parent class
         super().__init__()
 
+        # Initializations
         if maxblurpool:
             downsample = MaxBlurPool3D(in_channels)
         else:
             downsample = nn.MaxPool3d(2)
 
+        # Instance attributes
         self.block = nn.Sequential(
             downsample,
             DoubleConv(in_channels, out_channels),
         )
 
     def forward(self, x):
-        return self.block(x)
+        """
+        Forward pass of the downsampling block.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor with shape (B, C, D, H, W).
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor after max pooling and double convolution.
+        """
+        return self.maxpool_conv(x)
 
 
 class Up(nn.Module):
-    """
-    Upscaling followed by DoubleConv.
+"""
+    An upsampling block for a 3D U-Net that performs spatial upscaling
+    followed by a double convolution.
+
+    Attributes
+    ----------
+    up : nn.Module
+        Upsampling layer (either nn.Upsample or nn.ConvTranspose3d).
+    conv : DoubleConv
+        Double convolution block applied after concatenating the skip
+        connection.
     """
 
     def __init__(
@@ -264,8 +350,23 @@ class Up(nn.Module):
         trilinear=True,
         use_skip=True,
     ):
+        """
+        Instantiates an Up object.
+
+        Parameters
+        ----------
+        in_channels : int
+            Number of input channels to this module.
+        out_channels : int
+            Number of output channels produced by this module.
+        trilinear : bool, optional
+            Indication of whether to use nn.Upsample or nn.ConvTranspose3d.
+            Default is True, meaning that nn.Upsample is used.
+        """
+        # Call parent class
         super().__init__()
 
+        # Instance attributes
         self.use_skip = use_skip
 
         if trilinear:
@@ -292,6 +393,25 @@ class Up(nn.Module):
         )
 
     def forward(self, x1, x2=None):
+        """
+        Forward pass of the upsampling block in a 3D U-Net.
+
+        Parameters
+        ----------
+        x1 : torch.Tensor
+            Input tensor from the previous decoder layer with shape
+            (B, C1, D, H1, W1).
+        x2 : torch.Tensor, optional
+            Skip connection tensor from the encoder path with shape
+            (B, C2, D, H2, W2).
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor after upsampling, concatenation with the skip
+            connection, and double convolution. The output shape is
+            (B, out_channels, D, H2, W2).
+        """
         x1 = self.up(x1)
 
         if self.use_skip:
