@@ -19,118 +19,135 @@ import torch.nn.functional as F
 
 class UNet(nn.Module):
     """
-    3D U-Net architecture for 3D image data, suitable for tasks such as
-    denoising or segmentation.
-
-    Attributes
-    ----------
-    channels : List[int]
-        Number of channels in each layer after applying "width_multiplier".
-    trilinear : bool
-        Flag indicating whether trilinear upsampling is used.
-    inc : DoubleConv
-        Initial convolution block.
-    down1, down2, down3, down4 : Down
-        Downsampling blocks in the encoder path.
-    up1, up2, up3, up4 : Up
-        Upsampling blocks in the decoder path.
-    outc : OutConv
-        Final 1x1x1 convolution mapping features to the output channel.
+    3D U-Net with optional MaxBlurPool and optional removal of the
+    highest-resolution skip connection.
     """
 
-    def __init__(self, width_multiplier=1, trilinear=True, residual=True):
-        """
-        Instantiates a UNet object.
-
-        Parameters
-        ----------
-        width_multiplier : int, optional
-            Positive integer factor that scales the number of channels in each
-            layer. Default is 1.
-        trilinear : bool, optional
-            If True, use trilinear interpolation for upsampling in decoder
-            blocks; otherwise, use transposed convolutions. Default is True.
-        residual : bool, optional
-            If True, the network predicts a residual added to the input, so it
-            learns to "remove noise" rather than reconstruct the full signal.
-            Default is True.
-        """
-        # Call parent class
-        super(UNet, self).__init__()
+    def __init__(
+        self,
+        width_multiplier=1,
+        trilinear=True,
+        residual=True,
+        maxblurpool=False,
+        remove_top_skip=False,
+    ):
+        super().__init__()
 
         if (
-            isinstance(width_multiplier, bool)
-            or not isinstance(width_multiplier, Real)
+            isinstance(width_multiplier, Real)
             or width_multiplier < 1
-            or not float(width_multiplier).is_integer()
+            or int(width_multiplier) != width_multiplier
         ):
-            raise ValueError("width_multiplier must be a positive integer")
+            raise ValueError(
+                "width_multiplier must be a positive integer"
+            )
 
-        # Initializations
-        _channels = (32, 64, 128, 256, 512)
+        base_channels = (32, 64, 128, 256, 512)
         factor = 2 if trilinear else 1
 
-        # Instance attributes
         self.width_multiplier = int(width_multiplier)
-        self.channels = [c * self.width_multiplier for c in _channels]
+        self.channels = [
+            c * self.width_multiplier
+            for c in base_channels
+        ]
+
         self.trilinear = trilinear
         self.residual = residual
+        self.maxblurpool = maxblurpool
+        self.remove_top_skip = remove_top_skip
 
-        # Contracting layers
+        # Encoder
         self.inc = DoubleConv(1, self.channels[0])
-        self.down1 = Down(self.channels[0], self.channels[1])
-        self.down2 = Down(self.channels[1], self.channels[2])
-        self.down3 = Down(self.channels[2], self.channels[3])
-        self.down4 = Down(self.channels[3], self.channels[4] // factor)
 
-        # Expanding layers
-        self.up1 = Up(self.channels[4], self.channels[3] // factor, trilinear)
-        self.up2 = Up(self.channels[3], self.channels[2] // factor, trilinear)
-        self.up3 = Up(self.channels[2], self.channels[1] // factor, trilinear)
-        self.up4 = Up(self.channels[1], self.channels[0], trilinear)
+        self.down1 = Down(
+            self.channels[0],
+            self.channels[1],
+            maxblurpool=maxblurpool,
+        )
+
+        self.down2 = Down(
+            self.channels[1],
+            self.channels[2],
+            maxblurpool=maxblurpool,
+        )
+
+        self.down3 = Down(
+            self.channels[2],
+            self.channels[3],
+            maxblurpool=maxblurpool,
+        )
+
+        self.down4 = Down(
+            self.channels[3],
+            self.channels[4] // factor,
+            maxblurpool=maxblurpool,
+        )
+
+        # Decoder
+        self.up1 = Up(
+            self.channels[4],
+            self.channels[3] // factor,
+            trilinear=trilinear,
+            use_skip=True,
+        )
+
+        self.up2 = Up(
+            self.channels[3],
+            self.channels[2] // factor,
+            trilinear=trilinear,
+            use_skip=True,
+        )
+
+        self.up3 = Up(
+            self.channels[2],
+            self.channels[1] // factor,
+            trilinear=trilinear,
+            use_skip=True,
+        )
+
+        # N2V2 modification: remove ONLY the highest-resolution skip
+        self.up4 = Up(
+            self.channels[1],
+            self.channels[0],
+            trilinear=trilinear,
+            use_skip=not remove_top_skip,
+        )
+
         self.outc = OutConv(self.channels[0], 1)
 
     @property
     def config(self):
-        """Constructor arguments needed to recreate this model."""
         return {
             "width_multiplier": self.width_multiplier,
             "trilinear": self.trilinear,
             "residual": self.residual,
+            "maxblurpool": self.maxblurpool,
+            "remove_top_skip": self.remove_top_skip,
         }
 
     def forward(self, x):
-        """
-        Forward pass of the 3D U-Net.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor with shape (B, 1, D, H, W).
-
-        Returns
-        -------
-        torch.Tensor
-            Output tensor with shape (B, 1, D, H, W), representing the
-            denoised image.
-        """
-        # Contracting layers
+        # Encoder
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
         x5 = self.down4(x4)
 
-        # Expanding layers
+        # Decoder
         d = self.up1(x5, x4)
         d = self.up2(d, x3)
         d = self.up3(d, x2)
-        d = self.up4(d, x1)
+
+        if self.remove_top_skip:
+            d = self.up4(d)
+        else:
+            d = self.up4(d, x1)
+
         logits = self.outc(d)
 
-        # Residual denoising: predict the correction added to the input
         if self.residual:
             return x + logits
+
         return logits
 
 
@@ -210,126 +227,128 @@ class DoubleConv(nn.Module):
 
 class Down(nn.Module):
     """
-    A downsampling module for a 3D U-Net.
-
-    Attributes
-    ----------
-    maxpool_conv : nn.Sequential
-        Sequential module containing a MaxPool3d layer followed by a
-        DoubleConv block.
+    Downscaling followed by DoubleConv.
     """
 
-    def __init__(self, in_channels, out_channels):
-        """
-        Instantiates a Down object.
-
-        Parameters
-        ----------
-        in_channels : int
-            Number of input channels to this module.
-        out_channels : int
-            Number of output channels produced by this module.
-        """
-        # Call parent class
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        maxblurpool=False,
+    ):
         super().__init__()
 
-        # Instance attributes
-        self.maxpool_conv = nn.Sequential(
-            nn.MaxPool3d(2), DoubleConv(in_channels, out_channels)
+        if maxblurpool:
+            downsample = MaxBlurPool3D(in_channels)
+        else:
+            downsample = nn.MaxPool3d(2)
+
+        self.block = nn.Sequential(
+            downsample,
+            DoubleConv(in_channels, out_channels),
         )
 
     def forward(self, x):
-        """
-        Forward pass of the downsampling block.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor with shape (B, C, D, H, W).
-
-        Returns
-        -------
-        torch.Tensor
-            Output tensor after max pooling and double convolution.
-        """
-        return self.maxpool_conv(x)
+        return self.block(x)
 
 
 class Up(nn.Module):
     """
-    An upsampling block for a 3D U-Net that performs spatial upscaling
-    followed by a double convolution.
-
-    Attributes
-    ----------
-    up : nn.Module
-        Upsampling layer (either nn.Upsample or nn.ConvTranspose3d).
-    conv : DoubleConv
-        Double convolution block applied after concatenating the skip
-        connection.
+    Upscaling followed by DoubleConv.
     """
 
-    def __init__(self, in_channels, out_channels, trilinear=True):
-        """
-        Instantiates an Up object.
-
-        Parameters
-        ----------
-        in_channels : int
-            Number of input channels to this module.
-        out_channels : int
-            Number of output channels produced by this module.
-        trilinear : bool, optional
-            Indication of whether to use nn.Upsample or nn.ConvTranspose3d.
-            Default is True, meaning that nn.Upsample is used.
-        """
-        # Call parent class
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        trilinear=True,
+        use_skip=True,
+    ):
         super().__init__()
 
-        # Instance attributes
+        self.use_skip = use_skip
+
         if trilinear:
             self.up = nn.Upsample(
-                scale_factor=2, mode="trilinear", align_corners=True
-            )
-            self.conv = DoubleConv(
-                in_channels, out_channels, mid_channels=in_channels // 2
+                scale_factor=2,
+                mode="trilinear",
+                align_corners=True,
             )
         else:
             self.up = nn.ConvTranspose3d(
-                in_channels, in_channels // 2, kernel_size=2, stride=2
+                in_channels,
+                in_channels // 2,
+                kernel_size=2,
+                stride=2,
             )
-            self.conv = DoubleConv(in_channels, out_channels)
 
-    def forward(self, x1, x2):
-        """
-        Forward pass of the upsampling block in a 3D U-Net.
-
-        Parameters
-        ----------
-        x1 : torch.Tensor
-            Input tensor from the previous decoder layer with shape
-            (B, C1, D, H1, W1).
-        x2 : torch.Tensor
-            Skip connection tensor from the encoder path with shape
-            (B, C2, D, H2, W2).
-
-        Returns
-        -------
-        torch.Tensor
-            Output tensor after upsampling, concatenation with the skip
-            connection, and double convolution. The output shape is
-            (B, out_channels, D, H2, W2).
-        """
-        x1 = self.up(x1)
-        diffY = x2.size()[2] - x1.size()[2]
-        diffX = x2.size()[3] - x1.size()[3]
-
-        x1 = F.pad(
-            x1,
-            [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2],
+        conv_in_channels = (
+            in_channels if use_skip else in_channels // 2
         )
-        x = torch.cat([x2, x1], dim=1)
+
+        self.conv = DoubleConv(
+            conv_in_channels,
+            out_channels,
+        )
+
+    def forward(self, x1, x2=None):
+        x1 = self.up(x1)
+
+        if self.use_skip:
+            diff_z = x2.size(2) - x1.size(2)
+            diff_y = x2.size(3) - x1.size(3)
+            diff_x = x2.size(4) - x1.size(4)
+
+            x1 = F.pad(
+                x1,
+                [
+                    diff_x // 2,
+                    diff_x - diff_x // 2,
+                    diff_y // 2,
+                    diff_y - diff_y // 2,
+                    diff_z // 2,
+                    diff_z - diff_z // 2,
+                ],
+            )
+
+            x = torch.cat([x2, x1], dim=1)
+
+        else:
+            x = x1
+
         return self.conv(x)
+
+
+class MaxBlurPool3D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+
+        self.pool = nn.MaxPool3d(2, stride=1)
+
+        kernel = torch.tensor([1., 2., 1.])
+        kernel = (
+            kernel[:, None, None]
+            * kernel[None, :, None]
+            * kernel[None, None, :]
+        )
+        kernel /= kernel.sum()
+
+        self.register_buffer(
+            "kernel",
+            kernel[None, None].repeat(channels, 1, 1, 1, 1),
+        )
+        self.channels = channels
+
+    def forward(self, x):
+        x = self.pool(x)
+        x = F.conv3d(
+            x,
+            self.kernel,
+            stride=2,
+            padding=1,
+            groups=self.channels,
+        )
+        return x
 
 
 class OutConv(nn.Module):
