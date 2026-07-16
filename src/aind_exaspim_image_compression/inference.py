@@ -17,15 +17,19 @@ import itertools
 import numpy as np
 import torch
 
+from aind_exaspim_image_compression.machine_learning.transforms import (
+    build_transform,
+    estimate_offset,
+    with_offset,
+)
 from aind_exaspim_image_compression.machine_learning.unet3d import UNet
 
 
 def predict(
     img,
     model,
+    transform,
     batch_size=32,
-    normalization_percentiles=(0.5, 99.9),
-    normalized_brightness_clip=7,
     patch_size=64,
     overlap=12,
     trim=5,
@@ -41,14 +45,11 @@ def predict(
         Input 3D image of shape (1, 1, depth, height, width).
     model : torch.nn.Module
         PyTorch model to perform prediction on patches.
+    transform : IntensityTransform
+        Transform mapping raw counts to the normalized domain and back. Must
+        be the same transform the model was trained with.
     batch_size : int, optional
         Number of patches to process in a batch. Default is 32.
-    normalization_percentiles : Tuple[int], optional
-        Lower and upper percentiles used for normalization. Default is
-        (0.5, 99.9).
-    normalized_brightness_clip : float, optional
-        Brightness value used as an upper limit that normalized intensities
-        are clipped to. Default is 10.
     patch_size : int, optional
         Size of the cubic patch extracted from the image. Default is 64.
     overlap : int, optional
@@ -62,12 +63,10 @@ def predict(
     Returns
     -------
     denoised : numpy.ndarray
-        Denoised image.
+        Denoised image in raw counts (uint16).
     """
     # Preprocess image
-    mn, mx = np.percentile(img, normalization_percentiles)
-    img = (img - mn) / (mx - mn + 1e-8)
-    img = np.clip(img, 0, 5)
+    img = transform.forward(img)
     while len(img.shape) < 5:
         img = img[np.newaxis, ...]
 
@@ -76,9 +75,11 @@ def predict(
     n_starts = count_patches(img, patch_size, overlap)
     pbar = tqdm(total=n_starts, desc="Denoise") if verbose else None
 
-    # Main
-    accum_pred = np.zeros(img.shape[2:])
-    accum_wgt = np.zeros(img.shape[2:])
+    # Main. Use float32 accumulators, not numpy's default float64: these are
+    # full-volume buffers, and for a 1024**3 volume each float64 array is 8 GiB,
+    # so the two accumulators alone cost 16 GiB.
+    accum_pred = np.zeros(img.shape[2:], dtype=np.float32)
+    accum_wgt = np.zeros(img.shape[2:], dtype=np.float32)
     for _ in range(0, n_starts, batch_size):
         # Extract batch and run model
         starts = list(itertools.islice(patch_starts_generator, batch_size))
@@ -103,13 +104,19 @@ def predict(
 
         pbar.update(len(starts)) if verbose else None
 
-    # Postprocess prediction
-    denoised = accum_pred[:, ...] / (accum_wgt + 1e-8)
-    denoised = np.clip(denoised * (mx - mn) + mn, 0, 2**16 - 1)
-    return denoised.astype(np.uint16)
+    # Postprocess prediction in place. The transformed input is no longer
+    # needed, and averaging in place avoids the two extra full-volume buffers
+    # that "accum_pred / (accum_wgt + 1e-8)" would allocate -- on a 1024**3
+    # volume that expression added ~16 GiB of temporaries on top of the
+    # accumulators and OOM'd a 30 GB host.
+    del img
+    accum_wgt += 1e-8
+    accum_pred /= accum_wgt
+    del accum_wgt
+    return transform.inverse(accum_pred)
 
 
-def predict_patch(patch, model, normalization_percentiles=(0.5, 99.9)):
+def predict_patch(patch, model, transform):
     """
     Denoises a single 3D patch using the provided model.
 
@@ -119,31 +126,28 @@ def predict_patch(patch, model, normalization_percentiles=(0.5, 99.9)):
         3D input patch to denoise.
     model : torch.nn.Module
         PyTorch model used for prediction.
-    normalization_percentiles : Tuple[int], optional
-        Lower and upper percentiles used for normalization. Default is
-        (0.5, 99.9).
+    transform : IntensityTransform
+        Transform mapping raw counts to the normalized domain and back. Must
+        be the same transform the model was trained with.
 
     Returns
     -------
     pred : numpy.ndarray
-        Denoised 3D patch with the same shape as input patch.
+        Denoised 3D patch (uint16) with the same shape as the input patch.
     """
     # Preprocess image
-    mn, mx = np.percentile(patch, normalization_percentiles)
-    patch = (patch - mn) / (mx - mn + 1e-8)
-    patch = np.clip(patch, 0, 5)
+    patch = transform.forward(patch)
     while len(patch.shape) < 5:
         patch = patch[np.newaxis, ...]
 
     # Run model
-    patch = to_tensor(patch)
+    patch = to_tensor(patch, device=next(model.parameters()).device)
     with torch.no_grad():
         pred = model(patch)
 
     # Process output
     pred = np.array(pred.cpu())
-    pred = np.clip(pred[0, 0, ...] * (mx - mn) + mn, 0, 2**16 - 1)
-    return pred.astype(np.uint16)
+    return transform.inverse(pred[0, 0, ...])
 
 
 def _predict_batch(img, model, starts, patch_size, trim=5):
@@ -164,7 +168,7 @@ def _predict_batch(img, model, starts, patch_size, trim=5):
     inputs = np.stack([r[1] for r in results], axis=0)
 
     # Run model
-    inputs = batch_to_tensor(inputs)
+    inputs = batch_to_tensor(inputs, device=next(model.parameters()).device)
     with torch.no_grad():
         outputs = model(inputs).cpu().squeeze(1).numpy()
     return outputs[:, trim:-trim, trim:-trim, trim:-trim]
@@ -250,12 +254,16 @@ def count_patches(img, patch_size, overlap):
 
 def load_model(path, device="cuda"):
     """
-    Loads a pretrained UNet model from a file.
+    Loads a pretrained UNet model and its intensity transform from a file.
+
+    Supports both the current checkpoint format (a dict with "model" and
+    "transform" keys) and a bare state_dict (legacy), in which case the
+    transform defaults to asinh.
 
     Parameters
     ----------
     path : str
-        Path to the saved model weights (e.g., .pt or .pth file).
+        Path to the saved checkpoint (e.g., .pt or .pth file).
     device : str, optional
         Device to load the model onto. Default is "cuda".
 
@@ -263,47 +271,102 @@ def load_model(path, device="cuda"):
     -------
     model : torch.nn.Module
         UNet model loaded with weights and set to evaluation mode.
+    transform : IntensityTransform
+        The intensity transform the model was trained with.
     """
-    model = UNet()
-    model.load_state_dict(torch.load(path, map_location=device))
+    ckpt = torch.load(path, map_location=device)
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        state_dict = ckpt["model"]
+        transform_cfg = ckpt.get("transform") or {"kind": "asinh"}
+        model_cfg = ckpt.get("model_config") or {}
+    else:
+        state_dict = ckpt
+        transform_cfg = {"kind": "asinh"}
+        model_cfg = {}
+
+    model = UNet(**model_cfg)
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
-    return model
+    return model, build_transform(transform_cfg)
 
 
-def to_tensor(arr):
+def build_volume_transform(
+    base_transform, img=None, percentile=0.1, offset=None
+):
     """
-    Converts a NumPy array containing to a PyTorch tensor and moves it to the
-    GPU.
+    Builds an inference transform with a raw-count background offset.
+
+    Production inference should pass an offset precomputed from the full image
+    tile using lower-resolution data. When no offset is supplied, this falls
+    back to estimating one directly from ``img``; that mode is intended for
+    testing and debugging on representative subvolumes.
+
+    Parameters
+    ----------
+    base_transform : IntensityTransform
+        The transform the model was trained with (e.g., from load_model).
+    img : numpy.ndarray, optional
+        Raw image volume used only when ``offset`` is None.
+    percentile : float, optional
+        Low percentile used for fallback estimation from ``img``. Default is
+        0.1.
+    offset : float, optional
+        Precomputed full-tile background offset. When supplied, no statistic
+        is calculated from ``img``.
+
+    Returns
+    -------
+    IntensityTransform
+        A transform carrying the per-volume offset.
+    """
+    if offset is None:
+        if img is None:
+            raise ValueError("img is required when offset is not supplied")
+        offset = estimate_offset(
+            img, percentile=percentile, ignore_zeros=True
+        )
+    return with_offset(base_transform, offset)
+
+
+def to_tensor(arr, device="cuda"):
+    """
+    Converts a NumPy array to a PyTorch tensor and moves it to the given
+    device.
 
     Parameters
     ----------
     arr : numpy.ndarray
         Array to be converted.
+    device : str or torch.device, optional
+        Device to move the tensor to. Default is "cuda".
 
     Returns
     -------
     torch.Tensor
-        Tensor on GPU with shape (1, 1, depth, height, width).
+        Tensor on the given device with shape (1, 1, depth, height, width).
     """
     while (len(arr.shape)) < 5:
         arr = arr[np.newaxis, ...]
-    return torch.tensor(arr).to("cuda", dtype=torch.float)
+    return torch.tensor(arr).to(device, dtype=torch.float)
 
 
-def batch_to_tensor(arr):
+def batch_to_tensor(arr, device="cuda"):
     """
     Converts a NumPy array containing a batch of inputs to a PyTorch tensor
-    and moves it to the GPU.
+    and moves it to the given device.
 
     Parameters
     ----------
     arr : numpy.ndarray
         Array to be converted, with shape (batch_size, depth, height, width).
+    device : str or torch.device, optional
+        Device to move the tensor to. Default is "cuda".
 
     Returns
     -------
     torch.Tensor
-        Tensor on GPU with shape (batch_size, 1, depth, height, width).
+        Tensor on the given device with shape
+        (batch_size, 1, depth, height, width).
     """
-    return to_tensor(arr[:, np.newaxis, ...])
+    return to_tensor(arr[:, np.newaxis, ...], device=device)

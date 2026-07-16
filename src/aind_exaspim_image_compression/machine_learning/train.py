@@ -8,7 +8,6 @@ Code used to train neural network to denoise images.
 
 """
 
-from contextlib import nullcontext
 from datetime import datetime
 from numcodecs import blosc
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -16,14 +15,48 @@ from torch.utils.tensorboard import SummaryWriter
 
 import numpy as np
 import os
-import tifffile
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from skimage import io
 
 from aind_exaspim_image_compression.machine_learning.unet3d import UNet
 from aind_exaspim_image_compression.machine_learning.data_handling import DataLoader
+from aind_exaspim_image_compression.machine_learning.losses import (
+    SignalPreservingLoss,
+)
+from aind_exaspim_image_compression.machine_learning.metrics import (
+    checkpoint_score,
+    evaluate_example,
+)
 from aind_exaspim_image_compression.utils import img_util, util
+
+
+def save_mip_png(path, img, low_pct=1.0, high_pct=99.9):
+    """
+    Writes a 3D volume as a contrast-stretched 8-bit PNG for easy viewing.
+
+    The volume is reduced to 2D with a maximum-intensity projection along the
+    z-axis (axis 0), then percentile-normalized to uint8 so that dim neurites
+    are visible in a standard image viewer.
+
+    Parameters
+    ----------
+    path : str
+        Output path for the PNG file.
+    img : numpy.ndarray
+        3D image volume with shape (D, H, W) in raw counts.
+    low_pct : float, optional
+        Lower percentile mapped to black. The default is 1.0.
+    high_pct : float, optional
+        Upper percentile mapped to white. The default is 99.9.
+    """
+    mip = img.max(axis=0).astype(np.float32)
+    lo, hi = np.percentile(mip, (low_pct, high_pct))
+    if hi <= lo:
+        hi = lo + 1.0
+    mip = np.clip((mip - lo) / (hi - lo), 0.0, 1.0)
+    io.imsave(path, np.rint(mip * 255).astype(np.uint8), check_contrast=False)
 
 
 class Trainer:
@@ -37,6 +70,13 @@ class Trainer:
         max_epochs=400,
         model=None,
         use_amp=True,
+        use_amp_validation=False,
+        checkpoint_weights=None,
+        fg_weight=20.0,
+        num_workers=None,
+        prefetch=2,
+        val_every=1,
+        seed=0,
     ):
         """
         Instantiates a Trainer object.
@@ -56,7 +96,20 @@ class Trainer:
         model : None or nn.Module, optional
             Model to be trained on the given datasets. Default is None.
         use_amp : bool, optional
-            Indication of whether to use mixed precision. Default is True.
+            Whether to use CUDA float16 autocast and gradient scaling during
+            training. Default is True.
+        use_amp_validation : bool, optional
+            Whether to use CUDA float16 autocast during validation and
+            checkpoint selection. Default is False so validation matches FP32
+            production inference.
+        val_every : int, optional
+            Run validation (and checkpoint selection) every this many epochs;
+            the final epoch is always validated. The count-space metrics are
+            CPU-bound, so a large validation set is only cheap if it is not run
+            every epoch. Default is 1 (validate every epoch).
+        seed : int, optional
+            Seed used to reproducibly shuffle training examples by epoch.
+            Default is 0.
         """
         # Initializations
         exp_name = "session-" + datetime.today().strftime("%Y%m%d_%H%M")
@@ -68,18 +121,30 @@ class Trainer:
         self.device = device
         self.max_epochs = max_epochs
         self.log_dir = log_dir
+        self.num_workers = num_workers
+        self.prefetch = prefetch
+        self.val_every = max(1, int(val_every))
+        self.seed = seed
+        self.use_amp = bool(use_amp)
+        self.use_amp_validation = bool(use_amp_validation)
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
-        self.criterion = nn.L1Loss()
+        self.criterion = SignalPreservingLoss(fg_weight=fg_weight)
+        self.checkpoint_weights = checkpoint_weights
+        self.best_score = np.inf
         self.model = model.to(device) if model else UNet().to(device)
+        self._resume_transform_cfg = None
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=25)
+        # T_max spans the whole run so the cosine anneals once. With a small
+        # T_max the LR returns to its peak every 2*T_max epochs, and each
+        # return destabilized training (growing periodic loss spikes).
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=max_epochs)
         self.writer = SummaryWriter(log_dir=log_dir)
 
-        if use_amp:
-            self.autocast = torch.autocast(device_type="cuda", dtype=torch.float16)
-        else:
-            self.autocast = nullcontext()
+        # Scale the loss before backward so small float16 gradients do not
+        # underflow (and are unscaled before the step). Disabled => no-op, so
+        # the same code path is correct with and without AMP.
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
     # --- Core Routines ---
     def run(self, train_dataset, val_dataset):
@@ -95,23 +160,55 @@ class Trainer:
         """
         # Initializations
         print("Experiment:", os.path.basename(os.path.normpath(self.log_dir)))
+        if self._resume_transform_cfg is not None:
+            train_cfg = getattr(train_dataset.transform, "cfg", None)
+            val_cfg = getattr(val_dataset.transform, "cfg", None)
+            if train_cfg != self._resume_transform_cfg:
+                raise ValueError(
+                    "resume checkpoint transform does not match the training "
+                    "dataset transform"
+                )
+            if val_cfg != self._resume_transform_cfg:
+                raise ValueError(
+                    "resume checkpoint transform does not match the validation "
+                    "dataset transform"
+                )
+        self.transform = train_dataset.transform
         train_dataloader = DataLoader(
-            train_dataset, batch_size=self.batch_size
+            train_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            prefetch=self.prefetch,
+            shuffle=True,
+            seed=self.seed,
         )
-        val_dataloader = DataLoader(val_dataset, batch_size=self.batch_size)
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            prefetch=self.prefetch,
+            shuffle=False,
+        )
 
         # Main
-        self.best_l1 = np.inf
+        self.best_score = np.inf
         for epoch in range(self.max_epochs):
-            # Train-Validate
+            # Train
+            train_dataloader.set_epoch(epoch)
             train_loss = self.train_step(train_dataloader, epoch)
-            val_loss, val_cratio, is_best = self.validate_step(
-                val_dataloader, epoch
-            )
 
-            # Report results
-            suffix = " - New Best!" if is_best else ""
-            s = f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio}" + suffix
+            # Validate every val_every epochs (and always on the final epoch);
+            # the count-space metrics are CPU-bound, so a large validation set
+            # is only cheap when it is not run every epoch.
+            is_last = epoch == self.max_epochs - 1
+            if epoch % self.val_every == 0 or is_last:
+                val_loss, val_cratio, is_best = self.validate_step(
+                    val_dataloader, epoch
+                )
+                suffix = " - New Best!" if is_best else ""
+                s = f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio}" + suffix
+            else:
+                s = f"Epoch {epoch}:  train_loss={train_loss}"
             print(s)
 
             # Step scheduler
@@ -135,14 +232,17 @@ class Trainer:
         """
         losses = list()
         self.model.train()
-        for x, y, _ in train_dataloader:
+        for x, y, fg_mask in train_dataloader:
             # Forward pass
-            hat_y, loss = self.forward_pass(x, y)
+            hat_y, loss = self.forward_pass(
+                x, y, fg_mask, use_amp=self.use_amp
+            )
 
-            # Backward pass
+            # Backward pass (loss-scaled for AMP stability)
             self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             # Store loss for tensorboard
             losses.append(float(loss.detach().cpu()))
@@ -169,31 +269,57 @@ class Trainer:
         is_best : bool
             Indication of whether the model is the best so far.
         """
+        # Skip if there are no validation examples
+        if len(val_dataloader.dataset) == 0:
+            return float("nan"), float("nan"), False
+
         losses = list()
         cratios = list()
+        metric_rows = list()
         with torch.no_grad():
             self.model.eval()
-            for x, y, mn_mx in val_dataloader:
+            for x, y, raw, fg_mask in val_dataloader:
                 # Run model
-                hat_y, loss = self.forward_pass(x, y)
+                hat_y, loss = self.forward_pass(
+                    x, y, fg_mask, use_amp=self.use_amp_validation
+                )
 
-                # Evalute result
-                cratios.extend(self.compute_cratios(hat_y, mn_mx))
+                # Evaluate result
                 losses.append(loss.detach().cpu())
+                cratios.extend(self.compute_cratios(hat_y))
+                metric_rows.extend(
+                    self.compute_metrics(hat_y, y, raw, fg_mask)
+                )
+
+        # Aggregate results
+        loss = float(np.mean(losses))
+        cratio = float(np.median(cratios))
+        agg = {
+            k: float(np.mean([row[k] for row in metric_rows]))
+            for k in metric_rows[0]
+        }
+        score = checkpoint_score(agg, cratio, self.checkpoint_weights)
 
         # Log results
-        loss, cratio = np.mean(losses), np.median(cratios)
         self.writer.add_scalar("val_loss", loss, epoch)
         self.writer.add_scalar("val_cratio", cratio, epoch)
+        self.writer.add_scalar("val_score", score, epoch)
+        for name, value in agg.items():
+            self.writer.add_scalar(f"val_{name}", value, epoch)
 
-        # Check if current model is best so far
-        is_best = True if loss < self.best_l1 else False
+        # Save every validated checkpoint so the best can be chosen offline.
+        # Skip epoch 0: the untrained net emits a near-constant, trivially
+        # compressible volume whose cratio-weighted score would beat every
+        # trained checkpoint despite its high loss. is_best is tracked only for
+        # the "New Best!" log line.
+        is_best = epoch > 0 and score < self.best_score
         if is_best:
-            self.best_l1 = loss
-            self.save_model(epoch)
+            self.best_score = score
+        if epoch > 0:
+            self.save_model(epoch, score)
         return loss, cratio, is_best
 
-    def forward_pass(self, x, y):
+    def forward_pass(self, x, y, fg_mask, use_amp=None):
         """
         Performs a forward pass through the model and computes loss.
 
@@ -202,7 +328,12 @@ class Trainer:
         x : torch.Tensor
             Input tensor with shape (B, C, D, H, W).
         y : torch.Tensor
-            Ground truth labels with shape (B, C, D, H, W).
+            Target tensor with shape (B, C, D, H, W).
+        fg_mask : torch.Tensor
+            Foreground mask (0/1) with shape (B, C, D, H, W).
+        use_amp : bool, optional
+            Whether to autocast this forward pass to float16. Defaults to the
+            training AMP setting.
 
         Returns
         -------
@@ -211,24 +342,65 @@ class Trainer:
         loss : torch.Tensor
             Computed loss value.
         """
-        with self.autocast:
-            x = x.to("cuda")
-            y = y.to("cuda")
+        if use_amp is None:
+            use_amp = self.use_amp
+        with torch.autocast(
+            device_type=torch.device(self.device).type,
+            dtype=torch.float16,
+            enabled=bool(use_amp),
+        ):
+            x = x.to(self.device)
+            y = y.to(self.device)
+            fg_mask = fg_mask.to(self.device)
             hat_y = self.model(x)
-            loss = self.criterion(hat_y, y)
+            loss = self.criterion(hat_y, y, fg_mask)
             return hat_y, loss
 
     # --- Helpers ---
-    def compute_cratios(self, imgs, mn_mx):
+    def compute_cratios(self, imgs):
         cratios = list()
         imgs = np.array(imgs.detach().cpu())
         for i in range(imgs.shape[0]):
-            mn, mx = tuple(mn_mx[i, :])
-            img = np.clip(imgs[i, 0, ...] * (mx - mn) + mn, 0, 2**16 - 1)
+            img = self.transform.inverse(imgs[i, 0, ...])
             cratios.append(img_util.compute_cratio(img, self.codec))
             if i < 10:
-                tifffile.imwrite(f"{i}.tiff", img)
+                save_mip_png(f"{i}.png", img)
         return cratios
+
+    def compute_metrics(self, hat_y, y, raw, fg_mask):
+        """
+        Computes per-example neurite-preservation metrics in count space.
+
+        Parameters
+        ----------
+        hat_y : torch.Tensor
+            Model predictions in the normalized transform domain.
+        y : torch.Tensor
+            BM4D targets in the normalized transform domain.
+        raw : torch.Tensor
+            Raw noisy patches in counts.
+        fg_mask : torch.Tensor
+            Foreground masks (float 0/1).
+
+        Returns
+        -------
+        List[dict]
+            One metric dictionary per example in the batch.
+        """
+        rows = list()
+        preds = np.array(hat_y.detach().cpu())
+        targets = np.array(y.detach().cpu())
+        raws = np.array(raw.detach().cpu())
+        masks = np.array(fg_mask.detach().cpu())
+        for i in range(preds.shape[0]):
+            pred = self.transform.inverse(preds[i, 0, ...])
+            target = self.transform.inverse(targets[i, 0, ...])
+            rows.append(
+                evaluate_example(
+                    pred, raws[i, 0, ...], target, masks[i, 0, ...] > 0.5
+                )
+            )
+        return rows
 
     def load_pretrained_weights(self, model_path):
         """
@@ -239,11 +411,59 @@ class Trainer:
         model_path : str
             Path to the checkpoint file containing the saved weights.
         """
-        self.model.load_state_dict(
-            torch.load(model_path, map_location=self.device)
-        )
+        ckpt = torch.load(model_path, map_location=self.device)
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            checkpoint_model_cfg = ckpt.get("model_config")
+            current_model_cfg = getattr(self.model, "config", None)
+            if (
+                checkpoint_model_cfg is not None
+                and checkpoint_model_cfg != current_model_cfg
+            ):
+                raise ValueError(
+                    "resume checkpoint model configuration does not match "
+                    "the configured model"
+                )
+            self._resume_transform_cfg = ckpt.get("transform")
+            state_dict = ckpt["model"]
+        else:
+            state_dict = ckpt
+        self.model.load_state_dict(state_dict)
 
-    def save_model(self, epoch):
+    def save_config(self, config):
+        """
+        Writes a run configuration to ``config.json`` in the session directory.
+
+        The training script's hyperparameters are not otherwise persisted, so
+        this records them alongside the checkpoints and tensorboard logs to
+        make each run reproducible. The Trainer's own hyperparameters are
+        merged in so callers cannot forget them.
+
+        Parameters
+        ----------
+        config : dict
+            Run configuration (paths, hyperparameters, transform) assembled by
+            the caller. Merged over the Trainer-owned fields.
+        """
+        record = {
+            "batch_size": self.batch_size,
+            "device": self.device,
+            "max_epochs": self.max_epochs,
+            "num_workers": self.num_workers,
+            "prefetch": self.prefetch,
+            "val_every": self.val_every,
+            "seed": self.seed,
+            "use_amp": self.use_amp,
+            "use_amp_validation": self.use_amp_validation,
+            "fg_weight": getattr(self.criterion, "fg_weight", None),
+            "checkpoint_weights": self.checkpoint_weights,
+            "lr": self.optimizer.param_groups[0]["lr"],
+            "model": type(self.model).__name__,
+            "model_config": getattr(self.model, "config", None),
+        }
+        record.update(config)
+        util.write_json(os.path.join(self.log_dir, "config.json"), record)
+
+    def save_model(self, epoch, score):
         """
         Saves the current model state to a file.
 
@@ -251,8 +471,18 @@ class Trainer:
         ----------
         epoch : int
             Current training epoch.
+        score : float
+            Checkpoint-selection score for this epoch (lower is better),
+            embedded in the filename so checkpoints can be ranked offline.
         """
         date = datetime.today().strftime("%Y%m%d")
-        filename = f"BM4DNet-{date}-{epoch}-{self.best_l1:.6f}.pth"
+        filename = f"BM4DNet-{date}-{epoch}-{score:.6f}.pth"
         path = os.path.join(self.log_dir, filename)
-        torch.save(self.model.state_dict(), path)
+        torch.save(
+            {
+                "model": self.model.state_dict(),
+                "model_config": getattr(self.model, "config", None),
+                "transform": getattr(self.transform, "cfg", None),
+            },
+            path,
+        )

@@ -18,23 +18,32 @@ import os
 import pandas as pd
 import torch
 
-from aind_exaspim_image_compression.machine_learning import data_handling
 from aind_exaspim_image_compression.inference import (
-    predict, predict_patch, stitch
+    build_volume_transform, predict, predict_patch,
+)
+from aind_exaspim_image_compression.machine_learning import data_handling
+from aind_exaspim_image_compression.machine_learning.transforms import (
+    build_transform, with_offset,
 )
 from aind_exaspim_image_compression.utils import img_util, util
 from aind_exaspim_image_compression.utils.img_util import (
-    compute_cratio, compute_ssim3D, compute_mae, compute_lmax
+    compute_cratio, compute_lmax, compute_mae, ssim3D
 )
 
 
 class SupervisedEvaluator:
-    def __init__(self, img_paths, model, output_dir):
+    def __init__(
+        self, img_paths, model, output_dir, transform=None, device="cuda",
+        raw_input=True,
+    ):
         # Instance attributes
         self.codec = blosc.Blosc(cname="zstd", clevel=6, shuffle=blosc.SHUFFLE)
+        self.device = device
         self.img_paths = img_paths
         self.model = model
-        self.model.eval().to("cuda")
+        self.model.eval().to(device)
+        self.transform = transform or build_transform({"kind": "asinh"})
+        self.raw_input = raw_input
 
         # Initialize output directory
         self.output_dir = output_dir
@@ -63,7 +72,13 @@ class SupervisedEvaluator:
     # --- Main ---
     def run(self, model_path):
         # Initializations
-        self.model.load_state_dict(torch.load(model_path))
+        ckpt = torch.load(model_path, map_location=self.device)
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            self.model.load_state_dict(ckpt["model"])
+            if ckpt.get("transform"):
+                self.transform = build_transform(ckpt["transform"])
+        else:
+            self.model.load_state_dict(ckpt)
         model_name = os.path.basename(model_path)
         results_dir = os.path.join(self.output_dir, model_name)
         util.mkdir(results_dir)
@@ -73,16 +88,22 @@ class SupervisedEvaluator:
         df = pd.DataFrame(index=rows, columns=["cratio", "ssim"])
         desc = "Denoise Blocks"
         for block_id, noise in tqdm(self.noise_imgs.items(), desc=desc):
+            # For raw input, estimate this block's background offset so it is
+            # normalized to the same space the model was trained on.
+            if self.raw_input:
+                transform = build_volume_transform(self.transform, noise)
+            else:
+                transform = self.transform
+
             # Run model
-            coords, preds = predict(noise, self.model, verbose=False)
-            denoised = stitch(noise, coords, preds)
+            denoised = predict(
+                noise, self.model, transform, verbose=False
+            )
 
             # Compute metrics
             df.loc[block_id, "cratio"] = compute_cratio(denoised, self.codec)
-            df.loc[block_id, "ssim"] = compute_ssim3D(
-                noise[0, 0, ...],
-                denoised[0, 0, ...],
-                data_range=np.max(noise),
+            df.loc[block_id, "ssim"] = ssim3D(
+                noise[0], denoised, data_range=np.max(noise),
             )
 
             # Save MIPs
@@ -103,7 +124,10 @@ class SupervisedEvaluator:
 
 
 class UnsupervisedEvaluator:
-    def __init__(self, root_dir, model, img_paths_json, patch_shape):
+    def __init__(
+        self, root_dir, model, img_paths_json, patch_shape, transform=None,
+        offsets=None, raw_input=True,
+    ):
         # Class attributes
         self.codec = blosc.Blosc(cname="zstd", clevel=6, shuffle=blosc.SHUFFLE)
         self.img_paths_json = img_paths_json
@@ -112,6 +136,9 @@ class UnsupervisedEvaluator:
         self.root_dir = root_dir
         self.data_dir = os.path.join(root_dir, "data")
         self.result_dir = os.path.join(root_dir, "models")
+        self.transform = transform or build_transform({"kind": "asinh"})
+        self.offsets = offsets or dict()
+        self.raw_input = raw_input
 
         # Initialize directories
         util.mkdir(self.result_dir)
@@ -157,21 +184,33 @@ class UnsupervisedEvaluator:
             "lmax_gt": list()
         }
 
+        # For raw input, apply this brain's background offset (from the same
+        # per-brain offsets used in training). Estimated once per brain, not
+        # per patch, to avoid content-dependent offsets.
+        if self.raw_input:
+            transform = with_offset(
+                self.transform, self.offsets.get(brain_id, 0.0)
+            )
+        else:
+            transform = self.transform
+
         # Run evaluation
         for voxel in tqdm(voxels, desc=brain_id):
             # Get images
-            input_noise = dataset.get_patch(brain_id, voxel)
+            input_noise = np.asarray(dataset.read_patch(brain_id, voxel))
             noise = input_noise[5:-5, 5:-5, 5:-5]
             denoised_gt = np.maximum(bm4d(noise, 10), 0).astype(int)
-            denoised = predict_patch(input_noise, self.model)[5:-5, 5:-5, 5:-5]
+            denoised = predict_patch(
+                input_noise, self.model, transform
+            )[5:-5, 5:-5, 5:-5]
 
             # Compute metrics
             metrics["cratio"].append(compute_cratio(denoised, self.codec))
             metrics["cratio_noise"].append(compute_cratio(noise, self.codec))
             metrics["cratio_gt"].append(compute_cratio(denoised_gt, self.codec))
 
-            metrics["ssim_noise"].append(compute_ssim3D(noise, denoised))
-            metrics["ssim_gt"].append(compute_ssim3D(denoised_gt, denoised))
+            metrics["ssim_noise"].append(ssim3D(noise, denoised))
+            metrics["ssim_gt"].append(ssim3D(denoised_gt, denoised))
 
             metrics["l1_gt"].append(compute_mae(denoised_gt, denoised))
             metrics["lmax_gt"].append(compute_lmax(denoised_gt, denoised))
@@ -188,7 +227,13 @@ class UnsupervisedEvaluator:
         return dataset
 
     def ingest_model(self, model_path):
-        self.model.load_state_dict(torch.load(model_path))
+        ckpt = torch.load(model_path)
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            self.model.load_state_dict(ckpt["model"])
+            if ckpt.get("transform"):
+                self.transform = build_transform(ckpt["transform"])
+        else:
+            self.model.load_state_dict(ckpt)
         model_name = os.path.basename(model_path)
         util.mkdir(os.path.join(self.result_dir, model_name))
 

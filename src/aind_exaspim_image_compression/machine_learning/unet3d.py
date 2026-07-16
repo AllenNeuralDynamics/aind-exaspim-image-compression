@@ -9,6 +9,9 @@ Code that implements a 3D U-Net.
 
 """
 
+from math import gcd
+from numbers import Real
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,29 +38,43 @@ class UNet(nn.Module):
         Final 1x1x1 convolution mapping features to the output channel.
     """
 
-    def __init__(self, width_multiplier=1, trilinear=True):
+    def __init__(self, width_multiplier=1, trilinear=True, residual=True):
         """
         Instantiates a UNet object.
 
         Parameters
         ----------
-        width_multiplier : float, optional
-            Factor that scales the number of channels in each layer. Default
-            is 1.
+        width_multiplier : int, optional
+            Positive integer factor that scales the number of channels in each
+            layer. Default is 1.
         trilinear : bool, optional
             If True, use trilinear interpolation for upsampling in decoder
             blocks; otherwise, use transposed convolutions. Default is True.
+        residual : bool, optional
+            If True, the network predicts a residual added to the input, so it
+            learns to "remove noise" rather than reconstruct the full signal.
+            Default is True.
         """
         # Call parent class
         super(UNet, self).__init__()
+
+        if (
+            isinstance(width_multiplier, bool)
+            or not isinstance(width_multiplier, Real)
+            or width_multiplier < 1
+            or not float(width_multiplier).is_integer()
+        ):
+            raise ValueError("width_multiplier must be a positive integer")
 
         # Initializations
         _channels = (32, 64, 128, 256, 512)
         factor = 2 if trilinear else 1
 
         # Instance attributes
-        self.channels = [int(c * width_multiplier) for c in _channels]
+        self.width_multiplier = int(width_multiplier)
+        self.channels = [c * self.width_multiplier for c in _channels]
         self.trilinear = trilinear
+        self.residual = residual
 
         # Contracting layers
         self.inc = DoubleConv(1, self.channels[0])
@@ -72,6 +89,15 @@ class UNet(nn.Module):
         self.up3 = Up(self.channels[2], self.channels[1] // factor, trilinear)
         self.up4 = Up(self.channels[1], self.channels[0], trilinear)
         self.outc = OutConv(self.channels[0], 1)
+
+    @property
+    def config(self):
+        """Constructor arguments needed to recreate this model."""
+        return {
+            "width_multiplier": self.width_multiplier,
+            "trilinear": self.trilinear,
+            "residual": self.residual,
+        }
 
     def forward(self, x):
         """
@@ -96,27 +122,33 @@ class UNet(nn.Module):
         x5 = self.down4(x4)
 
         # Expanding layers
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
-        logits = self.outc(x)
+        d = self.up1(x5, x4)
+        d = self.up2(d, x3)
+        d = self.up3(d, x2)
+        d = self.up4(d, x1)
+        logits = self.outc(d)
+
+        # Residual denoising: predict the correction added to the input
+        if self.residual:
+            return x + logits
         return logits
 
 
 class DoubleConv(nn.Module):
     """
     A module that consists of two consecutive 3D convolutional layers, each
-    followed by batch normalization and a nonlinear activation.
+    followed by group normalization and a nonlinear activation.
 
     Attributes
     ----------
     double_conv : nn.Sequential
-        Sequential module containing two convolutions, batch norms, and
+        Sequential module containing two convolutions, group norms, and
         activations.
     """
 
-    def __init__(self, in_channels, out_channels, kernel_size=3, mid_channels=None):
+    def __init__(
+        self, in_channels, out_channels, kernel_size=3, mid_channels=None
+    ):
         """
         Instantiates a DoubleConv object.
 
@@ -141,12 +173,22 @@ class DoubleConv(nn.Module):
 
         # Instance attributes
         self.double_conv = nn.Sequential(
-            nn.Conv3d(in_channels, mid_channels, kernel_size=kernel_size, padding=1),
-            nn.BatchNorm3d(mid_channels),
+            nn.Conv3d(
+                in_channels,
+                mid_channels,
+                kernel_size=kernel_size,
+                padding=1,
+            ),
+            nn.GroupNorm(gcd(8, mid_channels), mid_channels),
             nn.LeakyReLU(negative_slope=0.01, inplace=True),
-            nn.Conv3d(mid_channels, out_channels, kernel_size=kernel_size, padding=1),
-            nn.BatchNorm3d(out_channels),
-            nn.LeakyReLU(negative_slope=0.01, inplace=True)
+            nn.Conv3d(
+                mid_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                padding=1,
+            ),
+            nn.GroupNorm(gcd(8, out_channels), out_channels),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
         )
 
     def forward(self, x):

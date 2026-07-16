@@ -1,0 +1,329 @@
+"""
+Precompute a pool of patches to disk so training is GPU-bound.
+
+The training bottleneck is per-patch BM4D + cloud reads on the CPU, which
+leaves the GPU idle -- both for the training pool and for the validation set
+that init_datasets otherwise builds live at startup. This script does that work
+once, offline, writing the expensive count-space intermediates -- (raw with the
+per-brain offset subtracted, clipped BM4D teacher, foreground mask) -- to
+memory-mapped arrays. Training then reads a cached patch and applies only the
+cheap transform + target construction (see CachedPatchDataset /
+CachedValidateDataset), so no cloud access or BM4D happens at startup.
+
+One script builds both caches; ``--split`` selects which:
+
+    python scripts/precompute.py --split train   # GPU-bound training pool
+    python scripts/precompute.py --split val      # fixed validation set
+
+Both splits draw voxels with the TrainDataset's foreground-biased sampler and
+build the foreground mask from the segmentation labels (used as-is unless
+segmentation_dilate > 0) unioned with the traced skeleton (dilated to a neurite
+radius), so the training target and the validation metric agree on what counts
+as neurite signal -- bright non-neuronal structures (noise,
+off-target label) are left for the BM4D teacher to denoise rather than
+preserved, while neurites the segmentation misses are still protected by the
+skeleton. The train split builds the mask inside TrainDataset; the val split
+builds the annotation mask from the TrainDataset and hands it to the
+ValidateDataset. The splits otherwise differ only in the outputs each records.
+
+A distinct RNG stream per split means the two caches never sample the same
+(brain, voxel) for a given task index when built with the same base seed.
+
+Outputs, under cache_dir (identical layout for both splits, so the val cache
+loads with CachedValidateDataset):
+    raw.npy        float32  (N, *patch_shape)   offset-subtracted counts
+    teacher.npy    float32  (N, *patch_shape)   clipped BM4D denoising
+    fg.npy         uint8    (N, *patch_shape)   foreground mask (0/1)
+    transform.json                              resolved transform cfg
+    config.json                                 full precompute configuration
+
+The transform cfg is stamped alongside the patches so the training run rebuilds
+the identical transform without touching the cloud. Each worker builds its
+datasets once (via init_datasets) so the large skeleton arrays and cloud
+handles are not re-pickled per patch.
+
+"""
+
+import argparse
+import random
+
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor
+from numpy.lib.format import open_memmap
+from tqdm import tqdm
+
+from aind_exaspim_image_compression.machine_learning import data_handling
+from aind_exaspim_image_compression.machine_learning.transforms import (
+    build_transform,
+)
+from aind_exaspim_image_compression.utils import util
+
+# Per-split RNG stream ids so the train and val caches, even at the same base
+# seed, never sample the same (brain, voxel) for a given task index.
+_SEED_STREAMS = {"train": 0, "val": 1}
+
+_WORKER_TRAIN = None
+_WORKER_VAL = None
+_WORKER_SEED = None
+_WORKER_STREAM = 0
+_WORKER_SPLIT = "train"
+_COUNT_DTYPE = np.float32
+
+
+def _seed_task(index):
+    """
+    Seeds the global RNGs deterministically from the base seed and task index.
+
+    Uses a SeedSequence so per-task streams are independent and well-mixed,
+    making the cache reproducible and independent of worker count / task
+    scheduling (executor.map assigns result i to task i regardless of which
+    worker runs it). A None base seed is a no-op (nondeterministic sampling).
+    """
+    if _WORKER_SEED is None:
+        return
+    states = np.random.SeedSequence(
+        [_WORKER_SEED, _WORKER_STREAM, index]
+    ).generate_state(2)
+    random.seed(int(states[0]))
+    np.random.seed(int(states[1]))
+
+
+def _init_worker(init_kwargs, base_seed, split):
+    """Builds the (train, val) dataset pair per worker and caches it."""
+    global _WORKER_TRAIN, _WORKER_VAL
+    global _WORKER_SEED, _WORKER_STREAM, _WORKER_SPLIT
+    _WORKER_SEED = base_seed
+    _WORKER_SPLIT = split
+    _WORKER_STREAM = _SEED_STREAMS[split]
+    _WORKER_TRAIN, _WORKER_VAL = data_handling.init_datasets(**init_kwargs)
+
+
+def _sample_counts(index):
+    """
+    Samples one count-space example for the configured split.
+
+    Both splits build the foreground mask from the segmentation labels (used
+    as-is unless segmentation_dilate > 0) unioned with the traced skeleton
+    (dilated to a neurite radius). The train split does this inside
+    TrainDataset; the val split draws the voxel with the same foreground-biased
+    sampler, builds the annotation mask from the TrainDataset (which owns the
+    segmentations and skeletons), and hands it to the ValidateDataset so the
+    target and the validation metric agree.
+    """
+    _seed_task(index)
+    if _WORKER_SPLIT == "train":
+        return _WORKER_TRAIN._sample_counts()
+    # sample_clean draws a patch (reading the val image and the train
+    # segmentation), resampling past incoherent-artifact patches, and returns
+    # the raw + labels so the val cache reads the image only once.
+    brain_id, voxel, raw, labels = _WORKER_TRAIN.sample_clean(
+        _WORKER_VAL.read_counts
+    )
+    fg_mask = _WORKER_TRAIN.annotation_mask(brain_id, voxel, labels=labels)
+    return _WORKER_VAL.sample_counts(brain_id, voxel, fg_mask=fg_mask, raw=raw)
+
+
+def precompute():
+    # Offset calibration would need a cloud sample the cache is meant to avoid,
+    # and each worker would calibrate on its own random sample -- so the cache
+    # would mix inconsistent offsets and none would match the stamped cfg. The
+    # training config subtracts per-brain offsets instead; refuse the ambiguous
+    # case loudly for both splits.
+    if transform_cfg.get("calibrate", {}).get("offset", False):
+        raise ValueError(
+            "offset calibration is not supported by the cached path; bake the "
+            "offset into transform_cfg or use per-brain offsets"
+        )
+
+    # Build the config each worker uses to construct its datasets. n_validate
+    # is 0 (we draw validation voxels ourselves) and the transform offset stays
+    # 0 because per-brain offsets are subtracted per patch.
+    brain_ids = util.read_txt(brain_ids_path)
+    offsets = util.read_json(offsets_path) if offsets_path else None
+    resolved_transform_cfg = build_transform(transform_cfg).cfg
+    init_kwargs = dict(
+        brain_ids=brain_ids,
+        img_paths_json=img_prefixes_path,
+        patch_shape=patch_shape,
+        foreground_sampling_rate=foreground_sampling_rate,
+        min_foreground_voxels=min_foreground_voxels,
+        min_segmentation_volume=min_segmentation_volume,
+        n_validate_examples=0,
+        offsets=offsets,
+        reject_incoherent_patches=reject_incoherent_patches,
+        coherence_min_autocorr=coherence_min_autocorr,
+        coherence_max_highfreq_frac=coherence_max_highfreq_frac,
+        coherence_min_segment_voxels=coherence_min_segment_voxels,
+        coherence_smooth_sigma=coherence_smooth_sigma,
+        coherence_lag=coherence_lag,
+        max_resample_attempts=max_resample_attempts,
+        segmentation_prefixes_path=segmentation_prefixes_path,
+        segmentation_dilate=segmentation_dilate,
+        sigma_bm4d=sigma_bm4d,
+        skeleton_radius=skeleton_radius,
+        swc_pointers=swc_pointers,
+        transform_cfg=resolved_transform_cfg,
+    )
+
+    # Pre-allocate memory-mapped outputs and stream results into them.
+    util.mkdir(cache_dir)
+    util.write_json(
+        f"{cache_dir}/config.json",
+        {
+            "split": split,
+            "cache_dir": cache_dir,
+            "n_patches": n_patches,
+            "brain_ids_path": brain_ids_path,
+            "img_prefixes_path": img_prefixes_path,
+            "segmentation_prefixes_path": segmentation_prefixes_path,
+            "offsets_path": offsets_path,
+            "swc_pointers": swc_pointers,
+            "transform_cfg": resolved_transform_cfg,
+            "foreground_sampling_rate": foreground_sampling_rate,
+            "min_foreground_voxels": min_foreground_voxels,
+            "min_segmentation_volume": min_segmentation_volume,
+            "patch_shape": patch_shape,
+            "skeleton_radius": skeleton_radius,
+            "segmentation_dilate": segmentation_dilate,
+            "sigma_bm4d": sigma_bm4d,
+            "reject_incoherent_patches": reject_incoherent_patches,
+            "coherence_min_autocorr": coherence_min_autocorr,
+            "coherence_max_highfreq_frac": coherence_max_highfreq_frac,
+            "coherence_min_segment_voxels": (
+                coherence_min_segment_voxels
+            ),
+            "coherence_smooth_sigma": coherence_smooth_sigma,
+            "coherence_lag": coherence_lag,
+            "max_resample_attempts": max_resample_attempts,
+            "seed": seed,
+            "seed_stream": _SEED_STREAMS[split],
+            "num_workers": num_workers,
+            "count_dtype": np.dtype(_COUNT_DTYPE).name,
+        },
+    )
+    shape = (n_patches,) + tuple(patch_shape)
+    raw_mm = open_memmap(
+        f"{cache_dir}/raw.npy", mode="w+", dtype=_COUNT_DTYPE, shape=shape
+    )
+    teacher_mm = open_memmap(
+        f"{cache_dir}/teacher.npy", mode="w+", dtype=_COUNT_DTYPE, shape=shape
+    )
+    fg_mm = open_memmap(
+        f"{cache_dir}/fg.npy", mode="w+", dtype=np.uint8, shape=shape
+    )
+
+    with ProcessPoolExecutor(
+        max_workers=num_workers,
+        initializer=_init_worker,
+        initargs=(init_kwargs, seed, split),
+    ) as executor:
+        results = executor.map(
+            _sample_counts, range(n_patches), chunksize=1
+        )
+        for i, (raw, teacher, fg) in enumerate(
+            tqdm(results, total=n_patches, desc=f"Precompute ({split})")
+        ):
+            raw_mm[i] = np.asarray(raw, dtype=_COUNT_DTYPE)
+            teacher_mm[i] = np.asarray(teacher, dtype=_COUNT_DTYPE)
+            fg_mm[i] = np.asarray(fg, dtype=np.uint8)
+
+    raw_mm.flush()
+    teacher_mm.flush()
+    fg_mm.flush()
+
+    # Stamp the resolved transform cfg so training rebuilds it exactly without
+    # touching the cloud.
+    util.write_json(
+        f"{cache_dir}/transform.json", resolved_transform_cfg
+    )
+    print(f"Wrote {n_patches} {split} patches to {cache_dir}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--split",
+        choices=("train", "val"),
+        default="train",
+        help="Which cache to build (default: train).",
+    )
+    split = parser.parse_args().split
+
+    # Paths (shared by both splits)
+    brain_ids_path = "/data/train_brain_ids.txt"
+    img_prefixes_path = "/data/exaspim_image_prefixes.json"
+    segmentation_prefixes_path = "/data/exaspim_segmentation_prefixes.json"
+    offsets_path = "/data/exaspim_background_offsets.json"
+
+    # SWC pointer (shared)
+    swc_pointers = {
+        "bucket_name": "allen-nd-goog",
+        "path": "ground_truth_tracings",
+    }
+
+    # Transform cfg (shared; offset 0, per-brain offsets subtracted per patch).
+    # Only max_count is used here, to clip the BM4D teacher. Keeping this
+    # shared is the point of one script: the train and val caches must use the
+    # identical mapping or the model trains and validates under different
+    # transforms.
+    transform_cfg = {
+        "kind": "asinh",
+        "params": {"offset": 0.0, "scale": 32.0},
+    }
+
+    # Sampling / patch parameters (shared)
+    foreground_sampling_rate = 0.5
+    min_foreground_voxels = 50
+    min_segmentation_volume = 200
+    patch_shape = (64, 64, 64)
+    # Neurite radius (voxels) the traced skeleton is dilated to in the mask.
+    skeleton_radius = 2
+    # Dilation (voxels) applied to the segmentation labels; 0 uses them as-is,
+    # since the labels already mark neurite voxels.
+    segmentation_dilate = 0
+    sigma_bm4d = 24
+
+    # Reject whole patches contaminated by a bright, spatially incoherent
+    # raw-image processing artifact (blocky salt-and-pepper noise) the FFN
+    # mislabels as a neurite. The artifact corrupts the raw input itself, so
+    # such a patch is a poor training example even with the label removed;
+    # sample_clean discards it and resamples (before BM4D, so rejects are
+    # cheap). A segment triggers rejection only when it fails BOTH tests --
+    # lag-2 autocorrelation below coherence_min_autocorr AND high-frequency
+    # energy fraction above coherence_max_highfreq_frac -- so dim-but-smooth
+    # neurites do not. Lag 2 (not 1) is the discriminating scale: the brightest
+    # artifacts correlate at lag 1 but decorrelate by lag 2, while real
+    # PSF-blurred signal stays correlated. Only segments >=
+    # coherence_min_segment_voxels are scored. See
+    # metrics.patch_has_incoherent_segment.
+    reject_incoherent_patches = True
+    coherence_min_autocorr = 0.4
+    coherence_max_highfreq_frac = 0.35
+    coherence_min_segment_voxels = 50
+    coherence_smooth_sigma = 1.0
+    coherence_lag = 2
+    # Give up resampling a clean patch after this many artifact hits and accept
+    # the last draw (rare; keeps the fixed-size cache build from stalling).
+    max_resample_attempts = 50
+
+    # Base RNG seed for reproducibility: with a fixed seed the sampled pool is
+    # identical across runs and independent of num_workers. Set to None for
+    # nondeterministic sampling. num_workers=None uses all CPUs.
+    seed = 42
+    num_workers = None
+
+    # Per-split output location and pool size.
+    if split == "train":
+        # ~2.4 MB/patch (fp32 raw+teacher + uint8 fg), so 30000 ~= 71 GB.
+        cache_dir = "/results/patch_cache"
+        n_patches = 30000
+    else:
+        # The per-patch metrics are heavy-tailed (a sizable fraction of patches
+        # are near-pure background that compress at hundreds of x), so a small
+        # set makes the reported median cratio -- and thus checkpoint selection
+        # -- noisy. ~500 keeps that sampling error small; returns diminish past
+        # ~1000. Disk is cheap.
+        cache_dir = "/results/val_patch_cache"
+        n_patches = 500
+
+    precompute()

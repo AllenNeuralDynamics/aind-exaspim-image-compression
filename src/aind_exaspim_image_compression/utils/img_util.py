@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from imagecodecs.numcodecs import Jpegxl
 from itertools import product
 from matplotlib.colors import ListedColormap
-from numcodecs import Blosc, register_codec
+from numcodecs import register_codec
 from ome_zarr.writer import write_multiscale
 from scipy.ndimage import uniform_filter
 from xarray_multiscale import multiscale
@@ -22,7 +22,6 @@ from xarray_multiscale.reducers import windowed_mode
 import gcsfs
 import matplotlib.pyplot as plt
 import numpy as np
-import s3fs
 import tensorstore as ts
 import tifffile
 import zarr
@@ -70,7 +69,12 @@ def read(img_path):
 
 def _read_n5(img_path):
     """
-    Reads an N5 volume from local disk or GCS.
+    Reads the "volume" dataset of an N5 container from local disk, GCS, or S3.
+
+    zarr v3 dropped built-in N5 support, so this reads through tensorstore (the
+    same backend used for neuroglancer volumes). NOTE: migrated for zarr>=3
+    compatibility but not exercised against live N5 data -- no current dataset
+    uses N5.
 
     Parameters
     ----------
@@ -79,18 +83,20 @@ def _read_n5(img_path):
 
     Returns
     -------
-    zarr.core.Array
-        Image volume.
+    tensorstore.TensorStore
+        Lazy, sliceable image volume.
     """
-    if is_gcs_path(img_path):
-        fs = gcsfs.GCSFileSystem(anon=False)
-        store = zarr.n5.N5FSStore(img_path, s=fs)
-    elif is_s3_path(img_path):
-        fs = s3fs.S3FileSystem(config_kwargs={"max_pool_connections": 50})
-        store = s3fs.S3Map(root=img_path, s3=fs)
+    if is_s3_path(img_path) or is_gcs_path(img_path):
+        bucket, prefix = util.parse_cloud_path(img_path)
+        kvstore = {
+            "driver": get_storage_driver(img_path),
+            "bucket": bucket,
+            "path": prefix.rstrip("/") + "/volume/",
+        }
     else:
-        store = zarr.n5.N5Store(img_path)
-    return zarr.open(store, mode="r")["volume"]
+        kvstore = {"driver": "file", "path": img_path.rstrip("/") + "/volume"}
+    arr = ts.open({"driver": "n5", "kvstore": kvstore}).result()
+    return arr
 
 
 def _read_neuroglancer_precompted(img_path):
@@ -108,11 +114,10 @@ def _read_neuroglancer_precompted(img_path):
                 "path": path,
                 },
             "context": {
-                "cache_pool": {"total_bytes_limit": 1000000000},
-                "cache_pool#remote": {"total_bytes_limit": 1000000000},
+                "cache_pool": {"total_bytes_limit": 0},
+                "cache_pool#remote": {"total_bytes_limit": 0},
                 "data_copy_concurrency": {"limit": 8},
             },
-            "recheck_cached_data": "open",
             }
     ).result()
 
@@ -159,19 +164,107 @@ def _read_zarr(img_path):
 
     Returns
     -------
-    zarr.ndarray
+    zarr.Array
         Image volume.
     """
     register_codec(Jpegxl)
-    if is_gcs_path(img_path):
-        fs = gcsfs.GCSFileSystem(anon=False)
-        store = zarr.storage.FSStore(img_path, fs=fs)
-    elif is_s3_path(img_path):
-        fs = s3fs.S3FileSystem(anon=True)
-        store = s3fs.S3Map(root=img_path, s3=fs)
-    else:
-        store = zarr.DirectoryStore(img_path)
-    return zarr.open(store, mode="r")
+    # zarr v3 builds the store from the path: a LocalStore for a filesystem
+    # path, an FsspecStore for s3:// / gs://. The S3 buckets read here are
+    # public (read anonymously); GCS uses the default credential chain.
+    storage_options = {"anon": True} if is_s3_path(img_path) else None
+    return zarr.open(img_path, mode="r", storage_options=storage_options)
+
+
+def get_ome_zarr_level_transform(img_path):
+    """Read the coordinate transform for an OME-Zarr array level.
+
+    Parameters
+    ----------
+    img_path : str
+        Path to a level array, for example ``/data/image.ome.zarr/0``.
+
+    Returns
+    -------
+    dict
+        Five-dimensional ``scale`` and ``translation`` tuples in axis order,
+        plus the common ``spatial_unit`` declared by the spatial axes.
+    """
+    level_path = img_path.rstrip("/")
+    if "/" not in level_path:
+        raise ValueError(f"Expected a Zarr level path, got: {img_path}")
+    group_path, dataset_path = level_path.rsplit("/", 1)
+    storage_options = {"anon": True} if is_s3_path(img_path) else None
+    group = zarr.open_group(
+        group_path, mode="r", storage_options=storage_options
+    )
+
+    ome = group.attrs.get("ome", {})
+    multiscales = group.attrs.get("multiscales") or ome.get("multiscales")
+    if not multiscales:
+        raise ValueError(f"No OME multiscales metadata found at {group_path}")
+
+    for multiscale_metadata in multiscales:
+        datasets = multiscale_metadata.get("datasets", [])
+        dataset = next(
+            (item for item in datasets if item.get("path") == dataset_path),
+            None,
+        )
+        if dataset is None:
+            continue
+
+        axes = multiscale_metadata.get("axes", [])
+        if [axis.get("name") for axis in axes] != ["t", "c", "z", "y", "x"]:
+            raise ValueError("Expected OME-Zarr axes in (t, c, z, y, x) order")
+
+        spatial_units = {
+            axis.get("unit") for axis in axes if axis.get("type") == "space"
+        }
+        if len(spatial_units) != 1 or None in spatial_units:
+            raise ValueError("Expected one common unit for all spatial axes")
+
+        scale = np.ones(5, dtype=float)
+        translation = np.zeros(5, dtype=float)
+        for transform in dataset.get("coordinateTransformations", []):
+            if transform.get("type") == "scale":
+                scale *= np.asarray(transform["scale"], dtype=float)
+            elif transform.get("type") == "translation":
+                translation += np.asarray(
+                    transform["translation"], dtype=float
+                )
+
+        return {
+            "scale": tuple(scale.tolist()),
+            "translation": tuple(translation.tolist()),
+            "spatial_unit": spatial_units.pop(),
+        }
+
+    raise ValueError(
+        f"Dataset {dataset_path!r} is not listed in OME metadata at "
+        f"{group_path}"
+    )
+
+
+def ome_zarr_coordinate_to_voxel(xyz, level_transform):
+    """Convert Neuroglancer ``(x, y, z)`` coordinates to ``(z, y, x)``.
+
+    Neuroglancer displays each coordinate in units of that dimension's scale,
+    shown separately in its position toolbar. Therefore, the physical OME
+    translation is normalized by the scale before it is subtracted. The
+    returned indices identify the nearest voxel center in the source array.
+    """
+    coordinate_xyz = np.asarray(xyz, dtype=float)
+    scale = np.asarray(level_transform["scale"], dtype=float)
+    translation = np.asarray(level_transform["translation"], dtype=float)
+    if coordinate_xyz.shape != (3,):
+        raise ValueError("xyz must contain exactly three coordinates")
+    if scale.shape != (5,) or translation.shape != (5,):
+        raise ValueError("OME scale and translation must each have five values")
+    if np.any(scale[2:] == 0):
+        raise ValueError("OME spatial scale values must be nonzero")
+
+    coordinate_zyx = coordinate_xyz[::-1]
+    voxel_zyx = coordinate_zyx - translation[2:] / scale[2:]
+    return tuple(np.rint(voxel_zyx).astype(int).tolist())
 
 
 # --- Read Patches ---
@@ -712,43 +805,149 @@ def write_ome_zarr(
     img,
     output_path,
     chunks=(1, 1, 64, 128, 128),
-    compressor=Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE),
+    compressor=None,
     n_levels=1,
     scale_factors=(1, 1, 2, 2, 2),
     voxel_size=(748, 748, 1000),
+    scale=None,
+    translation=None,
+    spatial_unit="nanometer",
+    storage_options=None,
 ):
+    # Zarr v3 codec; default matches the cratio codec (zstd, level 5, shuffle).
+    from zarr.codecs import BloscCodec
+
+    if compressor is None:
+        compressor = BloscCodec(
+            cname="zstd", clevel=5, shuffle="shuffle"
+        )
+
     # Ensure 5D image (T, C, Z, Y, X)
     while img.ndim < 5:
         img = img[np.newaxis, ...]
 
     # Generate multiscale pyramid
-    pyramid = multiscale(img, windowed_mode, scale_factors=scale_factors)[:n_levels]
+    pyramid = multiscale(
+        img, windowed_mode, scale_factors=scale_factors
+    )[:n_levels]
     pyramid = [level.data for level in pyramid]
 
-    # Prepare Zarr store
-    store = zarr.DirectoryStore(output_path, dimension_separator="/")
-    zgroup = zarr.open(store=store, mode="w")
+    # Zarr v3 builds a LocalStore or FsspecStore from the path/URL.
+    zgroup = zarr.open_group(
+        store=output_path, mode="w", storage_options=storage_options
+    )
 
-    # Voxel size scaling for each level
-    base_scale = np.array([1, 1, *reversed(voxel_size)])
-    scales = [base_scale[:2].tolist() + (base_scale[2:] * 2**i).tolist() for i in range(n_levels)]
-    coord_transforms = [[{"type": "scale", "scale": s}] for s in scales]
+    # Voxel size scaling for each level. ``voxel_size`` is in (x, y, z)
+    # order; an explicit scale uses the stored (t, c, z, y, x) axis order.
+    base_scale = np.asarray(
+        scale if scale is not None else [1, 1, *reversed(voxel_size)],
+        dtype=float,
+    )
+    if base_scale.shape != (5,):
+        raise ValueError(
+            "scale must have five values in (t, c, z, y, x) order"
+        )
+    base_translation = np.asarray(
+        translation if translation is not None else np.zeros(5), dtype=float
+    )
+    if base_translation.shape != (5,):
+        raise ValueError(
+            "translation must have five values in (t, c, z, y, x) order"
+        )
+    level_factors = np.asarray(scale_factors, dtype=float)
+    if level_factors.shape != (5,):
+        raise ValueError("scale_factors must have one value for each axis")
+    scales = [
+        (base_scale * level_factors**i).tolist() for i in range(n_levels)
+    ]
+    coord_transforms = []
+    for level_scale_values in scales:
+        level_scale = np.asarray(level_scale_values)
+        # Downsampling groups neighboring voxel centers, moving each coarser
+        # level's first voxel center by half the increase in voxel size.
+        level_translation = base_translation + (level_scale - base_scale) / 2
+        coord_transforms.append(
+            [
+                {"type": "scale", "scale": level_scale.tolist()},
+                {
+                    "type": "translation",
+                    "translation": level_translation.tolist(),
+                },
+            ]
+        )
 
     # Write to OME-Zarr
     write_multiscale(
         pyramid=pyramid,
         group=zgroup,
-        chunks=chunks,
         axes=[
             {"name": "t", "type": "time", "unit": "millisecond"},
             {"name": "c", "type": "channel"},
-            {"name": "z", "type": "space", "unit": "micrometer"},
-            {"name": "y", "type": "space", "unit": "micrometer"},
-            {"name": "x", "type": "space", "unit": "micrometer"},
+            {"name": "z", "type": "space", "unit": spatial_unit},
+            {"name": "y", "type": "space", "unit": spatial_unit},
+            {"name": "x", "type": "space", "unit": spatial_unit},
         ],
         coordinate_transformations=coord_transforms,
-        storage_options={"compressor": compressor},
+        storage_options={
+            "chunks": chunks,
+            "compressors": [compressor],
+        },
     )
+
+
+def write_zarr(
+    img,
+    output_path,
+    chunks=(1, 1, 64, 64, 64),
+    cname="zstd",
+    clevel=5,
+    shuffle="shuffle",
+    storage_options=None,
+):
+    """
+    Writes an image volume to a single Zarr array (local or cloud).
+
+    Uses the Zarr v3 API, so ``output_path`` may be a local path or a cloud URL
+    (``s3://...``, ``gs://...``); Zarr builds the store from the URL. Cloud
+    credentials are resolved from the standard chain unless ``storage_options``
+    overrides them. The array is stored 5D (t, c, z, y, x) so ``read`` reads it
+    back unchanged.
+
+    Parameters
+    ----------
+    img : numpy.ndarray
+        Image volume to write. Promoted to 5D if it has fewer dimensions.
+    output_path : str
+        Destination array path/URL (e.g. "s3://bucket/denoised.zarr").
+    chunks : Tuple[int], optional
+        Chunk shape. Default is (1, 1, 64, 64, 64), matching the cratio chunk.
+    cname : str, optional
+        Blosc compressor name. Default is "zstd".
+    clevel : int, optional
+        Blosc compression level. Default is 5.
+    shuffle : str, optional
+        Blosc shuffle mode ("shuffle", "bitshuffle", or "noshuffle"). Default
+        is "shuffle".
+    storage_options : dict or None, optional
+        fsspec storage options for cloud stores (e.g. {"anon": True}). Default
+        is None (default credential chain).
+    """
+    from zarr.codecs import BloscCodec
+
+    while img.ndim < 5:
+        img = img[np.newaxis, ...]
+    z = zarr.create_array(
+        store=output_path,
+        shape=img.shape,
+        chunks=chunks,
+        dtype=img.dtype,
+        compressors=BloscCodec(
+            cname=cname, clevel=clevel, shuffle=shuffle
+        ),
+        overwrite=True,
+        storage_options=storage_options,
+    )
+    z[:] = img
 
 
 def ssim3D(img1, img2, data_range=None, window_size=16):
@@ -775,6 +974,12 @@ def ssim3D(img1, img2, data_range=None, window_size=16):
     if img1.shape != img2.shape:
         raise ValueError("Input images must have the same dimensions")
 
+    # Integer powers and products overflow before scipy sees them (notably for
+    # normal uint16 microscopy inputs), corrupting the local moments. Convert
+    # once up front so all subsequent arithmetic is floating point.
+    img1 = np.asarray(img1, dtype=np.float64)
+    img2 = np.asarray(img2, dtype=np.float64)
+
     if data_range is None:
         data_range1 = np.max(img1) - np.min(img1)
         data_range2 = np.max(img2) - np.min(img2)
@@ -796,3 +1001,45 @@ def ssim3D(img1, img2, data_range=None, window_size=16):
     denominator = (mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2)
     ssim_map = numerator / (np.maximum(denominator, 1e-8) + 1e-6)
     return np.mean(ssim_map)
+
+
+def compute_mae(img1, img2):
+    """
+    Computes the mean absolute error between two images.
+
+    Parameters
+    ----------
+    img1 : numpy.ndarray
+        Image.
+    img2 : numpy.ndarray
+        Image with the same shape as "img1".
+
+    Returns
+    -------
+    float
+        Mean absolute error between the two images.
+    """
+    a = np.asarray(img1, dtype=np.float64)
+    b = np.asarray(img2, dtype=np.float64)
+    return float(np.mean(np.abs(a - b)))
+
+
+def compute_lmax(img1, img2):
+    """
+    Computes the maximum absolute error between two images.
+
+    Parameters
+    ----------
+    img1 : numpy.ndarray
+        Image.
+    img2 : numpy.ndarray
+        Image with the same shape as "img1".
+
+    Returns
+    -------
+    float
+        Maximum absolute error between the two images.
+    """
+    a = np.asarray(img1, dtype=np.float64)
+    b = np.asarray(img2, dtype=np.float64)
+    return float(np.max(np.abs(a - b)))

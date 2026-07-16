@@ -17,13 +17,66 @@ from copy import deepcopy
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+import logging
 import fastremap
 import numpy as np
+import os
+import queue
 import random
 import tensorstore as ts
+import threading
 import torch
 
+from aind_exaspim_image_compression.machine_learning.metrics import (
+    make_foreground_mask,
+    make_segmentation_mask,
+    make_skeleton_mask,
+    patch_has_incoherent_segment,
+)
+from aind_exaspim_image_compression.machine_learning.transforms import (
+    build_transform,
+    calibrate_transform,
+)
 from aind_exaspim_image_compression.utils import img_util, util
+
+
+logger = logging.getLogger(__name__)
+
+
+def build_training_example(
+    transform, preserve_foreground, raw, teacher, fg_mask
+):
+    """
+    Assembles a training example from count-space arrays.
+
+    Applies the foreground-preserving target construction and the transform,
+    shared by the live TrainDataset and the CachedPatchDataset.
+
+    Parameters
+    ----------
+    transform : IntensityTransform
+        Transform mapping counts to the normalized domain.
+    preserve_foreground : bool
+        Whether the target keeps raw counts on the foreground.
+    raw : numpy.ndarray
+        Offset-subtracted raw counts.
+    teacher : numpy.ndarray
+        Clipped BM4D denoising in counts.
+    fg_mask : numpy.ndarray
+        Foreground mask.
+
+    Returns
+    -------
+    Tuple[numpy.ndarray]
+        (x, y, fg_mask) — model input, target, and mask (float 0/1).
+    """
+    fg = np.asarray(fg_mask).astype(bool)
+    target = np.where(fg, raw, teacher) if preserve_foreground else teacher
+    return (
+        transform.forward(raw),
+        transform.forward(target),
+        fg.astype(np.float32),
+    )
 from aind_exaspim_image_compression.utils.swc_util import Reader
 
 
@@ -45,11 +98,23 @@ class TrainDataset(Dataset):
         anisotropy=(0.748, 0.748, 1.0),
         boundary_buffer=5000,
         foreground_sampling_rate=0.5,
+        min_foreground_voxels=50,
+        min_segmentation_volume=200,
         n_examples_per_epoch=300,
-        normalization_percentiles=(0.5, 99.9),
-        normalized_brightness_clip=8,
+        offsets=None,
         prefetch_foreground_sampling=16,
+        preserve_foreground=True,
+        reject_incoherent_patches=False,
+        coherence_min_autocorr=0.4,
+        coherence_max_highfreq_frac=0.35,
+        coherence_min_segment_voxels=50,
+        coherence_smooth_sigma=1.0,
+        coherence_lag=2,
+        max_resample_attempts=50,
+        segmentation_dilate=0,
         sigma_bm4d=16,
+        skeleton_radius=2,
+        transform=None,
     ):
         # Call parent class
         super(TrainDataset, self).__init__()
@@ -58,12 +123,24 @@ class TrainDataset(Dataset):
         self.anisotropy = anisotropy
         self.boundary_buffer = boundary_buffer
         self.foreground_sampling_rate = foreground_sampling_rate
+        self.min_foreground_voxels = min_foreground_voxels
+        self.min_segmentation_volume = min_segmentation_volume
         self.n_examples_per_epoch = n_examples_per_epoch
-        self.normalization_percentiles = normalization_percentiles
-        self.normalized_brightness_clip = normalized_brightness_clip
+        self.offsets = offsets or dict()
         self.patch_shape = patch_shape
+        self.preserve_foreground = preserve_foreground
         self.prefetch_foreground_sampling = prefetch_foreground_sampling
+        self.reject_incoherent_patches = reject_incoherent_patches
+        self.coherence_min_autocorr = coherence_min_autocorr
+        self.coherence_max_highfreq_frac = coherence_max_highfreq_frac
+        self.coherence_min_segment_voxels = coherence_min_segment_voxels
+        self.coherence_smooth_sigma = coherence_smooth_sigma
+        self.coherence_lag = coherence_lag
+        self.max_resample_attempts = max_resample_attempts
+        self.segmentation_dilate = segmentation_dilate
         self.sigma_bm4d = sigma_bm4d
+        self.skeleton_radius = skeleton_radius
+        self.transform = transform or build_transform({"kind": "asinh"})
         self.swc_reader = Reader()
 
         # Data structures
@@ -104,21 +181,25 @@ class TrainDataset(Dataset):
             Path to segmentation.
         """
         if segmentation_path:
+            # Parse into (bucket, key), tolerating a full gs://bucket/key URL
+            # or a bucket-relative key. The kvstore path must not include the
+            # gs://bucket/ prefix, or tensorstore doubles it.
+            bucket, key = self._parse_gcs_path(segmentation_path)
+
             # Load image
             label_mask = ts.open(
                 {
                     "driver": "neuroglancer_precomputed",
                     "kvstore": {
                         "driver": "gcs",
-                        "bucket": "allen-nd-goog",
-                        "path": segmentation_path,
+                        "bucket": bucket,
+                        "path": key,
                     },
                     "context": {
-                        "cache_pool": {"total_bytes_limit": 1000000000},
-                        "cache_pool#remote": {"total_bytes_limit": 1000000000},
+                        "cache_pool": {"total_bytes_limit": 0},
+                        "cache_pool#remote": {"total_bytes_limit": 0},
                         "data_copy_concurrency": {"limit": 8},
                     },
-                    "recheck_cached_data": "open",
                 }
             ).result()
 
@@ -128,27 +209,84 @@ class TrainDataset(Dataset):
             label_mask = label_mask[ts.d[0].transpose[1]]
             self.segmentations[brain_id] = label_mask
 
+    @staticmethod
+    def _parse_gcs_path(path, default_bucket="allen-nd-goog"):
+        """
+        Splits a GCS path into a (bucket, key) pair.
+
+        Accepts either a full ``gs://bucket/key`` URL or a bucket-relative
+        key. The kvstore "path" must be relative to the bucket, so the
+        ``gs://bucket/`` prefix is stripped when present.
+
+        Parameters
+        ----------
+        path : str
+            Full gs:// URL or bucket-relative key.
+        default_bucket : str, optional
+            Bucket used when "path" has no gs:// scheme. Default is
+            "allen-nd-goog".
+
+        Returns
+        -------
+        Tuple[str]
+            The (bucket, key) pair.
+        """
+        if path.startswith("gs://"):
+            bucket, _, key = path[len("gs://"):].partition("/")
+            return bucket, key
+        return default_bucket, path
+
     def _load_swcs(self, brain_id, swc_pointer):
         if swc_pointer:
             # Initializations
             swc_dicts = self.swc_reader.read(swc_pointer)
-            n_points = np.sum([len(d["xyz"]) for d in swc_dicts])
+            point_sets = list()
 
-            # Extract skeleton voxels
-            if n_points > 0:
-                start = 0
-                skeletons = np.zeros((n_points, 3), dtype=np.int32)
-                for swc_dict in swc_dicts:
-                    end = start + len(swc_dict["xyz"])
-                    skeletons[start:end] = self.to_voxels(swc_dict["xyz"])
-                    start = end
-                self.skeletons[brain_id] = skeletons
+            # SWCs are expected to be dense in voxel space. Validate parent
+            # links with Chebyshev distance so one-step 3D diagonals count as
+            # adjacent, but do not rasterize edges into the mask.
+            for swc_dict in swc_dicts:
+                points = self.to_voxels(
+                    np.asarray(swc_dict["xyz"], dtype=np.float32).copy()
+                )
+                if not len(points):
+                    continue
+                point_sets.append(points)
+                id_to_index = {
+                    int(node_id): i
+                    for i, node_id in enumerate(swc_dict["id"])
+                }
+                edge_lengths = list()
+                for child_index, parent_id in enumerate(swc_dict["pid"]):
+                    parent_index = id_to_index.get(int(parent_id))
+                    if parent_index is not None:
+                        edge_lengths.append(
+                            int(
+                                np.max(
+                                    np.abs(
+                                        points[child_index]
+                                        - points[parent_index]
+                                    )
+                                )
+                            )
+                        )
+                long_edges = [length for length in edge_lengths if length > 1]
+                if long_edges:
+                    logger.warning(
+                        "SWC for brain %s has %d parent-child edges longer "
+                        "than one voxel (maximum Chebyshev length: %d)",
+                        brain_id,
+                        len(long_edges),
+                        max(long_edges),
+                    )
+
+            if point_sets:
+                self.skeletons[brain_id] = np.concatenate(point_sets, axis=0)
 
     # --- Sample Image Patches ---
     def __getitem__(self, dummy_input):
         """
-        Returns a pair of noisy and BM4D-denoised image patches, normalized
-        according to percentile-based scaling.
+        Returns a pair of transformed noisy and BM4D-denoised image patches.
 
         Parameters
         ----------
@@ -158,25 +296,209 @@ class TrainDataset(Dataset):
 
         Returns
         -------
-        noise : numpy.ndarray
-            Noisy image patch, normalized and clipped.
-        denoised : numpy.ndarray
-            Denoised image patch, normalized and clipped using the same scale
-            as the noisy patch.
-        (mn, mx) : Tuple[float]
-            Lower and upper percentiles used for normalization.
+        x : numpy.ndarray
+            Noisy image patch in the normalized transform domain.
+        y : numpy.ndarray
+            Target image patch in the normalized transform domain.
+        fg_mask : numpy.ndarray
+            Foreground mask (float 0/1) for the signal-preserving loss.
         """
-        # Get image patches
-        brain_id = self.sample_brain()
-        voxel = self.sample_voxel(brain_id)
-        noise = self.read_patch(brain_id, voxel)
-        mn, mx = np.percentile(noise, self.normalization_percentiles)
-        denoised = bm4d(noise, self.sigma_bm4d)
+        raw, teacher, fg_mask = self._sample_counts()
+        return build_training_example(
+            self.transform, self.preserve_foreground, raw, teacher, fg_mask
+        )
 
-        # Normalize image patches
-        noise = self.normalize(noise, mn, mx)
-        denoised = self.normalize(denoised, mn, mx)
-        return noise, denoised, (mn, mx)
+    def _sample_counts(self):
+        """
+        Samples one patch and its BM4D target in offset-subtracted counts.
+
+        This is the expensive step (cloud read + BM4D + foreground mask) and
+        is exactly what the patch cache stores; the cheap transform + target
+        construction is applied by build_training_example. The patch is drawn
+        by sample_clean, which resamples past patches contaminated by an
+        incoherent processing artifact before the (expensive) BM4D runs.
+
+        Returns
+        -------
+        Tuple[numpy.ndarray]
+            (raw, teacher, fg_mask) in count space. raw has the per-brain
+            offset subtracted; teacher is the clipped BM4D denoising.
+        """
+        brain_id, voxel, raw, labels = self.sample_clean(self.read_counts)
+        teacher = bm4d(raw, self.sigma_bm4d)
+        teacher = np.clip(teacher, 0, self.transform.max_count)
+        fg_mask = self.foreground_mask(brain_id, voxel, raw, labels=labels)
+        return raw, teacher, fg_mask
+
+    def read_counts(self, brain_id, center):
+        """
+        Reads a patch and subtracts the per-brain offset (count space).
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the sampled brain.
+        center : Tuple[int]
+            Center voxel of the patch.
+
+        Returns
+        -------
+        numpy.ndarray
+            Offset-subtracted raw counts.
+        """
+        raw = np.asarray(self.read_patch(brain_id, center)).astype(np.float32)
+        return raw - self.offsets.get(brain_id, 0.0)
+
+    def sample_clean(self, read_counts):
+        """
+        Samples a patch, resampling past incoherent-artifact contamination.
+
+        Draws a (brain, voxel), reads its raw counts and (if the brain is
+        segmented) its label patch, and -- when reject_incoherent_patches is
+        set -- checks whether the segmentation contains a bright, spatially
+        incoherent processing artifact (see
+        metrics.patch_has_incoherent_segment). Such a patch is discarded and a
+        new one drawn, up to max_resample_attempts, because the artifact
+        corrupts the raw input itself, so the patch is a poor training example
+        even with the offending label removed. The check runs before BM4D, so
+        rejected patches cost only a label read, not the denoising. Returning
+        the labels lets the caller build the mask without a second read.
+
+        When rejection is disabled this draws a single patch. On exhausting the
+        attempt budget it returns the last patch drawn (rare; keeps the caller,
+        e.g. a fixed-size cache build, from stalling).
+
+        Parameters
+        ----------
+        read_counts : Callable[[str, Tuple[int]], numpy.ndarray]
+            Returns the offset-subtracted raw counts for a (brain, voxel). Lets
+            the validation cache read its own image while this TrainDataset
+            supplies the segmentation and skeletons.
+
+        Returns
+        -------
+        Tuple[str, Tuple[int], numpy.ndarray, numpy.ndarray or None]
+            (brain_id, voxel, raw, labels); labels is None when the brain has
+            no segmentation.
+        """
+        attempts = self.max_resample_attempts \
+            if self.reject_incoherent_patches else 1
+        brain_id = voxel = raw = labels = None
+        for _ in range(max(1, attempts)):
+            brain_id = self.sample_brain()
+            voxel = self.sample_voxel(brain_id)
+            raw = read_counts(brain_id, voxel)
+            labels = None
+            if brain_id in self.segmentations:
+                labels = np.asarray(self.read_precomputed_patch(brain_id, voxel))
+                if self.reject_incoherent_patches and patch_has_incoherent_segment(
+                    labels,
+                    raw,
+                    min_autocorr=self.coherence_min_autocorr,
+                    max_highfreq_frac=self.coherence_max_highfreq_frac,
+                    min_segment_voxels=self.coherence_min_segment_voxels,
+                    smooth_sigma=self.coherence_smooth_sigma,
+                    coherence_lag=self.coherence_lag,
+                ):
+                    continue
+            return brain_id, voxel, raw, labels
+        return brain_id, voxel, raw, labels
+
+    def foreground_mask(self, brain_id, center, raw, labels=None):
+        """
+        Builds a foreground mask for a patch from ground-truth annotations.
+
+        Foreground is the union of the segmentation labels (used as-is unless
+        segmentation_dilate > 0) and the traced skeleton (dilated to a neurite
+        radius), so both segmented and traced neurites are preserved from the
+        BM4D teacher while bright non-neuronal structures -- noise, off-target
+        label -- are not. The skeleton union matters because the segmentation
+        can miss neurites the ground-truth skeletons trace, and those patches
+        are sampled deliberately. Brains with neither annotation fall back to
+        the robust intensity threshold (should not occur when every brain is
+        segmented).
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the sampled brain.
+        center : Tuple[int]
+            Center voxel of the patch.
+        raw : numpy.ndarray
+            Raw image patch in counts, used only for the no-annotation
+            fallback.
+        labels : numpy.ndarray, optional
+            Pre-read segmentation label patch, when the caller already read it
+            (e.g. sample_clean). Avoids a second cloud read. Default is None.
+
+        Returns
+        -------
+        numpy.ndarray
+            Boolean foreground mask with the shape of "raw".
+        """
+        mask = self.annotation_mask(brain_id, center, labels=labels)
+        return make_foreground_mask(raw) if mask is None else mask
+
+    def annotation_mask(self, brain_id, center, labels=None):
+        """
+        Builds the ground-truth foreground mask (segmentation and skeleton).
+
+        Unions the segmentation labels (dilated only when segmentation_dilate >
+        0) with the rasterized, dilated skeleton for the patch. Returns None
+        when the brain has neither annotation, so callers can fall back to an
+        intensity mask. Incoherent-artifact segments are handled by rejecting
+        the whole patch at sampling time (see sample_clean), not here, so this
+        mask trusts the labels as given.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the sampled brain.
+        center : Tuple[int]
+            Center voxel of the patch.
+        labels : numpy.ndarray, optional
+            Pre-read segmentation label patch. When None it is read here.
+            Default is None.
+
+        Returns
+        -------
+        numpy.ndarray or None
+            Boolean foreground mask with shape "self.patch_shape", or None if
+            the brain has no segmentation and no skeleton.
+        """
+        mask = None
+        if brain_id in self.segmentations:
+            if labels is None:
+                labels = self.read_precomputed_patch(brain_id, center)
+            mask = make_segmentation_mask(labels, dilate=self.segmentation_dilate)
+        if brain_id in self.skeletons:
+            skel = self.skeleton_mask(brain_id, center)
+            mask = skel if mask is None else (mask | skel)
+        return mask
+
+    def skeleton_mask(self, brain_id, center):
+        """
+        Rasterizes the ground-truth skeleton points falling within a patch.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the sampled brain.
+        center : Tuple[int]
+            Center voxel of the patch.
+
+        Returns
+        -------
+        numpy.ndarray
+            Boolean foreground mask with shape "self.patch_shape".
+        """
+        start = [c - d // 2 for c, d in zip(center, self.patch_shape)]
+        return make_skeleton_mask(
+            self.skeletons[brain_id],
+            start,
+            self.patch_shape,
+            dilate=self.skeleton_radius,
+        )
 
     def sample_brain(self):
         """
@@ -267,7 +589,8 @@ class TrainDataset(Dataset):
             Voxel coordinate near a skeleton point.
         """
         idx = random.randint(0, len(self.skeletons[brain_id]) - 1)
-        shift = np.random.randint(0, 16, size=3)
+        radius = np.array(self.patch_shape) // 4
+        shift = np.array([np.random.randint(-r, r + 1) for r in radius])
         return tuple(self.skeletons[brain_id][idx] + shift)
 
     def sample_segmentation_voxel(self, brain_id):
@@ -291,7 +614,7 @@ class TrainDataset(Dataset):
         best_voxel = self.sample_interior_voxel(brain_id)
         cnt = 0
         with ThreadPoolExecutor() as executor:
-            while best_volume < 1600:
+            while best_volume < self.min_segmentation_volume:
                 # Read random image patches
                 pending = dict()
                 for _ in range(self.prefetch_foreground_sampling):
@@ -301,9 +624,11 @@ class TrainDataset(Dataset):
                     )
                     pending[thread] = voxel
 
-                # Check if labels patch has large enough object
-                for thread in as_completed(pending.keys()):
-                    voxel = pending.pop(thread)
+                # Check if labels patch has large enough object. Reads run
+                # concurrently, but results are consumed in submission order
+                # (not completion order) so ties break deterministically and
+                # a seeded run is reproducible.
+                for thread, voxel in pending.items():
                     labels_patch = thread.result()
                     vals, cnts = fastremap.unique(
                         labels_patch, return_counts=True
@@ -323,7 +648,12 @@ class TrainDataset(Dataset):
 
     def sample_bright_voxel(self, brain_id):
         """
-        Samples a voxel coordinate whose image patch is sufficiently bright.
+        Samples a voxel whose patch has enough foreground voxels.
+
+        Foreground is counted with the same robust mask used for targets and
+        metrics (median + k * sigma), so the threshold adapts to each patch
+        instead of using a fixed intensity cutoff. The occupancy requirement
+        is low enough (min_foreground_voxels) to accept thin fibers.
 
         Parameters
         ----------
@@ -333,14 +663,14 @@ class TrainDataset(Dataset):
         Returns
         -------
         best_voxel : Tuple[int]
-            Voxel coordinate whose patch is sufficiently bright or is the
-            highest observed brightness after 4 * self.prefetch attempts.
+            Voxel coordinate whose patch has the most foreground voxels found,
+            stopping once min_foreground_voxels is reached.
         """
         best_brightness = 0
         best_voxel = self.sample_interior_voxel(brain_id)
         cnt = 0
         with ThreadPoolExecutor() as executor:
-            while best_brightness < 1000:
+            while best_brightness < self.min_foreground_voxels:
                 # Read random image patches
                 pending = dict()
                 for _ in range(self.prefetch_foreground_sampling):
@@ -350,11 +680,13 @@ class TrainDataset(Dataset):
                     )
                     pending[thread] = voxel
 
-                # Check if image patch is bright enough
-                for thread in as_completed(pending.keys()):
-                    voxel = pending.pop(thread)
+                # Check if image patch has enough foreground. Reads run
+                # concurrently, but results are consumed in submission order
+                # (not completion order) so ties break deterministically and
+                # a seeded run is reproducible.
+                for thread, voxel in pending.items():
                     img_patch = thread.result()
-                    brightness = np.sum(img_patch > 100)
+                    brightness = int(make_foreground_mask(img_patch).sum())
                     if brightness > best_brightness:
                         best_voxel = voxel
                         best_brightness = brightness
@@ -377,28 +709,30 @@ class TrainDataset(Dataset):
         """
         return self.n_examples_per_epoch
 
-    def normalize(self, img, mn, mx):
+    def sample_intensity_values(self, n_patches=8):
         """
-        Normalizes the given image using a percentile-based scheme and clips
-        the max brightness.
+        Reads a few interior patches and returns their flattened counts.
+
+        Used to calibrate a transform's background offset from a global
+        sample of the training data.
 
         Parameters
         ----------
-        img : numpy.ndarray
-            Image to be normalized
-        mn : float
-            Lower percentile.
-        mx : float
-            Upper percentile
+        n_patches : int, optional
+            Number of interior patches to sample. Default is 8.
 
         Returns
         -------
-        img : numpy.ndarray
-            Normalized image.
+        numpy.ndarray
+            Flattened raw counts from the sampled patches.
         """
-        img = (img - mn) / (mx - mn + 1e-8)
-        img = np.clip(img, 0, self.normalized_brightness_clip)
-        return img
+        values = list()
+        for _ in range(n_patches):
+            brain_id = self.sample_brain()
+            voxel = self.sample_interior_voxel(brain_id)
+            patch = np.asarray(self.read_patch(brain_id, voxel))
+            values.append(patch.ravel())
+        return np.concatenate(values)
 
     def read_patch(self, brain_id, center):
         """
@@ -460,11 +794,8 @@ class TrainDataset(Dataset):
 class ValidateDataset(Dataset):
 
     def __init__(
-        self,
-        patch_shape,
-        normalization_percentiles=(0.5, 99.9),
-        normalized_brightness_clip=8,
-        sigma_bm4d=16,
+        self, patch_shape, sigma_bm4d=16, transform=None,
+        preserve_foreground=True, offsets=None,
     ):
         """
         Instantiates a ValidateDataset object.
@@ -473,31 +804,36 @@ class ValidateDataset(Dataset):
         ----------
         patch_shape : Tuple[int]
             Shape of image patches to be extracted.
-        normalization_percentiles : Tuple[float], optional
-            Upper and lower percentiles used to normalize the input image.
-            Default is (0.5, 99.5).
-        normalized_brightness_clip : float, optional
-            Brightness value used as an upper limit that normalized intensities
-            are clipped to. Default is 10.
         sigma_bm4d : float, optional
             Smoothing parameter used in the BM4D denoising algorithm. Default
             is 16.
+        transform : IntensityTransform, optional
+            Transform mapping raw counts to the normalized domain. Default is
+            an asinh transform.
+        preserve_foreground : bool, optional
+            Whether targets keep raw counts on the foreground. Default is
+            True.
+        offsets : dict, optional
+            Per-brain background offsets subtracted from raw patches before
+            the transform. Default is None (no subtraction).
         """
         # Call parent class
         super(ValidateDataset, self).__init__()
 
         # Instance attributes
-        self.normalization_percentiles = normalization_percentiles
-        self.normalized_brightness_clip = normalized_brightness_clip
         self.patch_shape = patch_shape
         self.sigma_bm4d = sigma_bm4d
+        self.transform = transform or build_transform({"kind": "asinh"})
+        self.preserve_foreground = preserve_foreground
+        self.offsets = offsets or dict()
 
         # Data structures
         self.example_ids = list()
         self.imgs = dict()
         self.denoised = list()
         self.noise = list()
-        self.mn_mxs = list()
+        self.raws = list()
+        self.fg_masks = list()
 
     def __len__(self):
         """
@@ -523,10 +859,13 @@ class ValidateDataset(Dataset):
         """
         self.imgs[brain_id] = img_util.read(img_path)
 
-    def ingest_example(self, brain_id, voxel):
+    def read_counts(self, brain_id, voxel):
         """
-        Extracts, denoises, normalizes, and stores an image patch from a brain
-        volume.
+        Reads a patch and subtracts the per-brain offset (count space).
+
+        Exposed so a caller that also needs the raw patch to build the
+        foreground mask (e.g. the coherence gate) can read it once and hand it
+        to "sample_counts", avoiding a second cloud read.
 
         Parameters
         ----------
@@ -534,21 +873,88 @@ class ValidateDataset(Dataset):
             Unique identifier of the brain from which to extract the patch.
         voxel : Tuple[int]
             Voxel coordinates of the patch center in the brain volume.
+
+        Returns
+        -------
+        numpy.ndarray
+            Offset-subtracted raw counts.
         """
-        # Get image patches
-        noise = self.read_patch(brain_id, voxel)
-        mn, mx = np.percentile(noise, self.normalization_percentiles)
-        denoised = bm4d(noise, self.sigma_bm4d)
+        raw = np.asarray(self.read_patch(brain_id, voxel)).astype(np.float32)
+        return raw - self.offsets.get(brain_id, 0.0)
 
-        # Normalize image patches
-        noise = self.normalize(noise, mn, mx)
-        denoised = self.normalize(denoised, mn, mx)
+    def sample_counts(self, brain_id, voxel, fg_mask=None, raw=None):
+        """
+        Samples one validation patch and its BM4D target in count space.
 
-        # Store results
+        This is the expensive step (cloud read + BM4D + foreground mask) and
+        is exactly what the validation cache stores; the cheap transform +
+        target construction is applied by build_training_example. The mask is
+        supplied by the caller -- the TrainDataset's annotation mask
+        (segmentation unioned with skeleton), matching the training mask -- and
+        falls back to the intensity threshold only when none is supplied.
+
+        Parameters
+        ----------
+        brain_id : hashable
+            Unique identifier of the brain from which to extract the patch.
+        voxel : Tuple[int]
+            Voxel coordinates of the patch center in the brain volume.
+        fg_mask : numpy.ndarray, optional
+            Precomputed foreground mask aligned with the sampled voxel. When
+            None, the mask falls back to the robust intensity threshold.
+        raw : numpy.ndarray, optional
+            Offset-subtracted raw counts for this voxel, when already read by
+            the caller (e.g. to build the coherence-gated mask). Avoids a
+            redundant cloud read. Default is None (read here).
+
+        Returns
+        -------
+        Tuple[numpy.ndarray]
+            (raw, teacher, fg_mask) in count space. raw has the per-brain
+            offset subtracted; teacher is the clipped BM4D denoising.
+        """
+        if raw is None:
+            raw = self.read_counts(brain_id, voxel)
+        teacher = bm4d(raw, self.sigma_bm4d)
+        teacher = np.clip(teacher, 0, self.transform.max_count)
+        if fg_mask is None:
+            fg_mask = make_foreground_mask(raw)
+        return raw, teacher, fg_mask
+
+    def ingest_example(self, brain_id, voxel, fg_mask=None, raw=None):
+        """
+        Extracts, denoises, transforms, and stores an image patch.
+
+        Parameters
+        ----------
+        brain_id : hashable
+            Unique identifier of the brain from which to extract the patch.
+        voxel : Tuple[int]
+            Voxel coordinates of the patch center in the brain volume.
+        fg_mask : numpy.ndarray, optional
+            Precomputed foreground mask aligned with the sampled voxel. When
+            None, the mask falls back to the intensity threshold.
+        raw : numpy.ndarray, optional
+            Offset-subtracted raw counts for this voxel, when already read by
+            the caller. Avoids a redundant cloud read. Default is None.
+        """
+        # Sample image patch and its BM4D-denoised target
+        raw, teacher, fg_mask = self.sample_counts(
+            brain_id, voxel, fg_mask=fg_mask, raw=raw
+        )
+
+        # Preserve raw counts on the ground-truth neurite foreground
+        if self.preserve_foreground:
+            target = np.where(fg_mask, raw, teacher)
+        else:
+            target = teacher
+
+        # Store transformed patches plus count-space metadata for metrics
         self.example_ids.append((brain_id, voxel))
-        self.noise.append(noise)
-        self.denoised.append(denoised)
-        self.mn_mxs.append((mn, mx))
+        self.noise.append(self.transform.forward(raw))
+        self.denoised.append(self.transform.forward(target))
+        self.raws.append(raw)
+        self.fg_masks.append(fg_mask.astype(np.float32))
 
     def __getitem__(self, idx):
         """
@@ -561,40 +967,23 @@ class ValidateDataset(Dataset):
 
         Returns
         -------
-        noise : numpy.ndarray
-            Noisy image patch at the given index.
-        denoised : numpy.ndarray
-            Corresponding denoised image patch.
-        mn_mx : Tuple[int]
-            Minimum and maximum values used for normalization of the image
-            patches.
+        x : numpy.ndarray
+            Noisy image patch in the normalized transform domain.
+        y : numpy.ndarray
+            BM4D-denoised image patch in the normalized transform domain.
+        raw : numpy.ndarray
+            Raw noisy image patch in counts (for count-space metrics).
+        fg_mask : numpy.ndarray
+            Foreground mask (float 0/1) for the metric split.
         """
-        return self.noise[idx], self.denoised[idx], self.mn_mxs[idx]
+        return (
+            self.noise[idx],
+            self.denoised[idx],
+            self.raws[idx],
+            self.fg_masks[idx],
+        )
 
     # --- Helpers ---
-    def normalize(self, img, mn, mx):
-        """
-        Normalizes the given image using a percentile-based scheme and clips
-        the max brightness.
-
-        Parameters
-        ----------
-        img : numpy.ndarray
-            Image to be normalized
-        mn : float
-            Lower percentile.
-        mx : float
-            Upper percentile
-
-        Returns
-        -------
-        img : numpy.ndarray
-            Normalized image.
-        """
-        img = (img - mn) / (mx - mn + 1e-8)
-        img = np.clip(img, 0, self.normalized_brightness_clip)
-        return img
-
     def read_patch(self, brain_id, center):
         """
         Reads an image patch from a Zarr array.
@@ -615,75 +1004,313 @@ class ValidateDataset(Dataset):
         return self.imgs[brain_id][(0, 0, *slices)]
 
 
+class CachedPatchDataset(Dataset):
+    """
+    Dataset that reads precomputed count-space patches from disk.
+
+    The expensive cloud reads + BM4D + foreground masks are precomputed once
+    (see scripts/precompute.py --split train) into memory-mapped arrays; this
+    dataset applies only the cheap transform + target construction, so
+    training becomes GPU-bound instead of BM4D-bound. Each cache entry is
+    addressable by index so the DataLoader controls epoch ordering.
+
+    Attributes
+    ----------
+    patch_shape : Tuple[int]
+        Shape of the cached patches.
+    transform : IntensityTransform
+        Transform mapping counts to the normalized domain.
+    """
+
+    def __init__(
+        self, cache_dir, transform=None, preserve_foreground=True,
+    ):
+        """
+        Instantiates a CachedPatchDataset.
+
+        Parameters
+        ----------
+        cache_dir : str
+            Directory holding raw.npy, teacher.npy, and fg.npy.
+        transform : IntensityTransform, optional
+            Transform mapping counts to the normalized domain. Default is an
+            asinh transform.
+        preserve_foreground : bool, optional
+            Whether the target keeps raw counts on the foreground. Default is
+            True.
+        """
+        super(CachedPatchDataset, self).__init__()
+        self.raw = np.load(os.path.join(cache_dir, "raw.npy"), mmap_mode="r")
+        self.teacher = np.load(
+            os.path.join(cache_dir, "teacher.npy"), mmap_mode="r"
+        )
+        self.fg = np.load(os.path.join(cache_dir, "fg.npy"), mmap_mode="r")
+        self.transform = transform or build_transform({"kind": "asinh"})
+        self.preserve_foreground = preserve_foreground
+        self.patch_shape = tuple(self.raw.shape[1:])
+
+    def __len__(self):
+        """Number of cached training examples."""
+        return len(self.raw)
+
+    def __getitem__(self, idx):
+        """
+        Returns a cached example as (x, y, fg_mask).
+
+        Parameters
+        ----------
+        idx : int
+            Index of the example to retrieve.
+
+        Returns
+        -------
+        Tuple[numpy.ndarray]
+            (x, y, fg_mask) for the model.
+        """
+        raw = np.asarray(self.raw[idx], dtype=np.float32)
+        teacher = np.asarray(self.teacher[idx], dtype=np.float32)
+        fg_mask = np.asarray(self.fg[idx])
+        return build_training_example(
+            self.transform, self.preserve_foreground, raw, teacher, fg_mask
+        )
+
+
+class CachedValidateDataset(Dataset):
+    """
+    Validation dataset backed by a precomputed count-space patch cache.
+
+    Mirrors CachedPatchDataset but reproduces the ValidateDataset interface:
+    a fixed set of examples iterated in order (not sampled at random), whose
+    __getitem__ also returns the raw counts needed for the count-space
+    metrics. The expensive cloud reads + BM4D + foreground masks are
+    precomputed once (see scripts/precompute.py --split val); this dataset
+    applies only the cheap transform + target construction, so a cache-backed
+    training run needs no cloud access or BM4D at startup.
+
+    Attributes
+    ----------
+    patch_shape : Tuple[int]
+        Shape of the cached patches.
+    transform : IntensityTransform
+        Transform mapping counts to the normalized domain.
+    """
+
+    def __init__(
+        self, cache_dir, transform=None, preserve_foreground=True,
+    ):
+        """
+        Instantiates a CachedValidateDataset.
+
+        Parameters
+        ----------
+        cache_dir : str
+            Directory holding raw.npy, teacher.npy, and fg.npy.
+        transform : IntensityTransform, optional
+            Transform mapping counts to the normalized domain. Default is an
+            asinh transform.
+        preserve_foreground : bool, optional
+            Whether the target keeps raw counts on the foreground. Default is
+            True.
+        """
+        super(CachedValidateDataset, self).__init__()
+        self.raw = np.load(os.path.join(cache_dir, "raw.npy"), mmap_mode="r")
+        self.teacher = np.load(
+            os.path.join(cache_dir, "teacher.npy"), mmap_mode="r"
+        )
+        self.fg = np.load(os.path.join(cache_dir, "fg.npy"), mmap_mode="r")
+        self.transform = transform or build_transform({"kind": "asinh"})
+        self.preserve_foreground = preserve_foreground
+        self.patch_shape = tuple(self.raw.shape[1:])
+
+    def __len__(self):
+        """Number of cached validation examples."""
+        return len(self.raw)
+
+    def __getitem__(self, idx):
+        """
+        Returns a cached validation example as (x, y, raw, fg_mask).
+
+        Parameters
+        ----------
+        idx : int
+            Index of the example to retrieve.
+
+        Returns
+        -------
+        Tuple[numpy.ndarray]
+            (x, y, raw, fg_mask) matching ValidateDataset.__getitem__: model
+            input, target, raw counts (for count-space metrics), and the
+            foreground mask (float 0/1).
+        """
+        raw = np.asarray(self.raw[idx], dtype=np.float32)
+        teacher = np.asarray(self.teacher[idx], dtype=np.float32)
+        fg_mask = np.asarray(self.fg[idx])
+        x, y, fg = build_training_example(
+            self.transform, self.preserve_foreground, raw, teacher, fg_mask
+        )
+        return x, y, raw, fg
+
+
 # --- Custom Dataloader ---
+_WORKER_DATASET = None
+
+
+def _worker_init(dataset):
+    """Stores the dataset in a per-worker global (avoids per-task pickling)."""
+    global _WORKER_DATASET
+    _WORKER_DATASET = dataset
+
+
+def _worker_getitem(idx):
+    """Fetches one example from the per-worker dataset global."""
+    return _WORKER_DATASET[idx]
+
+
 class DataLoader:
     """
-    DataLoader that uses multithreading to fetch image patches from the cloud
-    to form batches.
+    Prefetching DataLoader that overlaps batch preparation with training.
+
+    A background thread fills a bounded queue of prepared batches while the
+    training loop consumes them, so the GPU is not starved. Per-example work
+    runs either in-thread (num_workers=0, best for the cheap cached dataset)
+    or in a persistent process pool (num_workers>0 or None, for the cloud
+    dataset where BM4D dominates). The pool is created once per epoch, and the
+    dataset is pickled to workers once at pool startup rather than per task.
 
     Attributes
     ----------
     dataset : torch.utils.data.Dataset
-        Dataset to iterated over.
+        Dataset to iterate over.
     batch_size : int
         Number of examples in each batch.
     patch_shape : Tuple[int]
         Shape of image patch expected by the model.
     """
 
-    def __init__(self, dataset, batch_size=16):
+    def __init__(
+        self,
+        dataset,
+        batch_size=16,
+        num_workers=None,
+        prefetch=2,
+        shuffle=False,
+        seed=0,
+    ):
         """
         Instantiates a DataLoader object.
 
         Parameters
         ----------
         dataset : torch.utils.data.Dataset
-            Dataset to iterated over.
+            Dataset to iterate over.
         batch_size : int, optional
             Number of examples in each batch. Default is 16.
+        num_workers : int, optional
+            Process-pool workers for per-example work. None uses the CPU count;
+            0 runs in-thread (best for the cheap cached dataset). Default is
+            None.
+        prefetch : int, optional
+            Number of batches prepared ahead of the consumer. Default is 2.
+        shuffle : bool, optional
+            Whether to deterministically shuffle indices each epoch. Default
+            is False.
+        seed : int, optional
+            Base seed used with the epoch to generate shuffled indices.
+            Default is 0.
         """
-        # Instance attributes
         self.dataset = dataset
         self.batch_size = batch_size
         self.patch_shape = dataset.patch_shape
+        self.num_workers = num_workers
+        self.prefetch = prefetch
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        """Sets the epoch used to generate a reproducible shuffled order."""
+        self.epoch = epoch
 
     def __iter__(self):
         """
-        Iterates over the dataset and yields batches of examples.
+        Yields batches, preparing them ahead of the consumer in a thread.
 
         Returns
         -------
         iterator
-            Yields batches of examples.
+            Yields batches of tensors.
         """
-        for idx in range(0, len(self.dataset), self.batch_size):
-            yield self._load_batch(idx)
+        if self.shuffle:
+            rng = np.random.default_rng(
+                np.random.SeedSequence([self.seed, self.epoch])
+            )
+            indices = rng.permutation(len(self.dataset))
+        else:
+            indices = np.arange(len(self.dataset))
+        batches = [
+            indices[start:start + self.batch_size]
+            for start in range(0, len(indices), self.batch_size)
+        ]
+        if not batches:
+            return
 
-    def _load_batch(self, start_idx):
-        # Compute batch size
-        n_remaining_examples = len(self.dataset) - start_idx
-        batch_size = min(self.batch_size, n_remaining_examples)
+        executor = None
+        if self.num_workers != 0:
+            executor = ProcessPoolExecutor(
+                max_workers=self.num_workers,
+                initializer=_worker_init,
+                initargs=(self.dataset,),
+            )
 
-        # Generate batch
-        with ProcessPoolExecutor() as executor:
-            # Assign processs
-            processes = list()
-            for idx in range(start_idx, start_idx + batch_size):
-                processes.append(
-                    executor.submit(self.dataset.__getitem__, idx)
-                )
+        result_queue = queue.Queue(maxsize=max(1, self.prefetch))
+        done = object()
 
-            # Process results
-            shape = (batch_size, 1,) + self.patch_shape
-            noise_patches = np.zeros(shape)
-            denoised_patches = np.zeros(shape)
-            mn_mxs = np.zeros((self.batch_size, 2))
-            for i, process in enumerate(as_completed(processes)):
-                noise, denoised, mn_mx = process.result()
-                noise_patches[i, 0, ...] = noise
-                denoised_patches[i, 0, ...] = denoised
-                mn_mxs[i, :] = mn_mx
-        return to_tensor(noise_patches), to_tensor(denoised_patches), mn_mxs
+        def produce():
+            try:
+                for batch_indices in batches:
+                    result_queue.put(
+                        (None, self._load_batch(executor, batch_indices))
+                    )
+            except Exception as exc:  # surface loader errors to the consumer
+                result_queue.put((exc, None))
+            else:
+                result_queue.put((done, None))
+
+        thread = threading.Thread(target=produce, daemon=True)
+        thread.start()
+        try:
+            while True:
+                flag, batch = result_queue.get()
+                if flag is done:
+                    break
+                if flag is not None:
+                    raise flag
+                yield batch
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
+            thread.join(timeout=1)
+
+    def _load_batch(self, executor, indices):
+        batch_size = len(indices)
+
+        # Per-example work: in-thread when there is no pool, else in parallel.
+        if executor is None:
+            results = [self.dataset[idx] for idx in indices]
+        else:
+            futures = [executor.submit(_worker_getitem, idx) for idx in indices]
+            results = [f.result() for f in as_completed(futures)]
+
+        # Stack each field of the example tuple into its own batch tensor.
+        # Handles the (x, y, fg_mask) train shape and the
+        # (x, y, raw, fg_mask) validation shape alike.
+        shape = (batch_size, 1,) + self.patch_shape
+        n_fields = len(results[0])
+        batched = [np.zeros(shape) for _ in range(n_fields)]
+        for i, fields in enumerate(results):
+            for j, field in enumerate(fields):
+                batched[j][i, 0, ...] = field
+        return tuple(to_tensor(arr) for arr in batched)
 
 
 # --- Helpers ---
@@ -692,20 +1319,54 @@ def init_datasets(
     img_paths_json,
     patch_shape,
     foreground_sampling_rate=0.5,
+    min_foreground_voxels=50,
+    min_segmentation_volume=200,
     n_train_examples_per_epoch=100,
     n_validate_examples=0,
+    reject_incoherent_patches=False,
+    coherence_min_autocorr=0.4,
+    coherence_max_highfreq_frac=0.35,
+    coherence_min_segment_voxels=50,
+    coherence_smooth_sigma=1.0,
+    coherence_lag=2,
+    max_resample_attempts=50,
     segmentation_prefixes_path=None,
+    segmentation_dilate=0,
     sigma_bm4d=16,
-    swc_pointers=None
+    skeleton_radius=2,
+    swc_pointers=None,
+    transform_cfg=None,
+    preserve_foreground=True,
+    offsets=None,
 ):
     # Initializations
+    if transform_cfg is None:
+        transform_cfg = {"kind": "asinh"}
     train_dataset = TrainDataset(
         patch_shape,
         foreground_sampling_rate=foreground_sampling_rate,
+        min_foreground_voxels=min_foreground_voxels,
+        min_segmentation_volume=min_segmentation_volume,
         n_examples_per_epoch=n_train_examples_per_epoch,
-        sigma_bm4d=sigma_bm4d
+        offsets=offsets,
+        preserve_foreground=preserve_foreground,
+        reject_incoherent_patches=reject_incoherent_patches,
+        coherence_min_autocorr=coherence_min_autocorr,
+        coherence_max_highfreq_frac=coherence_max_highfreq_frac,
+        coherence_min_segment_voxels=coherence_min_segment_voxels,
+        coherence_smooth_sigma=coherence_smooth_sigma,
+        coherence_lag=coherence_lag,
+        max_resample_attempts=max_resample_attempts,
+        segmentation_dilate=segmentation_dilate,
+        sigma_bm4d=sigma_bm4d,
+        skeleton_radius=skeleton_radius,
     )
-    val_dataset = ValidateDataset(patch_shape)
+    val_dataset = ValidateDataset(
+        patch_shape,
+        sigma_bm4d=sigma_bm4d,
+        preserve_foreground=preserve_foreground,
+        offsets=offsets,
+    )
 
     # Read segmentation path lookup (if applicable)
     if segmentation_prefixes_path:
@@ -737,11 +1398,26 @@ def init_datasets(
             brain_id, img_path, segmentation_path, swc_pointer
         )
 
-    # Generate validation examples
+    # Resolve one frozen transform, optionally calibrating the offset from a
+    # global training sample, and share it across train and validation.
+    if transform_cfg.get("calibrate", {}).get("offset", False):
+        sample = train_dataset.sample_intensity_values()
+        transform_cfg = calibrate_transform(transform_cfg, sample)
+    transform = build_transform(transform_cfg)
+    train_dataset.transform = transform
+    val_dataset.transform = transform
+
+    # Generate validation examples. The voxel is drawn from the train dataset,
+    # which owns the segmentations and skeletons, so build the annotation mask
+    # (segmentation unioned with skeleton) here and hand it to the validation
+    # dataset (which loads neither) for a foreground mask consistent with
+    # training.
     for _ in range(n_validate_examples):
-        brain_id = train_dataset.sample_brain()
-        voxel = train_dataset.sample_voxel(brain_id)
-        val_dataset.ingest_example(brain_id, voxel)
+        brain_id, voxel, raw, labels = train_dataset.sample_clean(
+            val_dataset.read_counts
+        )
+        fg_mask = train_dataset.annotation_mask(brain_id, voxel, labels=labels)
+        val_dataset.ingest_example(brain_id, voxel, fg_mask=fg_mask, raw=raw)
     return train_dataset, val_dataset
 
 
