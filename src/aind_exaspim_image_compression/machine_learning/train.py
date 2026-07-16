@@ -8,7 +8,6 @@ Code used to train neural network to denoise images.
 
 """
 
-from contextlib import nullcontext
 from datetime import datetime
 from numcodecs import blosc
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -73,6 +72,7 @@ class Trainer:
         max_epochs=400,
         model=None,
         use_amp=True,
+        use_amp_validation=False,
         checkpoint_weights=None,
         checkpoint_selection=None,
         fg_weight=20.0,
@@ -80,6 +80,7 @@ class Trainer:
         num_workers=None,
         prefetch=2,
         val_every=1,
+        seed=0,
     ):
         """
         Instantiates a Trainer object.
@@ -99,7 +100,12 @@ class Trainer:
         model : None or nn.Module, optional
             Model to be trained on the given datasets. Default is None.
         use_amp : bool, optional
-            Indication of whether to use mixed precision. Default is True.
+            Whether to use CUDA float16 autocast and gradient scaling during
+            training. Default is True.
+        use_amp_validation : bool, optional
+            Whether to use CUDA float16 autocast during validation and
+            checkpoint selection. Default is False so validation matches FP32
+            production inference.
         criterion : torch.nn.Module, optional
             Configured denoising criterion. When omitted, the legacy
             SignalPreservingLoss is constructed from ``fg_weight``.
@@ -111,6 +117,9 @@ class Trainer:
             the final epoch is always validated. The count-space metrics are
             CPU-bound, so a large validation set is only cheap if it is not run
             every epoch. Default is 1 (validate every epoch).
+        seed : int, optional
+            Seed used to reproducibly shuffle training examples by epoch.
+            Default is 0.
         """
         # Initializations
         exp_name = "session-" + datetime.today().strftime("%Y%m%d_%H%M")
@@ -126,6 +135,9 @@ class Trainer:
         self.prefetch = prefetch
         self.val_every = max(1, int(val_every))
         self.run_config = None
+        self.seed = seed
+        self.use_amp = bool(use_amp)
+        self.use_amp_validation = bool(use_amp_validation)
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
         self.criterion = (
@@ -169,15 +181,10 @@ class Trainer:
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=max_epochs)
         self.writer = SummaryWriter(log_dir=log_dir)
 
-        if use_amp:
-            self.autocast = torch.autocast(device_type="cuda", dtype=torch.float16)
-        else:
-            self.autocast = nullcontext()
-
         # Scale the loss before backward so small float16 gradients do not
         # underflow (and are unscaled before the step). Disabled => no-op, so
         # the same code path is correct with and without AMP.
-        self.scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
     # --- Core Routines ---
     def run(self, train_dataset, val_dataset):
@@ -212,18 +219,22 @@ class Trainer:
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             prefetch=self.prefetch,
+            shuffle=True,
+            seed=self.seed,
         )
         val_dataloader = DataLoader(
             val_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             prefetch=self.prefetch,
+            shuffle=False,
         )
 
         # Main
         self.best_score = np.inf
         for epoch in range(self.max_epochs):
             # Train
+            train_dataloader.set_epoch(epoch)
             train_loss = self.train_step(train_dataloader, epoch)
 
             # Validate every val_every epochs (and always on the final epoch);
@@ -263,7 +274,9 @@ class Trainer:
         self.model.train()
         for batch in train_dataloader:
             # Forward pass
-            hat_y, loss = self.forward_pass(batch)
+            hat_y, loss = self.forward_pass(
+                batch, use_amp=self.use_amp
+            )
 
             # Backward pass (loss-scaled for AMP stability)
             self.optimizer.zero_grad()
@@ -307,7 +320,9 @@ class Trainer:
             self.model.eval()
             for batch in val_dataloader:
                 # Run model
-                hat_y, loss = self.forward_pass(batch)
+                hat_y, loss = self.forward_pass(
+                    batch, use_amp=self.use_amp_validation
+                )
 
                 # Evaluate result
                 losses.append(loss.detach().cpu())
@@ -373,7 +388,7 @@ class Trainer:
             self.save_model(epoch, score)
         return loss, cratio, is_best
 
-    def forward_pass(self, batch):
+    def forward_pass(self, batch, use_amp=None):
         """
         Performs a forward pass through the model and computes loss.
 
@@ -381,6 +396,9 @@ class Trainer:
         ----------
         batch : dict[str, torch.Tensor]
             Dictionary containing model fields and optional count metadata.
+        use_amp : bool, optional
+            Whether to autocast this forward pass to float16. Defaults to the
+            training AMP setting.
 
         Returns
         -------
@@ -389,7 +407,13 @@ class Trainer:
         loss : torch.Tensor
             Computed loss value.
         """
-        with self.autocast:
+        if use_amp is None:
+            use_amp = self.use_amp
+        with torch.autocast(
+            device_type=torch.device(self.device).type,
+            dtype=torch.float16,
+            enabled=bool(use_amp),
+        ):
             x = batch["input"].to(self.device)
             y = batch["target"].to(self.device)
             fg_mask = batch["foreground"].to(self.device)
@@ -595,6 +619,9 @@ class Trainer:
             "num_workers": self.num_workers,
             "prefetch": self.prefetch,
             "val_every": self.val_every,
+            "seed": self.seed,
+            "use_amp": self.use_amp,
+            "use_amp_validation": self.use_amp_validation,
             "fg_weight": getattr(self.criterion, "fg_weight", None),
             "loss_config": self.loss_config,
             "checkpoint_weights": self.checkpoint_weights,

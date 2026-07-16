@@ -1589,12 +1589,13 @@ def _cached_record(arrays, idx, has_metadata):
 
 class CachedPatchDataset(Dataset):
     """
-    Dataset that samples precomputed count-space patches from disk.
+    Dataset that reads precomputed count-space patches from disk.
 
     The expensive cloud reads + BM4D + foreground masks are precomputed once
     (see scripts/precompute.py --split train) into memory-mapped arrays; this
-    dataset reads a random cached patch and applies only the cheap transform +
-    target construction, so training becomes GPU-bound instead of BM4D-bound.
+    dataset applies only the cheap transform + target construction, so
+    training becomes GPU-bound instead of BM4D-bound. Each cache entry is
+    addressable by index so the DataLoader controls epoch ordering.
 
     Attributes
     ----------
@@ -1606,7 +1607,7 @@ class CachedPatchDataset(Dataset):
 
     def __init__(
         self, cache_dir, transform=None, preserve_foreground=True,
-        n_examples_per_epoch=None, require_noise_metadata=False,
+        require_noise_metadata=False,
     ):
         """
         Instantiates a CachedPatchDataset.
@@ -1621,8 +1622,6 @@ class CachedPatchDataset(Dataset):
         preserve_foreground : bool, optional
             Whether the target keeps raw counts on the foreground. Default is
             True.
-        n_examples_per_epoch : int, optional
-            Number of examples drawn per epoch. Default is the pool size.
         """
         super(CachedPatchDataset, self).__init__()
         arrays, brain_ids, config, has_metadata = _load_cache(
@@ -1638,29 +1637,25 @@ class CachedPatchDataset(Dataset):
         self.transform = transform or build_transform({"kind": "asinh"})
         self.preserve_foreground = preserve_foreground
         self.patch_shape = tuple(self.raw.shape[1:])
-        self.n_examples_per_epoch = (
-            n_examples_per_epoch if n_examples_per_epoch else len(self.raw)
-        )
 
     def __len__(self):
-        """Number of examples drawn per epoch."""
-        return self.n_examples_per_epoch
+        """Number of cached training examples."""
+        return len(self.raw)
 
-    def __getitem__(self, dummy_input):
+    def __getitem__(self, idx):
         """
-        Returns a random cached example as (x, y, fg_mask).
+        Returns a cached example as (x, y, fg_mask).
 
         Parameters
         ----------
-        dummy_input : Any
-            Unused index; patches are sampled at random from the pool.
+        idx : int
+            Index of the example to retrieve.
 
         Returns
         -------
         dict
             Model fields, count-space arrays, and source metadata.
         """
-        idx = random.randint(0, len(self.raw) - 1)
         record = _cached_record(self.arrays, idx, self.has_metadata)
         return build_example_record(
             self.transform, self.preserve_foreground, record
@@ -1780,7 +1775,15 @@ class DataLoader:
         Shape of image patch expected by the model.
     """
 
-    def __init__(self, dataset, batch_size=16, num_workers=None, prefetch=2):
+    def __init__(
+        self,
+        dataset,
+        batch_size=16,
+        num_workers=None,
+        prefetch=2,
+        shuffle=False,
+        seed=0,
+    ):
         """
         Instantiates a DataLoader object.
 
@@ -1796,12 +1799,25 @@ class DataLoader:
             None.
         prefetch : int, optional
             Number of batches prepared ahead of the consumer. Default is 2.
+        shuffle : bool, optional
+            Whether to deterministically shuffle indices each epoch. Default
+            is False.
+        seed : int, optional
+            Base seed used with the epoch to generate shuffled indices.
+            Default is 0.
         """
         self.dataset = dataset
         self.batch_size = batch_size
         self.patch_shape = dataset.patch_shape
         self.num_workers = num_workers
         self.prefetch = prefetch
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        """Sets the epoch used to generate a reproducible shuffled order."""
+        self.epoch = epoch
 
     def __iter__(self):
         """
@@ -1812,8 +1828,18 @@ class DataLoader:
         iterator
             Yields dictionaries of tensors stacked by field shape.
         """
-        starts = list(range(0, len(self.dataset), self.batch_size))
-        if not starts:
+        if self.shuffle:
+            rng = np.random.default_rng(
+                np.random.SeedSequence([self.seed, self.epoch])
+            )
+            indices = rng.permutation(len(self.dataset))
+        else:
+            indices = np.arange(len(self.dataset))
+        batches = [
+            indices[start:start + self.batch_size]
+            for start in range(0, len(indices), self.batch_size)
+        ]
+        if not batches:
             return
 
         executor = None
@@ -1829,8 +1855,10 @@ class DataLoader:
 
         def produce():
             try:
-                for start in starts:
-                    result_queue.put((None, self._load_batch(executor, start)))
+                for batch_indices in batches:
+                    result_queue.put(
+                        (None, self._load_batch(executor, batch_indices))
+                    )
             except Exception as exc:  # surface loader errors to the consumer
                 result_queue.put((exc, None))
             else:
@@ -1851,11 +1879,8 @@ class DataLoader:
                 executor.shutdown(wait=False, cancel_futures=True)
             thread.join(timeout=1)
 
-    def _load_batch(self, executor, start_idx):
-        # Compute batch size
-        n_remaining = len(self.dataset) - start_idx
-        batch_size = min(self.batch_size, n_remaining)
-        indices = range(start_idx, start_idx + batch_size)
+    def _load_batch(self, executor, indices):
+        batch_size = len(indices)
 
         # Per-example work: in-thread when there is no pool, else in parallel.
         if executor is None:

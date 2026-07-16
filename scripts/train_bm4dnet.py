@@ -325,7 +325,6 @@ def train(experiment_config):
         train_cache_dir,
         transform=transform,
         preserve_foreground=preserve_foreground,
-        n_examples_per_epoch=training["n_train_examples_per_epoch"],
         **train_kwargs,
     )
     val_dataset = data_handling.CachedValidateDataset(
@@ -357,10 +356,12 @@ def train(experiment_config):
         model=model,
         criterion=criterion,
         use_amp=training.get("use_amp", True),
+        use_amp_validation=training.get("use_amp_validation", False),
         checkpoint_weights=config["checkpoint_weights"],
         checkpoint_selection=config["checkpoint_selection"],
         num_workers=0,
         val_every=training["val_every"],
+        seed=config["seed"],
     )
 
     # Persist the run configuration next to the checkpoints/tensorboard so each
@@ -372,9 +373,6 @@ def train(experiment_config):
             "resume_path": resume_path,
             "transform_cfg": transform.cfg,
             "transform_record": transform_record,
-            "n_train_examples_per_epoch": training[
-                "n_train_examples_per_epoch"
-            ],
             "preserve_foreground": preserve_foreground,
             "loss_config": criterion.cfg,
             "provenance": provenance,
@@ -391,11 +389,10 @@ EXPERIMENT_CONFIG = {
     "paths": {
         "output_dir": "/results/training-sessions",
         "train_cache_dir": (
-            "/root/capsule/data/denoise_net_patch_cache_2026_07_10/patch_cache"
+            "/root/capsule/data/denoise_net_patch_cache_2026_07_13/patch_cache"
         ),
         "val_cache_dir": (
-            "/root/capsule/data/denoise_net_patch_cache_2026_07_10/"
-            "val_patch_cache"
+            "/root/capsule/data/denoise_net_patch_cache_2026_07_13/val_patch_cache"
         ),
         "resume_path": None,
     },
@@ -439,18 +436,18 @@ EXPERIMENT_CONFIG = {
     "training": {
         "batch_size": 32,
         "device": "cuda",
-        "use_amp": True,
+        "use_amp": False,
+        "use_amp_validation": False,
         "lr": 1e-3,
-        "max_epochs": 500,
-        "n_train_examples_per_epoch": 300,
-        "val_every": 3,
+        "max_epochs": 50,
+        "val_every": 1,
     },
     "target": {"preserve_foreground": False},
     "checkpoint_weights": {
         "fg_mae": 1.0,
         "bg_mae": 0.2,
         "top_pct_error": 0.5,
-        "cratio": 2.0,
+        "cratio": 10.0,
     },
     # Switch mode to "constrained" to enforce bright/halo limits before
     # ranking valid checkpoints with one objective. Example constraints:

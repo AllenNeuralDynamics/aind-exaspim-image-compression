@@ -79,9 +79,9 @@ class CachedTrainingTest(unittest.TestCase):
                 "batch_size": 2,
                 "device": "cpu",
                 "use_amp": False,
+                "use_amp_validation": False,
                 "lr": 1e-3,
                 "max_epochs": 3,
-                "n_train_examples_per_epoch": 7,
                 "val_every": 2,
             },
             "target": {"preserve_foreground": True},
@@ -235,6 +235,7 @@ class CachedTrainingTest(unittest.TestCase):
             val_dataset.__len__.return_value = 3
             val_dataset.transform = transform
             trainer = MagicMock()
+            trainer_factory = MagicMock(return_value=trainer)
 
             data_handling = self.namespace["data_handling"]
             with patch.object(
@@ -250,7 +251,7 @@ class CachedTrainingTest(unittest.TestCase):
             ), patch.dict(
                 train.__globals__,
                 {
-                    "Trainer": MagicMock(return_value=trainer),
+                    "Trainer": trainer_factory,
                     "UNet": MagicMock(return_value=object()),
                 },
             ):
@@ -260,7 +261,6 @@ class CachedTrainingTest(unittest.TestCase):
                 str(train_cache),
                 transform=ANY,
                 preserve_foreground=True,
-                n_examples_per_epoch=7,
             )
             cached_val.assert_called_once_with(
                 str(val_cache),
@@ -273,10 +273,15 @@ class CachedTrainingTest(unittest.TestCase):
             self.assertEqual(config["val_cache_dir"], str(val_cache))
             self.assertEqual(config["transform_cfg"], transform.cfg)
             self.assertEqual(config["experiment"], experiment)
+            self.assertNotIn("n_train_examples_per_epoch", config)
             self.assertIsNone(
                 config["transform_record"]["transform_override_cfg"]
             )
             self.assertIn("provenance", config)
+            trainer_call = trainer_factory.call_args
+            self.assertEqual(trainer_call.kwargs["seed"], 42)
+            self.assertFalse(trainer_call.kwargs["use_amp"])
+            self.assertFalse(trainer_call.kwargs["use_amp_validation"])
 
     def test_top_level_experiment_configuration_has_required_sections(self):
         """The executable script exposes one complete serializable object."""
