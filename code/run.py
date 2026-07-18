@@ -247,10 +247,23 @@ if __name__ == "__main__":
         default="train",
         help="Which cache to build (default: train).",
     )
-    split = parser.parse_args().split
+    parser.add_argument(
+        "--brain_type",
+        choices=("alpha", "beta", "beta2"),
+        default="train",
+        help="Which cache to build (default: train).",
+    )
+    split, brain_type = parser.parse_args().split
 
+    # Set brain ids path based on brain type
+    if brain_type == "alpha":
+        brain_ids_path = "/data/train_alpha_brain_ids.txt"
+    elif brain_type == "beta":
+        brain_ids_path = "/data/train_beta_brain_ids.txt"
+    else:
+        brain_ids_path = "/data/train_beta2_brain_ids.txt"
+    
     # Paths (shared by both splits)
-    brain_ids_path = "/data/train_brain_ids.txt"
     img_prefixes_path = "/data/exaspim_image_prefixes.json"
     segmentation_prefixes_path = "/data/exaspim_segmentation_prefixes.json"
     offsets_path = "/data/exaspim_background_offsets.json"

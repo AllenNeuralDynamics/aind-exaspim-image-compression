@@ -119,7 +119,7 @@ if __name__ == "__main__":
 
     # Parameters
     level = 5
-    percentile = 0.1
-    scale_hint = 32.0  # asinh knee; only used to judge whether spread matters
+    percentile = 0.5
+    scale_hint = 40.0  # asinh knee; only used to judge whether spread matters
 
     main()
