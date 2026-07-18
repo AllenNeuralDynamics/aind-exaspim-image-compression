@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Dispatcher: routes to train.py or evaluate.py based on --run_mode.
+#
+# Handles both  --run_mode value  and  --run_mode=value  formats.
+# run_mode is matched case-insensitively (e.g. "Train" == "train").
+#
+# Usage:
+#   ./run --run_mode train    --img_norm_mode <m> --model_name <n> --use_amp_train False
+#   ./run --run_mode evaluate [eval-specific flags forwarded to evaluate.py]
+# ---------------------------------------------------------------------------
+
+run_mode=""
+remaining_args=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --run_mode|--run-mode)
+            run_mode="${2:?'--run_mode requires a value'}"
+            shift 2
+            ;;
+        --run_mode=*|--run-mode=*)
+            run_mode="${1#*=}"
+            shift
+            ;;
+        *)
+            remaining_args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Normalise to lower-case (requires bash 4+, standard on all CO instances)
+run_mode="${run_mode,,}"
+
+[[ -n "$run_mode" ]] || {
+    echo "Error: --run_mode is required. Expected 'train' or 'eval'/'evaluate'." >&2
+    exit 1
+}
+
+case "$run_mode" in
+    train)
+        echo "[run] mode=train"
+        python -u /code/train.py "${remaining_args[@]+"${remaining_args[@]}"}"
+        ;;
+    eval|evaluate)
+        echo "[run] mode=eval"
+        python -u /code/evaluate.py "${remaining_args[@]+"${remaining_args[@]}"}"
+        ;;
+    *)
+        echo "Error: unknown run_mode '${run_mode}' — expected 'train' or 'eval'/'evaluate'." >&2
+        exit 1
+        ;;
+esac

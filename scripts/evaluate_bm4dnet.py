@@ -185,19 +185,19 @@ if __name__ == "__main__":
     # Checkpoint. Point session_dir at a training session (the folder holding
     # the BM4DNet-*.pth files) to auto-select the best checkpoint. Set
     # checkpoint_path to a .pth to evaluate that file explicitly instead.
-    session_dir = "/root/capsule/results/training-sessions/session-20260710_1719"
-    checkpoint_path = "/root/capsule/results/training-sessions/session-20260710_1719/BM4DNet-20260710-499--19.965923.pth"
+    session_dir = "/root/capsule/data/bm4dnet-training-session-20260714_2305"
+    checkpoint_path = None
 
     # Test image. Any zarr readable by img_util.read, including an s3:// path;
     # give the full path to a single 5D multiscale level array.
-    img_path = "s3://aind-open-data/exaSPIM_826511_2026-06-02_15-10-47/SPIM.ome.zarr/tile_000010_ch_488.zarr/0"
+    img_path = "s3://aind-scratch-data/cameron.arshadi/clipping-test/input.zarr/0"
 
     # Region to evaluate. crop_center is the numeric (x, y, z) position shown by
     # Neuroglancer; the physical scale displayed beside each coordinate is read
     # from the source OME-Zarr. The position is converted to the nearest source
     # voxel before cropping. Each crop_shape dimension must be >= the model patch
     # size (64). Set crop_center=None only for a small, pre-cropped input volume.
-    crop_center = (22464, -15914, 18711)
+    crop_center = None
     crop_shape = (1024, 1024, 1024)
 
     # Use raw_input=True for volumes that were not background-subtracted.
@@ -210,9 +210,9 @@ if __name__ == "__main__":
     output_dir = "/results/evaluation"
     # Where to persist the denoised volume as an OME-Zarr. Local path or a
     # cloud path (e.g. "s3://BUCKET/PATH/denoised.zarr"). Set to None to skip.
-    output_zarr = "s3://aind-scratch-data/cameron.arshadi/denoising-experiments/outputs/BM4DNet-20260710-499--19.965923/826511_raw_crop.zarr"
+    output_zarr = "s3://aind-scratch-data/cameron.arshadi/denoising-experiments/outputs/20260714_2305/734738_crop.zarr"
     device = "cuda"
     batch_size = 32
-    clevel = 5
+    clevel = 9
 
     evaluate()

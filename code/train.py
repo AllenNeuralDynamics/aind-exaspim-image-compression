@@ -1,3 +1,4 @@
+import argparse
 import os
 
 from aind_exaspim_image_compression.machine_learning import data_handling
@@ -14,46 +15,11 @@ os.environ["GRPC_TRACE"] = ""
 _REQUIRED_CACHE_FILES = ("raw.npy", "teacher.npy", "fg.npy", "transform.json")
 
 
-def _load_cached_transform(train_cache_dir, val_cache_dir):
-    """Validates both patch caches and returns their shared transform."""
-    cache_dirs = {
-        "train_cache_dir": train_cache_dir,
-        "val_cache_dir": val_cache_dir,
-    }
-    transform_cfgs = {}
-    for name, cache_dir in cache_dirs.items():
-        if not cache_dir:
-            raise ValueError(f"{name} is required for training")
-        if not os.path.isdir(cache_dir):
-            raise FileNotFoundError(
-                f"{name} does not exist or is not a directory: {cache_dir}"
-            )
-        missing = [
-            filename
-            for filename in _REQUIRED_CACHE_FILES
-            if not os.path.isfile(os.path.join(cache_dir, filename))
-        ]
-        if missing:
-            raise FileNotFoundError(
-                f"{name} is missing required cache files: "
-                + ", ".join(missing)
-            )
-        transform_cfgs[name] = util.read_json(
-            os.path.join(cache_dir, "transform.json")
-        )
-
-    if transform_cfgs["train_cache_dir"] != transform_cfgs["val_cache_dir"]:
-        raise ValueError(
-            "train and validation patch caches use different transforms"
-        )
-    return build_transform(transform_cfgs["train_cache_dir"])
-
-
 def train(train_cache_dir, val_cache_dir):
     """Trains and validates exclusively from precomputed patch caches."""
     # Per-brain offsets and the BM4D teacher are already baked into the cached
     # counts. Both caches must use the identical count-space transform.
-    transform = _load_cached_transform(train_cache_dir, val_cache_dir)
+    transform = build_transform(config["transform_cfg"])
     train_dataset = data_handling.CachedPatchDataset(
         train_cache_dir,
         transform=transform,
@@ -81,7 +47,7 @@ def train(train_cache_dir, val_cache_dir):
         lr=lr,
         max_epochs=max_epochs,
         model=model,
-        use_amp=use_amp,
+        use_amp=use_amp_train,
         use_amp_validation=use_amp_validation,
         fg_weight=fg_weight,
         checkpoint_weights=checkpoint_weights,
@@ -99,7 +65,7 @@ def train(train_cache_dir, val_cache_dir):
             "resume_path": resume_path,
             "transform_cfg": transform.cfg,
             "preserve_foreground": preserve_foreground,
-            "use_amp": use_amp,
+            "use_amp": use_amp_train,
             "use_amp_validation": use_amp_validation,
         }
     )
@@ -110,17 +76,41 @@ def train(train_cache_dir, val_cache_dir):
 
 
 if __name__ == "__main__":
+    # Extract reproducible run parameters
+    parser = argparse.ArgumentParser(description="Process named arguments")
+    parser.add_argument("--config_name", type=str, required=True)
+    parser.add_argument("--cached_dataset_type", type=str, required=True)
+    parser.add_argument("--model_name", type=str, required=False)
+    parser.add_argument("--use_amp_train", type=bool, required=False)
+    args, _ = parser.parse_known_args()  # ignore cross-mode flags (e.g. --dataset_name)
+
     # Paths
     output_dir = "/results/training-sessions"
+    util.mkdir(output_dir)    
     # Both patch caches are required. Build them with precompute.py --split
     # train and precompute.py --split val before starting training.
-    train_cache_dir = (
-        "/root/capsule/data/denoise_net_patch_cache_2026_07_13/patch_cache"
-    )
-    val_cache_dir = (
-        "/root/capsule/data/denoise_net_patch_cache_2026_07_13/val_patch_cache"
-    )
-    util.mkdir(output_dir)
+
+    # Set dataset paths
+    if args.cached_dataset_type == "alpha":
+        raise Exception("Not so fast, alpha datasets not implemented yet!")
+    elif args.cached_dataset_type == "beta":
+        train_cache_dir = (
+            "/root/capsule/data/denoise_net_patch_cache_2026_07_13/patch_cache"
+        )
+        val_cache_dir = (
+            "/root/capsule/data/denoise_net_patch_cache_2026_07_13/val_patch_cache"
+        )
+    else:
+        raise Exception("Not so fast, alpha and beta datasets not implemented yet!")
+
+    # Load experiment config file
+    config_name = args.config_name.strip()
+    input_config_path = f"/root/capsule/data/{config_name}.json"
+    config = util.read_json(input_config_path)
+    print("Experiment Config:", config)
+
+    output_config_path = os.path.join(output_dir, f"{config_name}.json")
+    util.write_json(output_config_path, config)
 
     # Resume path. Checkpoints from before the normalization overhaul are NOT
     # compatible: GroupNorm changed the state_dict keys, the residual output
@@ -130,18 +120,21 @@ if __name__ == "__main__":
     resume_path = None
 
     # Model (new defaults: residual output + GroupNorm)
-    model = UNet()
+    if args.model_name == "unet":
+        model = UNet()
+    elif args.model_name == "unet_blurpool_rmskip0":
+        model = UNet(maxblurpool=True, remove_top_skip=True)
 
     # Training parameters
-    batch_size = 32
-    lr = 1e-3
+    batch_size = config["batch_size"]
+    lr = config["lr"]
     max_epochs = 50
     # Use AMP for optimization, but keep validation/checkpoint selection in
     # FP32 so its cratio matches production FP32 inference.
-    use_amp = False
+    use_amp_train = args.use_amp_train
     use_amp_validation = False
     # Validate (and consider a checkpoint) after every full-cache epoch.
-    val_every = 1
+    val_every = config["val_every"]
     seed = 42
 
     # Signal-preserving loss + target/sampling (Parts E/F). preserve_foreground
