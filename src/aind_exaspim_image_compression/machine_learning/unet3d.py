@@ -377,3 +377,112 @@ class OutConv(nn.Module):
             (B, 1, D, H, W).
         """
         return self.conv(x)
+
+
+class N2V2UNet(UNet):
+    """
+    Noise2Void2 variant of the 3D U-Net.
+
+    This implementation makes two architectural modifications relative to
+    the standard U-Net:
+
+      1. Replaces max pooling with anti-aliased MaxBlurPool3D.
+      2. Removes the highest-resolution skip connection.
+
+    Residual learning is disabled by default to avoid reintroducing an
+    identity path from the input to the output.
+    """
+
+    def __init__(
+        self,
+        width_multiplier=1,
+        trilinear=True,
+        residual=True,
+    ):
+        # Call parent class
+        super().__init__(
+            width_multiplier=width_multiplier,
+            trilinear=trilinear,
+            residual=residual,
+        )
+
+        factor = 2 if trilinear else 1
+
+        # Encoder
+        self.down1 = DownBlur(self.channels[0], self.channels[1])
+        self.down2 = DownBlur(self.channels[1], self.channels[2])
+        self.down3 = DownBlur(self.channels[2], self.channels[3])
+        self.down4 = DownBlur(self.channels[3], self.channels[4] // factor)
+
+    @property
+    def config(self):
+        config = super().config
+        config["model"] = "N2V2UNet"
+        return config
+
+
+class DownBlur(nn.Module):
+    """Downsampling block using MaxBlurPool3D."""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+
+        self.maxpool_conv = nn.Sequential(
+            MaxBlurPool3D(in_channels),
+            DoubleConv(in_channels, out_channels),
+        )
+
+    def forward(self, x):
+        return self.maxpool_conv(x)
+
+
+class MaxBlurPool3D(nn.Module):
+    """
+    Anti-aliased 3D max pooling (BlurPool).
+    """
+
+    def __init__(self, channels):
+        # Call parent class
+        super().__init__()        
+
+        # Create kernel
+        kernel = torch.tensor([1.0, 2.0, 1.0])
+        kernel = (
+            kernel[:, None, None]
+            * kernel[None, :, None]
+            * kernel[None, None, :]
+        )
+        kernel /= kernel.sum()
+
+        self.register_buffer(
+            "kernel",
+            kernel[None, None],
+            persistent=False,
+        )
+
+        # Instance attributes
+        self.channels = channels
+        self.pool = nn.MaxPool3d(2, stride=1)
+
+    def forward(self, x):
+        x = self.pool(x)
+        x = F.pad(
+            x,
+            [1, 1, 1, 1, 1, 1],
+            mode="replicate",
+        )
+
+        kernel = self.kernel.expand(
+            self.channels,
+            -1,
+            -1,
+            -1,
+            -1,
+        )
+
+        return F.conv3d(
+            x,
+            kernel,
+            stride=2,
+            groups=self.channels,
+        )
