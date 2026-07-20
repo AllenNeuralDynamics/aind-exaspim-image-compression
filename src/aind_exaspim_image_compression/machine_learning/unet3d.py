@@ -1,4 +1,3 @@
-
 """
 Created on Fri Aug 14 15:00:00 2025
 
@@ -9,8 +8,10 @@ Code that implements a 3D U-Net.
 
 """
 
+import warnings
 from math import gcd
 from numbers import Real
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -60,17 +61,39 @@ class UNet(nn.Module):
         residual : bool, optional
             If True, the network predicts a residual added to the input, so it
             learns to "remove noise" rather than reconstruct the full signal.
-            Default is True.
+            Default is True. Note: combining residual=True with
+            remove_top_skip=True re-introduces an unattenuated identity path
+            from input to output via this residual add, which can defeat the
+            purpose of removing the top skip (see N2V2). Consider
+            residual=False when remove_top_skip=True.
+        maxblurpool : bool, optional
+            If True, use anti-aliased max-blur pooling (MaxBlurPool3D) instead
+            of plain nn.MaxPool3d for downsampling. Default is False.
+        remove_top_skip : bool, optional
+            If True, drop the encoder-to-decoder skip connection at the
+            highest resolution (up4), as in N2V2, to reduce noise
+            short-circuiting from input to output. Default is False.
         """
         # Call parent class
         super().__init__()
 
         if (
-            isinstance(width_multiplier, Real)
+            isinstance(width_multiplier, bool)
+            or not isinstance(width_multiplier, Real)
             or width_multiplier < 1
             or not float(width_multiplier).is_integer()
         ):
             raise ValueError("width_multiplier must be a positive integer")
+
+        if remove_top_skip and residual:
+            warnings.warn(
+                "remove_top_skip=True removes the top skip connection to "
+                "reduce noise short-circuiting (as in N2V2), but "
+                "residual=True adds an unattenuated identity path from the "
+                "raw input back onto the output, which can silently defeat "
+                "that change. Consider residual=False.",
+                stacklevel=2,
+            )
 
         # Initializations
         base_channels = (32, 64, 128, 256, 512)
@@ -90,25 +113,21 @@ class UNet(nn.Module):
 
         # Encoder
         self.inc = DoubleConv(1, self.channels[0])
-
         self.down1 = Down(
             self.channels[0],
             self.channels[1],
             maxblurpool=maxblurpool,
         )
-
         self.down2 = Down(
             self.channels[1],
             self.channels[2],
             maxblurpool=maxblurpool,
         )
-
         self.down3 = Down(
             self.channels[2],
             self.channels[3],
             maxblurpool=maxblurpool,
         )
-
         self.down4 = Down(
             self.channels[3],
             self.channels[4] // factor,
@@ -120,30 +139,23 @@ class UNet(nn.Module):
             self.channels[4],
             self.channels[3] // factor,
             trilinear=trilinear,
-            use_skip=True,
         )
-
         self.up2 = Up(
             self.channels[3],
             self.channels[2] // factor,
             trilinear=trilinear,
-            use_skip=True,
         )
-
         self.up3 = Up(
             self.channels[2],
             self.channels[1] // factor,
             trilinear=trilinear,
-            use_skip=True,
         )
-
         self.up4 = Up(
             self.channels[1],
             self.channels[0],
             trilinear=trilinear,
             use_skip=not remove_top_skip,
         )
-
         self.outc = OutConv(self.channels[0], 1)
 
     @property
@@ -183,13 +195,18 @@ class UNet(nn.Module):
         d = self.up1(x5, x4)
         d = self.up2(d, x3)
         d = self.up3(d, x2)
-
-        if self.remove_top_skip:
-            d = self.up4(d)
-        else:
-            d = self.up4(d, x1)
-
+        d = self.up4(d, x1)
         logits = self.outc(d)
+
+        # Without a top skip, the decoder's own upsampling determines output
+        # size; guard against off-by-one mismatches on odd input shapes.
+        if logits.shape[2:] != x.shape[2:]:
+            logits = F.interpolate(
+                logits,
+                size=x.shape[2:],
+                mode="trilinear",
+                align_corners=True,
+            )
 
         # Residual denoising: predict the correction added to the input
         if self.residual:
@@ -243,6 +260,10 @@ class DoubleConv(nn.Module):
                 kernel_size=kernel_size,
                 padding=1,
             ),
+            # 8 groups caps GroupNorm's group count at a small, fixed value
+            # regardless of width_multiplier; gcd(8, C) falls back to fewer
+            # groups (down to 1, i.e. LayerNorm-like) if C isn't a multiple
+            # of 8.
             nn.GroupNorm(gcd(8, mid_channels), mid_channels),
             nn.LeakyReLU(negative_slope=0.01, inplace=True),
             nn.Conv3d(
@@ -275,6 +296,13 @@ class DoubleConv(nn.Module):
 class Down(nn.Module):
     """
     A downsampling module for a 3D U-Net.
+
+    Attributes
+    ----------
+    maxpool_conv : nn.Sequential
+        Sequential module containing a downsampling layer (plain max
+        pooling, or anti-aliased max-blur pooling if maxblurpool=True)
+        followed by a DoubleConv block.
     """
 
     def __init__(
@@ -323,7 +351,7 @@ class Down(nn.Module):
         Returns
         -------
         torch.Tensor
-            Output tensor after max pooling and double convolution.
+            Output tensor after downsampling and double convolution.
         """
         return self.maxpool_conv(x)
 
@@ -337,9 +365,11 @@ class Up(nn.Module):
     ----------
     up : nn.Module
         Upsampling layer (either nn.Upsample or nn.ConvTranspose3d).
+    use_skip : bool
+        Whether this block concatenates an encoder skip connection.
     conv : DoubleConv
         Double convolution block applied after concatenating the skip
-        connection.
+        connection (if used).
     """
 
     def __init__(
@@ -355,12 +385,17 @@ class Up(nn.Module):
         Parameters
         ----------
         in_channels : int
-            Number of input channels to this module.
+            Number of channels feeding into this block's DoubleConv — i.e.
+            the post-concatenation channel count when use_skip=True.
         out_channels : int
             Number of output channels produced by this module.
         trilinear : bool, optional
             Indication of whether to use nn.Upsample or nn.ConvTranspose3d.
             Default is True, meaning that nn.Upsample is used.
+        use_skip : bool, optional
+            If True, concatenate the encoder skip connection passed as x2 in
+            forward(). If False, x2 is ignored (as in N2V2's top-skip
+            removal) and the decoder path runs on x1 alone. Default is True.
         """
         # Call parent class
         super().__init__()
@@ -389,9 +424,10 @@ class Up(nn.Module):
         self.conv = DoubleConv(
             conv_in_channels,
             out_channels,
+            mid_channels=in_channels // 2 if trilinear and use_skip else None,
         )
 
-    def forward(self, x1, x2=None):
+    def forward(self, x1, x2: Optional[torch.Tensor] = None):
         """
         Forward pass of the upsampling block in a 3D U-Net.
 
@@ -402,15 +438,23 @@ class Up(nn.Module):
             (B, C1, D, H1, W1).
         x2 : torch.Tensor, optional
             Skip connection tensor from the encoder path with shape
-            (B, C2, D, H2, W2).
+            (B, C2, D, H2, W2). Required if use_skip=True; ignored if
+            use_skip=False.
 
         Returns
         -------
         torch.Tensor
             Output tensor after upsampling, concatenation with the skip
-            connection, and double convolution. The output shape is
-            (B, out_channels, D, H2, W2).
+            connection (if use_skip=True), and double convolution. Output
+            shape is (B, out_channels, D, H2, W2) if use_skip=True, or
+            (B, out_channels, D, H1, W1) otherwise.
         """
+        if self.use_skip and x2 is None:
+            raise ValueError(
+                "Up was initialized with use_skip=True but no skip tensor "
+                "(x2) was provided to forward()."
+            )
+
         x1 = self.up(x1)
 
         if self.use_skip:
@@ -439,8 +483,38 @@ class Up(nn.Module):
 
 
 class MaxBlurPool3D(nn.Module):
+    """
+    Anti-aliased downsampling module (BlurPool, Zhang 2019), extended to 3D.
+    Drop-in, shape-compatible replacement for nn.MaxPool3d(2): performs a
+    stride-1 max pool followed by a stride-2 binomial blur convolution,
+    which reduces aliasing compared to plain strided max pooling.
+
+    The blur input is replicate-padded (rather than zero-padded) before the
+    stride-2 convolution so that border voxels aren't systematically
+    attenuated relative to interior voxels.
+
+    Attributes
+    ----------
+    pool : nn.MaxPool3d
+        Stride-1 max pool preceding the blur convolution.
+    kernel : torch.Tensor
+        Non-persistent (1, 1, 3, 3, 3) normalized binomial [1, 2, 1] blur
+        kernel, expanded per-channel at forward time rather than stored
+        once per channel.
+    channels : int
+        Number of channels this pool operates on (needed for the grouped
+        convolution and kernel expansion).
+    """
 
     def __init__(self, channels):
+        """
+        Instantiates a MaxBlurPool3D object.
+
+        Parameters
+        ----------
+        channels : int
+            Number of input/output channels.
+        """
         super().__init__()
 
         self.pool = nn.MaxPool3d(2, stride=1)
@@ -453,21 +527,29 @@ class MaxBlurPool3D(nn.Module):
         )
         kernel /= kernel.sum()
 
-        self.register_buffer(
-            "kernel",
-            kernel[None, None].repeat(channels, 1, 1, 1, 1),
-        )
+        # Store one copy of the kernel (not one per channel) and not part
+        # of the checkpoint; expanded per-channel in forward() instead.
+        self.register_buffer("kernel", kernel[None, None], persistent=False)
         self.channels = channels
 
     def forward(self, x):
+        """
+        Forward pass of the max-blur pooling module.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor with shape (B, C, D, H, W).
+
+        Returns
+        -------
+        torch.Tensor
+            Downsampled tensor with shape (B, C, D/2, H/2, W/2).
+        """
         x = self.pool(x)
-        x = F.conv3d(
-            x,
-            self.kernel,
-            stride=2,
-            padding=1,
-            groups=self.channels,
-        )
+        x = F.pad(x, [1, 1, 1, 1, 1, 1], mode="replicate")
+        kernel = self.kernel.expand(self.channels, -1, -1, -1, -1)
+        x = F.conv3d(x, kernel, stride=2, padding=0, groups=self.channels)
         return x
 
 
