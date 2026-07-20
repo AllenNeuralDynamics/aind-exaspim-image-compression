@@ -260,10 +260,6 @@ class DoubleConv(nn.Module):
                 kernel_size=kernel_size,
                 padding=1,
             ),
-            # 8 groups caps GroupNorm's group count at a small, fixed value
-            # regardless of width_multiplier; gcd(8, C) falls back to fewer
-            # groups (down to 1, i.e. LayerNorm-like) if C isn't a multiple
-            # of 8.
             nn.GroupNorm(gcd(8, mid_channels), mid_channels),
             nn.LeakyReLU(negative_slope=0.01, inplace=True),
             nn.Conv3d(
