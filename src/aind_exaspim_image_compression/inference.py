@@ -274,6 +274,7 @@ def load_model(path, device="cuda"):
     transform : IntensityTransform
         The intensity transform the model was trained with.
     """
+    # Read ckpt and create model config
     ckpt = torch.load(path, map_location=device)
     if isinstance(ckpt, dict) and "model" in ckpt:
         state_dict = ckpt["model"]
@@ -284,7 +285,14 @@ def load_model(path, device="cuda"):
         transform_cfg = {"kind": "asinh"}
         model_cfg = {}
 
-    model = UNet(**model_cfg)
+    # Determine correct model class
+    model_type = model_cfg.pop("model", "UNet")
+    if model_type == "N2V2UNet":
+        model = N2V2UNet(**model_cfg)
+    else:
+        model = UNet(**model_cfg)
+
+    # Load ckpt into model
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()

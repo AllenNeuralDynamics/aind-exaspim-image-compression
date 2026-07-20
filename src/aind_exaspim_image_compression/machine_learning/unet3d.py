@@ -321,14 +321,24 @@ class Up(nn.Module):
             (B, out_channels, D, H2, W2).
         """
         x1 = self.up(x1)
-        diffY = x2.size()[2] - x1.size()[2]
-        diffX = x2.size()[3] - x1.size()[3]
+
+        diffD = x2.size()[2] - x1.size()[2]
+        diffH = x2.size()[3] - x1.size()[3]
+        diffW = x2.size()[4] - x1.size()[4]
 
         x1 = F.pad(
             x1,
-            [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2],
+            [
+                diffW // 2,
+                diffW - diffW // 2,
+                diffH // 2,
+                diffH - diffH // 2,
+                diffD // 2,
+                diffD - diffD // 2,
+            ],
         )
         x = torch.cat([x2, x1], dim=1)
+
         return self.conv(x)
 
 
@@ -389,8 +399,9 @@ class N2V2UNet(UNet):
       1. Replaces max pooling with anti-aliased MaxBlurPool3D.
       2. Removes the highest-resolution skip connection.
 
-    Residual learning is disabled by default to avoid reintroducing an
-    identity path from the input to the output.
+    Residual learning can be enabled to predict a residual correction
+    that is added to the input image. This is commonly used for denoising
+    tasks.
     """
 
     def __init__(
@@ -399,7 +410,6 @@ class N2V2UNet(UNet):
         trilinear=True,
         residual=True,
     ):
-        # Call parent class
         super().__init__(
             width_multiplier=width_multiplier,
             trilinear=trilinear,
@@ -408,11 +418,67 @@ class N2V2UNet(UNet):
 
         factor = 2 if trilinear else 1
 
-        # Encoder
-        self.down1 = DownBlur(self.channels[0], self.channels[1])
-        self.down2 = DownBlur(self.channels[1], self.channels[2])
-        self.down3 = DownBlur(self.channels[2], self.channels[3])
-        self.down4 = DownBlur(self.channels[3], self.channels[4] // factor)
+        self.down1 = DownBlur(
+            self.channels[0],
+            self.channels[1],
+        )
+        self.down2 = DownBlur(
+            self.channels[1],
+            self.channels[2],
+        )
+        self.down3 = DownBlur(
+            self.channels[2],
+            self.channels[3],
+        )
+        self.down4 = DownBlur(
+            self.channels[3],
+            self.channels[4] // factor,
+        )
+
+        # remove highest-resolution skip
+        self.up4 = UpNoSkip3D(
+            self.channels[1] // factor,
+            self.channels[0],
+            trilinear,
+        )
+
+    def forward(self, x):
+        input_size = x.shape[2:]
+
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+
+        d = self.up1(x5, x4)
+        d = self.up2(d, x3)
+        d = self.up3(d, x2)
+        d = self.up4(d)
+
+        logits = self.outc(d)
+
+        # Restore original spatial size
+        diffD = input_size[0] - logits.size(2)
+        diffH = input_size[1] - logits.size(3)
+        diffW = input_size[2] - logits.size(4)
+
+        logits = F.pad(
+            logits,
+            [
+                diffW // 2,
+                diffW - diffW // 2,
+                diffH // 2,
+                diffH - diffH // 2,
+                diffD // 2,
+                diffD - diffD // 2,
+            ],
+        )
+
+        if self.residual:
+            return x + logits
+
+        return logits
 
     @property
     def config(self):
@@ -442,10 +508,9 @@ class MaxBlurPool3D(nn.Module):
     """
 
     def __init__(self, channels):
-        # Call parent class
-        super().__init__()        
+        super().__init__()
 
-        # Create kernel
+        # Create separable binomial blur kernel
         kernel = torch.tensor([1.0, 2.0, 1.0])
         kernel = (
             kernel[:, None, None]
@@ -454,13 +519,16 @@ class MaxBlurPool3D(nn.Module):
         )
         kernel /= kernel.sum()
 
+        # Expand kernel for depthwise convolution
+        # Shape: (channels, 1, 3, 3, 3)
+        kernel = kernel[None, None].repeat(channels, 1, 1, 1, 1)
+
         self.register_buffer(
             "kernel",
-            kernel[None, None],
-            persistent=False,
+            kernel,
+            persistent=True,
         )
 
-        # Instance attributes
         self.channels = channels
         self.pool = nn.MaxPool3d(2, stride=1)
 
@@ -471,18 +539,64 @@ class MaxBlurPool3D(nn.Module):
             [1, 1, 1, 1, 1, 1],
             mode="replicate",
         )
-
-        kernel = self.kernel.expand(
-            self.channels,
-            -1,
-            -1,
-            -1,
-            -1,
-        )
-
         return F.conv3d(
             x,
-            kernel,
+            self.kernel,
             stride=2,
             groups=self.channels,
         )
+
+
+class UpNoSkip3D(nn.Module):
+    """
+    Upsampling block without a skip connection.
+    """
+
+    def __init__(self, in_channels, out_channels, trilinear=True):
+        super().__init__()
+
+        if trilinear:
+            self.up = nn.Upsample(
+                scale_factor=2,
+                mode="trilinear",
+                align_corners=True,
+            )
+            self.conv = DoubleConv(
+                in_channels,
+                out_channels,
+                mid_channels=in_channels // 2,
+            )
+        else:
+            self.up = nn.ConvTranspose3d(
+                in_channels,
+                in_channels // 2,
+                kernel_size=2,
+                stride=2,
+            )
+            self.conv = DoubleConv(
+                in_channels // 2,
+                out_channels,
+            )
+
+    def forward(self, x):
+        x = self.up(x)
+        return self.conv(x)
+
+
+def test_unets():
+    for cls in [UNet, N2V2UNet]:
+        model = cls()
+        model.eval()
+
+        for size in [32, 33, 64, 65, 128]:
+            x = torch.randn(1, 1, size, size, size)
+
+            with torch.no_grad():
+                y = model(x)
+
+            assert y.shape == x.shape, (
+                f"{cls.__name__}: "
+                f"{x.shape} -> {y.shape}"
+            )
+
+        print(f"{cls.__name__}: passed")
