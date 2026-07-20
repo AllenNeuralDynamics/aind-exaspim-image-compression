@@ -418,22 +418,10 @@ class N2V2UNet(UNet):
 
         factor = 2 if trilinear else 1
 
-        self.down1 = DownBlur(
-            self.channels[0],
-            self.channels[1],
-        )
-        self.down2 = DownBlur(
-            self.channels[1],
-            self.channels[2],
-        )
-        self.down3 = DownBlur(
-            self.channels[2],
-            self.channels[3],
-        )
-        self.down4 = DownBlur(
-            self.channels[3],
-            self.channels[4] // factor,
-        )
+        self.down1 = DownBlur(self.channels[0], self.channels[1])
+        self.down2 = DownBlur(self.channels[1], self.channels[2])
+        self.down3 = DownBlur(self.channels[2], self.channels[3])
+        self.down4 = DownBlur(self.channels[3], self.channels[4] // factor)
 
         # remove highest-resolution skip
         self.up4 = UpNoSkip3D(
