@@ -282,6 +282,7 @@ class CachedTrainingTest(unittest.TestCase):
             self.assertEqual(trainer_call.kwargs["seed"], 42)
             self.assertFalse(trainer_call.kwargs["use_amp"])
             self.assertFalse(trainer_call.kwargs["use_amp_validation"])
+            self.assertIsNone(trainer_call.kwargs["max_grad_norm"])
 
     def test_top_level_experiment_configuration_has_required_sections(self):
         """The executable script exposes one complete serializable object."""
@@ -293,6 +294,9 @@ class CachedTrainingTest(unittest.TestCase):
         self.assertIn("train_regions", config["sampling"])
         self.assertIn("validation_regions", config["sampling"])
         self.assertIn("checkpoint_selection", config)
+        self.assertEqual(config["teacher"]["mode"], "gat_bm4d")
+        self.assertEqual(config["loss"]["count_weight"], 0.003)
+        self.assertEqual(config["training"]["max_grad_norm"], 1.0)
         json.dumps(config)
 
 

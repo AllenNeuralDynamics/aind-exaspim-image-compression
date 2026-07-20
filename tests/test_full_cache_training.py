@@ -119,6 +119,58 @@ class FullCacheDataLoaderTest(unittest.TestCase):
 class TrainerShuffleTest(unittest.TestCase):
     """Tests Trainer wiring for shuffled training and ordered validation."""
 
+    def test_gradient_clipping_requires_positive_finite_norm(self):
+        """Invalid clipping thresholds fail before training starts."""
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "finite and positive"):
+                Trainer(
+                    directory,
+                    device="cpu",
+                    model=torch.nn.Linear(1, 1),
+                    max_epochs=1,
+                    use_amp=False,
+                    max_grad_norm=0,
+                )
+
+    def test_gradient_clipping_unscales_before_optimizer_step(self):
+        """Configured clipping sees unscaled gradients before the update."""
+        model = torch.nn.Linear(1, 1)
+        values = torch.ones((1, 1, 1, 1, 1))
+        batch = {
+            "input": values,
+            "target": torch.zeros_like(values),
+            "foreground": torch.zeros_like(values),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = Trainer(
+                directory,
+                device="cpu",
+                model=model,
+                max_epochs=1,
+                use_amp=False,
+                max_grad_norm=1.0,
+            )
+            try:
+                with (
+                    patch.object(
+                        trainer.scaler,
+                        "unscale_",
+                        wraps=trainer.scaler.unscale_,
+                    ) as unscale,
+                    patch(
+                        "aind_exaspim_image_compression.machine_learning."
+                        "train.torch.nn.utils.clip_grad_norm_",
+                        wraps=torch.nn.utils.clip_grad_norm_,
+                    ) as clip,
+                ):
+                    trainer.train_step([batch], epoch=0)
+
+                unscale.assert_called_once_with(trainer.optimizer)
+                clip.assert_called_once()
+                self.assertEqual(clip.call_args.kwargs["max_norm"], 1.0)
+            finally:
+                trainer.writer.close()
+
     def test_training_and_validation_amp_are_configured_separately(self):
         """Training can use AMP while validation remains full precision."""
         model = torch.nn.Linear(1, 1)
@@ -221,6 +273,7 @@ class TrainerShuffleTest(unittest.TestCase):
                     self.assertEqual(config["seed"], 42)
                     self.assertFalse(config["use_amp"])
                     self.assertFalse(config["use_amp_validation"])
+                    self.assertIsNone(config["max_grad_norm"])
             finally:
                 trainer.writer.close()
 

@@ -81,6 +81,7 @@ class Trainer:
         prefetch=2,
         val_every=1,
         seed=0,
+        max_grad_norm=None,
     ):
         """
         Instantiates a Trainer object.
@@ -120,6 +121,10 @@ class Trainer:
         seed : int, optional
             Seed used to reproducibly shuffle training examples by epoch.
             Default is 0.
+        max_grad_norm : float, optional
+            Maximum L2 norm of the gradients. Gradients are unscaled before
+            clipping when AMP is enabled. ``None`` disables clipping. Default
+            is None.
         """
         # Initializations
         exp_name = "session-" + datetime.today().strftime("%Y%m%d_%H%M")
@@ -138,6 +143,12 @@ class Trainer:
         self.seed = seed
         self.use_amp = bool(use_amp)
         self.use_amp_validation = bool(use_amp_validation)
+        if max_grad_norm is None:
+            self.max_grad_norm = None
+        else:
+            self.max_grad_norm = float(max_grad_norm)
+            if not np.isfinite(self.max_grad_norm) or self.max_grad_norm <= 0:
+                raise ValueError("max_grad_norm must be finite and positive")
 
         self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
         self.criterion = (
@@ -281,6 +292,11 @@ class Trainer:
             # Backward pass (loss-scaled for AMP stability)
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
+            if self.max_grad_norm is not None:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), max_norm=self.max_grad_norm
+                )
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -622,6 +638,7 @@ class Trainer:
             "seed": self.seed,
             "use_amp": self.use_amp,
             "use_amp_validation": self.use_amp_validation,
+            "max_grad_norm": self.max_grad_norm,
             "fg_weight": getattr(self.criterion, "fg_weight", None),
             "loss_config": self.loss_config,
             "checkpoint_weights": self.checkpoint_weights,

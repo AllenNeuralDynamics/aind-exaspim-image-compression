@@ -362,6 +362,7 @@ def train(experiment_config):
         num_workers=0,
         val_every=training["val_every"],
         seed=config["seed"],
+        max_grad_norm=training.get("max_grad_norm"),
     )
 
     # Persist the run configuration next to the checkpoints/tensorboard so each
@@ -398,7 +399,7 @@ EXPERIMENT_CONFIG = {
     },
     # None accepts the teacher stamped into the cache. Set an explicit mode to
     # make the script reject a cache built with a different teacher.
-    "teacher": {"mode": None},
+    "teacher": {"mode": "gat_bm4d"},
     # Cache transform metadata is compared before this explicit count-space
     # override is applied. Set override to None to use the cache transform.
     "transform": {
@@ -409,7 +410,7 @@ EXPERIMENT_CONFIG = {
     },
     "loss": {
         "legacy_weight": 1.0,
-        "count_weight": 0.0,
+        "count_weight": 0.003,
         "legacy": {"fg_weight": 0.0, "eps": 1e-3},
         "count": {
             "sigma_floor": 2.0,
@@ -441,6 +442,7 @@ EXPERIMENT_CONFIG = {
         "lr": 1e-3,
         "max_epochs": 50,
         "val_every": 1,
+        "max_grad_norm": 1.0,
     },
     "target": {"preserve_foreground": False},
     "checkpoint_weights": {

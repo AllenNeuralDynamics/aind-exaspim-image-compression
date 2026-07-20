@@ -89,6 +89,9 @@ class UNet(nn.Module):
         self.up3 = Up(self.channels[2], self.channels[1] // factor, trilinear)
         self.up4 = Up(self.channels[1], self.channels[0], trilinear)
         self.outc = OutConv(self.channels[0], 1)
+        if self.residual:
+            nn.init.zeros_(self.outc.conv.weight)
+            nn.init.zeros_(self.outc.conv.bias)
 
     @property
     def config(self):

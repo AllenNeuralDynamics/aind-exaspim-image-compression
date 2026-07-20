@@ -87,6 +87,12 @@ class InferenceRegressionTest(unittest.TestCase):
 class ArchitectureRegressionTest(unittest.TestCase):
     """Tests non-default U-Net construction."""
 
+    def test_residual_output_head_is_zero_initialized(self):
+        """A new residual U-Net initially predicts the identity mapping."""
+        model = UNet(residual=True)
+        self.assertTrue(torch.count_nonzero(model.outc.conv.weight) == 0)
+        self.assertTrue(torch.count_nonzero(model.outc.conv.bias) == 0)
+
     def test_width_multiplier_is_a_positive_integer(self):
         """Arbitrary fractional width multipliers are rejected explicitly."""
         with self.assertRaisesRegex(ValueError, "positive integer"):
