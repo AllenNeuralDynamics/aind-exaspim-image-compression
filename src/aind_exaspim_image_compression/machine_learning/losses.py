@@ -238,6 +238,7 @@ class CompositeDenoisingLoss(nn.Module):
         self.legacy_weight = float(legacy_weight)
         self.count_weight = float(count_weight)
         self.cfg = copy.deepcopy(cfg) if cfg is not None else None
+        self.last_components = {}
 
     @property
     def fg_weight(self):
@@ -261,10 +262,13 @@ class CompositeDenoisingLoss(nn.Module):
     ):
         """Evaluate and combine enabled loss terms."""
         total = pred.new_zeros((), dtype=torch.float32)
+        legacy_component = pred.new_zeros((), dtype=torch.float32)
+        count_component = pred.new_zeros((), dtype=torch.float32)
         if self.legacy_weight:
-            total = total + self.legacy_weight * self.legacy_loss(
+            legacy_component = self.legacy_weight * self.legacy_loss(
                 pred, target, fg_mask
             )
+            total = total + legacy_component
         if self.count_weight:
             required = {
                 "target_counts": target_counts,
@@ -277,13 +281,18 @@ class CompositeDenoisingLoss(nn.Module):
                 raise ValueError(
                     "count loss requires batch fields: " + ", ".join(missing)
                 )
-            total = total + self.count_weight * self.count_loss(
+            count_component = self.count_weight * self.count_loss(
                 pred,
                 target_counts,
                 raw_counts,
                 noise_params,
                 offset,
             )
+            total = total + count_component
+        self.last_components = {
+            "legacy": legacy_component.detach(),
+            "count": count_component.detach(),
+        }
         return total
 
 

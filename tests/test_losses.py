@@ -3,6 +3,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import MagicMock
 
 import torch
 
@@ -245,6 +246,16 @@ class CompositeDenoisingLossTest(unittest.TestCase):
                 combined_value, 2 * legacy_value + 3 * count_value
             )
         )
+        self.assertTrue(
+            torch.allclose(
+                combined.last_components["legacy"], 2 * legacy_value
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                combined.last_components["count"], 3 * count_value
+            )
+        )
         self.assertFalse(legacy.requires_count_metadata)
         self.assertTrue(count.requires_count_metadata)
 
@@ -314,6 +325,14 @@ class CompositeDenoisingLossTest(unittest.TestCase):
                 trainer.transform = self.transform
                 _, actual = trainer.forward_pass(batch)
                 self.assertTrue(torch.isfinite(actual))
+                trainer.writer.add_scalar = MagicMock()
+                trainer.train_step([batch], epoch=0)
+                logged_names = {
+                    call.args[0]
+                    for call in trainer.writer.add_scalar.call_args_list
+                }
+                self.assertIn("train_legacy_loss", logged_names)
+                self.assertIn("train_count_loss", logged_names)
                 trainer.save_model(1, 1.0)
                 checkpoint_path = next(
                     trainer.log_dir + "/" + name

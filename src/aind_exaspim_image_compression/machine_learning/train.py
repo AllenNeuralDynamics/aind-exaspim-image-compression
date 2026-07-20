@@ -282,6 +282,7 @@ class Trainer:
             Average loss over the training epoch.
         """
         losses = list()
+        loss_components = {}
         self.model.train()
         for batch in train_dataloader:
             # Forward pass
@@ -302,7 +303,17 @@ class Trainer:
 
             # Store loss for tensorboard
             losses.append(float(loss.detach().cpu()))
+            for name, value in getattr(
+                self.criterion, "last_components", {}
+            ).items():
+                loss_components.setdefault(name, []).append(
+                    float(value.detach().cpu())
+                )
         self.writer.add_scalar("train_loss", np.mean(losses), epoch)
+        for name, values in loss_components.items():
+            self.writer.add_scalar(
+                f"train_{name}_loss", np.mean(values), epoch
+            )
         return np.mean(losses)
 
     def validate_step(self, val_dataloader, epoch):
@@ -330,6 +341,7 @@ class Trainer:
             return float("nan"), float("nan"), False
 
         losses = list()
+        loss_components = {}
         cratios = list()
         metric_records = list()
         with torch.no_grad():
@@ -342,6 +354,12 @@ class Trainer:
 
                 # Evaluate result
                 losses.append(loss.detach().cpu())
+                for name, value in getattr(
+                    self.criterion, "last_components", {}
+                ).items():
+                    loss_components.setdefault(name, []).append(
+                        float(value.detach().cpu())
+                    )
                 cratios.extend(self.compute_cratios(hat_y))
                 metric_records.extend(
                     self.compute_metrics(
@@ -368,6 +386,8 @@ class Trainer:
 
         # Log results
         self.writer.add_scalar("val_loss", loss, epoch)
+        for name, values in loss_components.items():
+            self.writer.add_scalar(f"val_{name}_loss", np.mean(values), epoch)
         self.writer.add_scalar("val_cratio", cratio, epoch)
         self.writer.add_scalar("val_score", score, epoch)
         self.writer.add_scalar(
