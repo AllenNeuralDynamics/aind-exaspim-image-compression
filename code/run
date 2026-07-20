@@ -1,5 +1,46 @@
 #!/usr/bin/env bash
 set -ex
 
-# This is the master script for the capsule. When you click "Reproducible Run", the code in this file will execute.
-python -u precompute.py "$@"
+setup_google_creds() {
+    TEMP_CRED_FILE=$(mktemp --suffix=".json")
+    trap "rm -f $TEMP_CRED_FILE" EXIT
+    echo "${CUSTOM_KEY}" > "$TEMP_CRED_FILE"
+    export GOOGLE_APPLICATION_CREDENTIALS=$TEMP_CRED_FILE
+}
+
+setup_google_creds
+
+# Extract --run_mode and strip it from the forwarded args so each script
+# only sees the flags it declares in its own argparser.
+run_mode=""
+remaining=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --run_mode)
+            run_mode="$2"
+            shift 2
+            ;;
+        --run_mode=*)
+            run_mode="${1#--run_mode=}"
+            shift
+            ;;
+        *)
+            remaining+=("$1")
+            shift
+            ;;
+    esac
+done
+
+case "$run_mode" in
+    generate_cached_dataset)
+        python -u run.py "${remaining[@]}"
+        ;;
+    compute_background_offsets)
+        python -u estimate_background_offsets.py "${remaining[@]}"
+        ;;
+    *)
+        echo "ERROR: unknown or missing run_mode '${run_mode}'." \
+             "Must be 'generate_cached_dataset' or 'compute_background_offsets'." >&2
+        exit 1
+        ;;
+esac

@@ -112,14 +112,23 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--filename", default="train_brain_ids.txt")
+    parser.add_argument("--level", type=int, default=5)
+    parser.add_argument("--percentile", type=float, default=0.1)
+    parser.add_argument("--scale_hint", type=float, default=32.0)
+    args, _ = parser.parse_known_args()
+ 
     # Paths
-    brain_ids_path = "/data/train_brain_ids.txt"
+    brain_ids_path = f"/data/{args.filename.strip()}"
     img_prefixes_path = "/data/exaspim_image_prefixes.json"
-    output_path = "/data/exaspim_background_offsets.json"
+    output_path = f"/results/{args.filename.replace('brain_ids', 'background_offsets').replace('.txt', '.json')}"
 
     # Parameters
-    level = 5
-    percentile = 0.5
-    scale_hint = 40.0  # asinh knee; only used to judge whether spread matters
+    level = args.level
+    percentile = args.percentile
+    scale_hint = args.scale_hint  # asinh knee; only used to judge whether spread matters
 
     main()

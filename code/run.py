@@ -46,6 +46,7 @@ handles are not re-pickled per patch.
 
 import argparse
 import random
+import shutil
 
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
@@ -250,18 +251,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--brain_type",
         choices=("alpha", "beta", "beta2"),
-        default="train",
-        help="Which cache to build (default: train).",
+        default="alpha",
+        help="Which brain type to build the cache for (default: alpha).",
     )
-    split, brain_type = parser.parse_args().split
+    args = parser.parse_args()
+    split = args.split
+    brain_type = args.brain_type
 
     # Set brain ids path based on brain type
     if brain_type == "alpha":
-        brain_ids_path = "/data/train_alpha_brain_ids.txt"
+        brains_filename = "train_alpha_brain_ids.txt"
     elif brain_type == "beta":
-        brain_ids_path = "/data/train_beta_brain_ids.txt"
+        brains_filename = "train_beta_brain_ids.txt"
     else:
-        brain_ids_path = "/data/train_beta2_brain_ids.txt"
+        brains_filename = "train_beta2_brain_ids.txt"
+    
+    brain_ids_path = f"/data/{brains_filename}"
+
+    # Save brain ids in results
+    dst_path = f"/results/{brains_filename}"
+    shutil.copy2(brain_ids_path, dst_path)
     
     # Paths (shared by both splits)
     img_prefixes_path = "/data/exaspim_image_prefixes.json"
