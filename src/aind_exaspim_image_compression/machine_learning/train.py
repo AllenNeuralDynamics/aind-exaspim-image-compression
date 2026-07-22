@@ -151,6 +151,7 @@ class Trainer:
         # Create learning rate scheduler
         total_steps = self.max_epochs * len(train_dataloader)
         scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps)
+        print("Total Optimizer Steps:", total_steps)
 
         # Training loop
         step = 0
@@ -187,7 +188,7 @@ class Trainer:
                         "train_loss", avg_train_loss, step
                     )
 
-                    suffix = " - New Best!" if is_best else ""
+                    suffix = " - New Best!" if epoch > 0 and is_best else ""
                     print(
                         f"Step {step}: "
                         f"train_loss={avg_train_loss:.5f}, "
