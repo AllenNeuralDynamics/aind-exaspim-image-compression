@@ -31,33 +31,6 @@ from aind_exaspim_image_compression.machine_learning.metrics import (
 from aind_exaspim_image_compression.utils import img_util, util
 
 
-def save_mip_png(path, img, low_pct=1.0, high_pct=99.9):
-    """
-    Writes a 3D volume as a contrast-stretched 8-bit PNG for easy viewing.
-
-    The volume is reduced to 2D with a maximum-intensity projection along the
-    z-axis (axis 0), then percentile-normalized to uint8 so that dim neurites
-    are visible in a standard image viewer.
-
-    Parameters
-    ----------
-    path : str
-        Output path for the PNG file.
-    img : numpy.ndarray
-        3D image volume with shape (D, H, W) in raw counts.
-    low_pct : float, optional
-        Lower percentile mapped to black. The default is 1.0.
-    high_pct : float, optional
-        Upper percentile mapped to white. The default is 99.9.
-    """
-    mip = img.max(axis=0).astype(np.float32)
-    lo, hi = np.percentile(mip, (low_pct, high_pct))
-    if hi <= lo:
-        hi = lo + 1.0
-    mip = np.clip((mip - lo) / (hi - lo), 0.0, 1.0)
-    io.imsave(path, np.rint(mip * 255).astype(np.uint8), check_contrast=False)
-
-
 class Trainer:
 
     def __init__(
@@ -146,7 +119,7 @@ class Trainer:
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
     # --- Core Routines ---
-    def run(self, train_dataset, val_dataset):
+    def __call__(self, train_dataset, val_dataset):
         """
         Runs the full training and validation loop.
 
@@ -193,18 +166,18 @@ class Trainer:
         # Main
         step = 0
         best_score = np.inf
+        running_loss = 0
+        running_steps = 0
         self.model.train()
         for epoch in range(self.max_epochs):
-            # Epoch initializations
-            train_losses = []
             train_dataloader.set_epoch(epoch)
-
-            # Run train/val epoch
             for x, y, fg_mask in train_dataloader:
                 # Train
                 train_loss = self.train_step(x, y, fg_mask)
-                train_losses.append(train_loss)
                 self.scheduler.step()
+
+                running_loss += train_loss
+                running_steps += 1
                 step += 1
 
                 # Validate (if applicable)
@@ -213,15 +186,15 @@ class Trainer:
                         val_dataloader,
                         step,
                     )
-                    is_best = epoch > 0 and val_score < best_score
-                    if is_best:
+                    is_best = val_score < best_score
+                    if epoch > 0 and is_best:
                         best_score = val_score
                     if epoch > 0:
                         self.save_model(step, val_score)
 
                 # Report results (if applicable)
                 if step % self.val_every == 0:
-                    avg_train_loss = np.mean(train_losses)
+                    avg_train_loss = running_loss / running_steps
                     self.writer.add_scalar(
                         "train_loss", avg_train_loss, step
                     )
@@ -236,7 +209,8 @@ class Trainer:
                         f"{suffix}"
                     )
 
-                    train_losses = []
+                    running_loss = 0
+                    running_steps = 0
                     self.model.train()
 
     def train_step(self, x, y, fg_mask):
@@ -353,7 +327,7 @@ class Trainer:
         cratios = list()
         imgs = np.array(imgs.detach().cpu())
         for i in range(imgs.shape[0]):
-            img = self.transform.inverse(imgs[i, 0, ...])
+            img = self.transform.inverse(imgs[i, 0])
             cratios.append(img_util.compute_cratio(img, self.codec))
             if i < 10:
                 save_mip_png(f"{i}.png", img)
@@ -385,11 +359,11 @@ class Trainer:
         raws = np.array(raw.detach().cpu())
         masks = np.array(fg_mask.detach().cpu())
         for i in range(preds.shape[0]):
-            pred = self.transform.inverse(preds[i, 0, ...])
-            target = self.transform.inverse(targets[i, 0, ...])
+            pred = self.transform.inverse(preds[i, 0])
+            target = self.transform.inverse(targets[i, 0])
             rows.append(
                 evaluate_example(
-                    pred, raws[i, 0, ...], target, masks[i, 0, ...] > 0.5
+                    pred, raws[i, 0], target, masks[i, 0] > 0.5
                 )
             )
         return rows
@@ -478,3 +452,31 @@ class Trainer:
             },
             path,
         )
+
+
+# --- Helpers ---
+def save_mip_png(path, img, low_pct=1.0, high_pct=99.9):
+    """
+    Writes a 3D volume as a contrast-stretched 8-bit PNG for easy viewing.
+
+    The volume is reduced to 2D with a maximum-intensity projection along the
+    z-axis (axis 0), then percentile-normalized to uint8 so that dim neurites
+    are visible in a standard image viewer.
+
+    Parameters
+    ----------
+    path : str
+        Output path for the PNG file.
+    img : numpy.ndarray
+        3D image volume with shape (D, H, W) in raw counts.
+    low_pct : float, optional
+        Lower percentile mapped to black. The default is 1.0.
+    high_pct : float, optional
+        Upper percentile mapped to white. The default is 99.9.
+    """
+    mip = img.max(axis=0).astype(np.float32)
+    lo, hi = np.percentile(mip, (low_pct, high_pct))
+    if hi <= lo:
+        hi = lo + 1.0
+    mip = np.clip((mip - lo) / (hi - lo), 0.0, 1.0)
+    io.imsave(path, np.rint(mip * 255).astype(np.uint8), check_contrast=False)
