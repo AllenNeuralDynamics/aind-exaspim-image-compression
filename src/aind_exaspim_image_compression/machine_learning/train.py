@@ -107,10 +107,6 @@ class Trainer:
         self.model = model.to(device) if model else UNet().to(device)
         self._resume_transform_cfg = None
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
-        # T_max spans the whole run so the cosine anneals once. With a small
-        # T_max the LR returns to its peak every 2*T_max epochs, and each
-        # return destabilized training (growing periodic loss spikes).
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=self.val_every)
         self.writer = SummaryWriter(log_dir=log_dir)
 
         # Scale the loss before backward so small float16 gradients do not
@@ -130,21 +126,10 @@ class Trainer:
         val_dataset : ValidateDataset
             Dataset used for validation.
         """
-        # Initializations
-        print("Experiment:", os.path.basename(os.path.normpath(self.log_dir)))
+        # Create dataloaders
         if self._resume_transform_cfg is not None:
-            train_cfg = getattr(train_dataset.transform, "cfg", None)
-            val_cfg = getattr(val_dataset.transform, "cfg", None)
-            if train_cfg != self._resume_transform_cfg:
-                raise ValueError(
-                    "resume checkpoint transform does not match the training "
-                    "dataset transform"
-                )
-            if val_cfg != self._resume_transform_cfg:
-                raise ValueError(
-                    "resume checkpoint transform does not match the validation "
-                    "dataset transform"
-                )
+            self.check_transform_cfg(train_dataset, "train")
+            self.check_transform_cfg(val_dataset, "val")
 
         self.transform = train_dataset.transform
         train_dataloader = DataLoader(
@@ -163,7 +148,11 @@ class Trainer:
             shuffle=False,
         )
 
-        # Main
+        # Create learning rate scheduler
+        total_steps = self.max_epochs * len(train_dataloader)
+        scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps)
+
+        # Training loop
         step = 0
         best_score = np.inf
         running_loss = 0
@@ -174,7 +163,7 @@ class Trainer:
             for x, y, fg_mask in train_dataloader:
                 # Train
                 train_loss = self.train_step(x, y, fg_mask)
-                self.scheduler.step()
+                scheduler.step()
 
                 running_loss += train_loss
                 running_steps += 1
@@ -183,8 +172,7 @@ class Trainer:
                 # Validate (if applicable)
                 if step % self.val_every == 0:
                     val_loss, val_cratio, val_score = self.validate(
-                        val_dataloader,
-                        step,
+                        val_dataloader, step,
                     )
                     is_best = val_score < best_score
                     if epoch > 0 and is_best:
@@ -323,6 +311,14 @@ class Trainer:
             return hat_y, loss
 
     # --- Helpers ---
+    def check_transform_cfg(self, dataset, dataset_name):
+        cfg = getattr(dataset.transform, "cfg", None)
+        if cfg != self._resume_transform_cfg:
+            raise ValueError(
+                f"Resume checkpoint transform does not match the "
+                f"{dataset_name} dataset transform."
+            )
+
     def compute_cratios(self, imgs):
         cratios = list()
         imgs = np.array(imgs.detach().cpu())
