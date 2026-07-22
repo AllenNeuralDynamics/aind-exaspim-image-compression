@@ -163,8 +163,8 @@ class Trainer:
             train_dataloader.set_epoch(epoch)
             for x, y, fg_mask in train_dataloader:
                 # Train
-                scheduler.step()
                 train_loss = self.train_step(x, y, fg_mask)
+                scheduler.step()
 
                 running_loss += train_loss
                 running_steps += 1
