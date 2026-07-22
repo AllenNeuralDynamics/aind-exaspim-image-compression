@@ -16,7 +16,6 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import os
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from skimage import io
 
@@ -75,7 +74,7 @@ class Trainer:
         fg_weight=20.0,
         num_workers=None,
         prefetch=2,
-        val_every=1,
+        val_every=1000,
         seed=0,
     ):
         """
@@ -103,10 +102,11 @@ class Trainer:
             checkpoint selection. Default is False so validation matches FP32
             production inference.
         val_every : int, optional
-            Run validation (and checkpoint selection) every this many epochs;
-            the final epoch is always validated. The count-space metrics are
-            CPU-bound, so a large validation set is only cheap if it is not run
-            every epoch. Default is 1 (validate every epoch).
+            Run validation (and checkpoint selection) every this many gradient
+            updates; the final epoch is always validated. Count-space metrics
+            are CPU-bound, so a large validation set is only cheap if it is
+            not run every epoch. Default is 1000 (validate every 1000 gradient
+            updates).
         seed : int, optional
             Seed used to reproducibly shuffle training examples by epoch.
             Default is 0.
@@ -128,17 +128,16 @@ class Trainer:
         self.use_amp = bool(use_amp)
         self.use_amp_validation = bool(use_amp_validation)
 
-        self.codec = blosc.Blosc(cname="zstd", clevel=5, shuffle=blosc.SHUFFLE)
+        self.codec = blosc.Blosc(cname="zstd", clevel=6, shuffle=blosc.SHUFFLE)
         self.criterion = SignalPreservingLoss(fg_weight=fg_weight)
         self.checkpoint_weights = checkpoint_weights
-        self.best_score = np.inf
         self.model = model.to(device) if model else UNet().to(device)
         self._resume_transform_cfg = None
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
         # T_max spans the whole run so the cosine anneals once. With a small
         # T_max the LR returns to its peak every 2*T_max epochs, and each
         # return destabilized training (growing periodic loss spikes).
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=max_epochs)
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=self.val_every)
         self.writer = SummaryWriter(log_dir=log_dir)
 
         # Scale the loss before backward so small float16 gradients do not
@@ -173,6 +172,7 @@ class Trainer:
                     "resume checkpoint transform does not match the validation "
                     "dataset transform"
                 )
+
         self.transform = train_dataset.transform
         train_dataloader = DataLoader(
             train_dataset,
@@ -191,74 +191,75 @@ class Trainer:
         )
 
         # Main
-        self.best_score = np.inf
-        for epoch in range(self.max_epochs):
-            # Train
-            train_dataloader.set_epoch(epoch)
-            train_loss = self.train_step(train_dataloader, epoch)
-
-            # Validate every val_every epochs (and always on the final epoch);
-            # the count-space metrics are CPU-bound, so a large validation set
-            # is only cheap when it is not run every epoch.
-            is_last = epoch == self.max_epochs - 1
-            if epoch % self.val_every == 0 or is_last:
-                val_loss, val_cratio, is_best = self.validate_step(
-                    val_dataloader, epoch
-                )
-                suffix = " - New Best!" if is_best else ""
-                s = f"Epoch {epoch}:  train_loss={train_loss},  val_loss={val_loss}, val_cratio={val_cratio}" + suffix
-            else:
-                s = f"Epoch {epoch}:  train_loss={train_loss}"
-            print(s)
-
-            # Step scheduler
-            self.scheduler.step()
-
-    def train_step(self, train_dataloader, epoch):
-        """
-        Performs a single training epoch over the provided DataLoader.
-
-        Parameters
-        ----------
-        train_dataloader : torch.utils.data.DataLoader
-            DataLoader for the training dataset.
-        epoch : int
-            Current training epoch.
-
-        Returns
-        -------
-        loss : float
-            Average loss over the training epoch.
-        """
-        losses = list()
+        step = 0
+        best_score = np.inf
         self.model.train()
-        for x, y, fg_mask in train_dataloader:
-            # Forward pass
-            hat_y, loss = self.forward_pass(
-                x, y, fg_mask, use_amp=self.use_amp
-            )
+        for epoch in range(self.max_epochs):
+            # Epoch initializations
+            train_losses = []
+            train_dataloader.set_epoch(epoch)
 
-            # Backward pass (loss-scaled for AMP stability)
-            self.optimizer.zero_grad()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            # Run train/val epoch
+            for x, y, fg_mask in train_dataloader:
+                # Train
+                train_loss = self.train_step(x, y, fg_mask)
+                train_losses.append(train_loss)
+                self.scheduler.step()
+                step += 1
 
-            # Store loss for tensorboard
-            losses.append(float(loss.detach().cpu()))
-        self.writer.add_scalar("train_loss", np.mean(losses), epoch)
-        return np.mean(losses)
+                # Validate (if applicable)
+                if step % self.val_every == 0:
+                    val_loss, val_cratio, val_score = self.validate(
+                        val_dataloader,
+                        step,
+                    )
+                    is_best = epoch > 0 and val_score < best_score
+                    if is_best:
+                        best_score = val_score
+                    if epoch > 0:
+                        self.save_model(step, val_score)
 
-    def validate_step(self, val_dataloader, epoch):
+                # Report results (if applicable)
+                if step % self.val_every == 0:
+                    avg_train_loss = np.mean(train_losses)
+                    self.writer.add_scalar(
+                        "train_loss", avg_train_loss, step
+                    )
+
+                    suffix = " - New Best!" if is_best else ""
+                    print(
+                        f"Step {step}: "
+                        f"train_loss={avg_train_loss:.5f}, "
+                        f"val_loss={val_loss:.5f}, "
+                        f"val_cratio={val_cratio:.5f}, "
+                        f"val_score={val_score:.5f}"
+                        f"{suffix}"
+                    )
+
+                    train_losses = []
+                    self.model.train()
+
+    def train_step(self, x, y, fg_mask):
+        # Forward
+        _, loss = self.forward_pass(x, y, fg_mask, use_amp=self.use_amp)
+
+        # Backward
+        self.optimizer.zero_grad()
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        return loss.item()
+
+    def validate(self, val_dataloader, step):
         """
-        Validates the model over the provided DataLoader.
+        Validates the model over the validation dataset.
 
         Parameters
         ----------
         val_dataloader : torch.utils.data.DataLoader
             DataLoader for the validation dataset.
         epoch : int
-            Current training epoch.
+            Current number of gradient steps.
 
         Returns
         -------
@@ -273,10 +274,11 @@ class Trainer:
         if len(val_dataloader.dataset) == 0:
             return float("nan"), float("nan"), False
 
+        # Run model over validation dataset
         losses = list()
         cratios = list()
         metric_rows = list()
-        with torch.no_grad():
+        with torch.inference_mode():
             self.model.eval()
             for x, y, raw, fg_mask in val_dataloader:
                 # Run model
@@ -285,7 +287,7 @@ class Trainer:
                 )
 
                 # Evaluate result
-                losses.append(loss.detach().cpu())
+                losses.append(loss.item())
                 cratios.extend(self.compute_cratios(hat_y))
                 metric_rows.extend(
                     self.compute_metrics(hat_y, y, raw, fg_mask)
@@ -301,23 +303,13 @@ class Trainer:
         score = checkpoint_score(agg, cratio, self.checkpoint_weights)
 
         # Log results
-        self.writer.add_scalar("val_loss", loss, epoch)
-        self.writer.add_scalar("val_cratio", cratio, epoch)
-        self.writer.add_scalar("val_score", score, epoch)
+        self.writer.add_scalar("val_loss", loss, step)
+        self.writer.add_scalar("val_cratio", cratio, step)
+        self.writer.add_scalar("val_score", score, step)
         for name, value in agg.items():
-            self.writer.add_scalar(f"val_{name}", value, epoch)
+            self.writer.add_scalar(f"val_{name}", value, step)
 
-        # Save every validated checkpoint so the best can be chosen offline.
-        # Skip epoch 0: the untrained net emits a near-constant, trivially
-        # compressible volume whose cratio-weighted score would beat every
-        # trained checkpoint despite its high loss. is_best is tracked only for
-        # the "New Best!" log line.
-        is_best = epoch > 0 and score < self.best_score
-        if is_best:
-            self.best_score = score
-        if epoch > 0:
-            self.save_model(epoch, score)
-        return loss, cratio, is_best
+        return loss, cratio, score
 
     def forward_pass(self, x, y, fg_mask, use_amp=None):
         """

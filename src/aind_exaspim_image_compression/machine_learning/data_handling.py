@@ -77,6 +77,8 @@ def build_training_example(
         transform.forward(target),
         fg.astype(np.float32),
     )
+
+
 from aind_exaspim_image_compression.utils.swc_util import Reader
 
 
