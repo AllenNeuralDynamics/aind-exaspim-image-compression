@@ -149,7 +149,7 @@ class Trainer:
         )
 
         # Create learning rate scheduler
-        total_steps = self.max_epochs * len(train_dataloader)
+        total_steps = self.max_epochs * len(train_dataset) // self.batch_size
         scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps)
         print("Total Optimizer Steps:", total_steps)
 
