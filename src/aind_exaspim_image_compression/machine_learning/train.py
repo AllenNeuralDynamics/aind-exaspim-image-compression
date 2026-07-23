@@ -13,6 +13,7 @@ from numcodecs import blosc
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 
+import math
 import numpy as np
 import os
 import torch
@@ -115,7 +116,7 @@ class Trainer:
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
     # --- Core Routines ---
-    def __call__(self, train_dataset, val_dataset):
+    def run(self, train_dataset, val_dataset):
         """
         Runs the full training and validation loop.
 
@@ -149,9 +150,12 @@ class Trainer:
         )
 
         # Create learning rate scheduler
-        total_steps = self.max_epochs * len(train_dataset) // self.batch_size
+        total_steps = self.max_epochs * math.ceil(len(train_dataset) / self.batch_size)
+        num_validations = math.ceil(total_steps / self.val_every)
         scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps)
-        print("Total Optimizer Steps:", total_steps)
+        print(f"Total optimizer steps: {total_steps}")
+        print(f"Validation interval: every {self.val_every} steps")
+        print(f"Expected validations: {num_validations}")
 
         # Training loop
         step = 0
@@ -160,6 +164,7 @@ class Trainer:
         running_steps = 0
         self.model.train()
         for epoch in range(self.max_epochs):
+            print(f"Starting epoch {epoch} / {self.max_epochs}...")
             train_dataloader.set_epoch(epoch)
             for x, y, fg_mask in train_dataloader:
                 # Train
@@ -175,11 +180,13 @@ class Trainer:
                     val_loss, val_cratio, val_score = self.validate(
                         val_dataloader, step,
                     )
-                    is_best = val_score < best_score
-                    if epoch > 0 and is_best:
-                        best_score = val_score
-                    if epoch > 0:
-                        self.save_model(step, val_score)
+                    self.save_model(step, val_score)
+
+                    if val_score is not None:
+                        is_best = val_score < best_score
+                        best_score = min(best_score, val_score)
+                    else:
+                        is_best = False
 
                 # Report results (if applicable)
                 if step % self.val_every == 0:
@@ -188,7 +195,7 @@ class Trainer:
                         "train_loss", avg_train_loss, step
                     )
 
-                    suffix = " - New Best!" if epoch > 0 and is_best else ""
+                    suffix = " - New Best!" if is_best else ""
                     print(
                         f"Step {step}: "
                         f"train_loss={avg_train_loss:.5f}, "
@@ -201,6 +208,18 @@ class Trainer:
                     running_loss = 0
                     running_steps = 0
                     self.model.train()
+
+            # Final model validation
+            val_loss, val_cratio, val_score = self.validate(
+                val_dataloader, step,
+            )
+            self.save_model(step, val_score)
+            print(
+                "Final model validation:"
+                f"val_loss={val_loss:.5f}, "
+                f"val_cratio={val_cratio:.5f}, "
+                f"val_score={val_score:.5f}"
+            )
 
     def train_step(self, x, y, fg_mask):
         # Forward
@@ -221,7 +240,7 @@ class Trainer:
         ----------
         val_dataloader : torch.utils.data.DataLoader
             DataLoader for the validation dataset.
-        epoch : int
+        step : int
             Current number of gradient steps.
 
         Returns
@@ -230,12 +249,12 @@ class Trainer:
             Average loss over the validation dataset.
         cratio : float
             Average compression ratio over the validation dataset.
-        is_best : bool
-            Indication of whether the model is the best so far.
+        score : float or None
+            Model score on validation dataset.
         """
         # Skip if there are no validation examples
         if len(val_dataloader.dataset) == 0:
-            return float("nan"), float("nan"), False
+            return float("nan"), float("nan"), None
 
         # Run model over validation dataset
         losses = list()
