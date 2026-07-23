@@ -13,7 +13,6 @@ from numcodecs import blosc
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 
-import math
 import numpy as np
 import os
 import torch
@@ -43,7 +42,7 @@ class Trainer:
         max_epochs=400,
         model=None,
         use_amp=True,
-        use_amp_validation=False,
+        use_amp_val=False,
         checkpoint_weights=None,
         fg_weight=20.0,
         num_workers=None,
@@ -71,7 +70,7 @@ class Trainer:
         use_amp : bool, optional
             Whether to use CUDA float16 autocast and gradient scaling during
             training. Default is True.
-        use_amp_validation : bool, optional
+        use_amp_val : bool, optional
             Whether to use CUDA float16 autocast during validation and
             checkpoint selection. Default is False so validation matches FP32
             production inference.
@@ -99,8 +98,8 @@ class Trainer:
         self.prefetch = prefetch
         self.val_every = max(1, int(val_every))
         self.seed = seed
-        self.use_amp = bool(use_amp)
-        self.use_amp_validation = bool(use_amp_validation)
+        self.use_amp = bool(use_amp and device.startswith("cuda"))
+        self.use_amp_val = bool(use_amp_val and device.startswith("cuda"))
 
         self.codec = blosc.Blosc(cname="zstd", clevel=6, shuffle=blosc.SHUFFLE)
         self.criterion = SignalPreservingLoss(fg_weight=fg_weight)
@@ -150,17 +149,16 @@ class Trainer:
         )
 
         # Create learning rate scheduler
-        total_steps = self.max_epochs * math.ceil(len(train_dataset) / self.batch_size)
-        num_validations = math.ceil(total_steps / self.val_every)
+        total_steps = self.max_epochs * len(train_dataloader)
+        expected_validations = total_steps // self.val_every
         scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps)
         print(f"Total optimizer steps: {total_steps}")
         print(f"Validation interval: every {self.val_every} steps")
-        print(f"Expected validations: {num_validations}")
+        print(f"Expected validations: {expected_validations}")
 
         # Training loop
         step = 0
-        best_score = np.inf
-        running_loss = 0
+        running_loss = 0.0
         running_steps = 0
         self.model.train()
         for epoch in range(self.max_epochs):
@@ -168,58 +166,31 @@ class Trainer:
             train_dataloader.set_epoch(epoch)
             for x, y, fg_mask in train_dataloader:
                 # Train
-                train_loss = self.train_step(x, y, fg_mask)
+                loss = self.train_step(x, y, fg_mask)
                 scheduler.step()
 
-                running_loss += train_loss
+                running_loss += loss
                 running_steps += 1
                 step += 1
 
                 # Validate (if applicable)
                 if step % self.val_every == 0:
-                    val_loss, val_cratio, val_score = self.validate(
-                        val_dataloader, step,
-                    )
-                    self.save_model(step, val_score)
+                    # Summarize train progress
+                    avg_loss = running_loss / running_steps
+                    label = f"Step {step}:  train_loss={avg_loss:.5f}, "
+                    self.writer.add_scalar("train_loss", avg_loss, step)
 
-                    if val_score is not None:
-                        is_best = val_score < best_score
-                        best_score = min(best_score, val_score)
-                    else:
-                        is_best = False
+                    # Call validation
+                    self.validate_and_checkpoint(val_dataloader, step, label)
 
-                # Report results (if applicable)
-                if step % self.val_every == 0:
-                    avg_train_loss = running_loss / running_steps
-                    self.writer.add_scalar(
-                        "train_loss", avg_train_loss, step
-                    )
-
-                    suffix = " - New Best!" if is_best else ""
-                    print(
-                        f"Step {step}: "
-                        f"train_loss={avg_train_loss:.5f}, "
-                        f"val_loss={val_loss:.5f}, "
-                        f"val_cratio={val_cratio:.5f}, "
-                        f"val_score={val_score:.5f}"
-                        f"{suffix}"
-                    )
-
+                    # Reset counters for training session
                     running_loss = 0
                     running_steps = 0
                     self.model.train()
 
-            # Final model validation
-            val_loss, val_cratio, val_score = self.validate(
-                val_dataloader, step,
-            )
-            self.save_model(step, val_score)
-            print(
-                "Final model validation:"
-                f"val_loss={val_loss:.5f}, "
-                f"val_cratio={val_cratio:.5f}, "
-                f"val_score={val_score:.5f}"
-            )
+        # Final model validation
+        if step % self.val_every != 0:
+            self.validate_and_checkpoint(val_dataloader, step, "Final: ")
 
     def train_step(self, x, y, fg_mask):
         # Forward
@@ -231,6 +202,23 @@ class Trainer:
         self.scaler.step(self.optimizer)
         self.scaler.update()
         return loss.item()
+
+    def validate_and_checkpoint(self, val_dataloader, step, label):
+        # Validate
+        loss, cratio, score = self.validate(val_dataloader, step)
+        if score is None:
+            print(f"{label}: validation skipped (empty validation dataset)")
+            return False
+
+        # Save checkpoint and report reuslts
+        self.save_model(step, score)
+        print(
+            f"{label}"
+            f"val_loss={loss:.5f}, "
+            f"val_cratio={cratio:.5f}, "
+            f"val_score={score:.5f}"
+        )
+        return True
 
     def validate(self, val_dataloader, step):
         """
@@ -260,19 +248,19 @@ class Trainer:
         losses = list()
         cratios = list()
         metric_rows = list()
+        self.model.eval()
         with torch.inference_mode():
-            self.model.eval()
             for x, y, raw, fg_mask in val_dataloader:
                 # Run model
-                hat_y, loss = self.forward_pass(
-                    x, y, fg_mask, use_amp=self.use_amp_validation
+                y_pred, loss = self.forward_pass(
+                    x, y, fg_mask, use_amp=self.use_amp_val
                 )
 
                 # Evaluate result
                 losses.append(loss.item())
-                cratios.extend(self.compute_cratios(hat_y))
+                cratios.extend(self.compute_cratios(y_pred))
                 metric_rows.extend(
-                    self.compute_metrics(hat_y, y, raw, fg_mask)
+                    self.compute_metrics(y_pred, y, raw, fg_mask)
                 )
 
         # Aggregate results
@@ -311,7 +299,7 @@ class Trainer:
 
         Returns
         -------
-        hat_y : torch.Tensor
+        y_pred : torch.Tensor
             Model predictions.
         loss : torch.Tensor
             Computed loss value.
@@ -326,9 +314,9 @@ class Trainer:
             x = x.to(self.device)
             y = y.to(self.device)
             fg_mask = fg_mask.to(self.device)
-            hat_y = self.model(x)
-            loss = self.criterion(hat_y, y, fg_mask)
-            return hat_y, loss
+            y_pred = self.model(x)
+            loss = self.criterion(y_pred, y, fg_mask)
+            return y_pred, loss
 
     # --- Helpers ---
     def check_transform_cfg(self, dataset, dataset_name):
@@ -349,13 +337,13 @@ class Trainer:
                 save_mip_png(f"{i}.png", img)
         return cratios
 
-    def compute_metrics(self, hat_y, y, raw, fg_mask):
+    def compute_metrics(self, y_pred, y, raw, fg_mask):
         """
         Computes per-example neurite-preservation metrics in count space.
 
         Parameters
         ----------
-        hat_y : torch.Tensor
+        y_pred : torch.Tensor
             Model predictions in the normalized transform domain.
         y : torch.Tensor
             BM4D targets in the normalized transform domain.
@@ -370,7 +358,7 @@ class Trainer:
             One metric dictionary per example in the batch.
         """
         rows = list()
-        preds = np.array(hat_y.detach().cpu())
+        preds = np.array(y_pred.detach().cpu())
         targets = np.array(y.detach().cpu())
         raws = np.array(raw.detach().cpu())
         masks = np.array(fg_mask.detach().cpu())
@@ -435,7 +423,7 @@ class Trainer:
             "val_every": self.val_every,
             "seed": self.seed,
             "use_amp": self.use_amp,
-            "use_amp_validation": self.use_amp_validation,
+            "use_amp_val": self.use_amp_val,
             "fg_weight": getattr(self.criterion, "fg_weight", None),
             "checkpoint_weights": self.checkpoint_weights,
             "lr": self.optimizer.param_groups[0]["lr"],
@@ -458,6 +446,7 @@ class Trainer:
             embedded in the filename so checkpoints can be ranked offline.
         """
         date = datetime.today().strftime("%Y%m%d")
+        score = score or np.inf
         filename = f"BM4DNet-{date}-{epoch}-{score:.6f}.pth"
         path = os.path.join(self.log_dir, filename)
         torch.save(

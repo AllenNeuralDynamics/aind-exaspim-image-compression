@@ -19,6 +19,7 @@ from tqdm import tqdm
 
 import logging
 import fastremap
+import math
 import numpy as np
 import os
 import queue
@@ -1313,6 +1314,9 @@ class DataLoader:
             for j, field in enumerate(fields):
                 batched[j][i, 0, ...] = field
         return tuple(to_tensor(arr) for arr in batched)
+
+    def __len__(self):
+        return math.ceil(len(self.dataset) / self.batch_size)
 
 
 # --- Helpers ---
