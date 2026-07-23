@@ -10,6 +10,7 @@ Routines for loading data during training and inference.
 
 from aind_exaspim_dataset_utils.s3_util import get_img_prefix
 from bm4d import bm4d
+from collections.abc import Iterable
 from concurrent.futures import (
     as_completed, ProcessPoolExecutor, ThreadPoolExecutor,
 )
@@ -796,8 +797,12 @@ class TrainDataset(Dataset):
 class ValidateDataset(Dataset):
 
     def __init__(
-        self, patch_shape, sigma_bm4d=16, transform=None,
-        preserve_foreground=True, offsets=None,
+        self,
+        patch_shape,
+        sigma_bm4d=16,
+        transform=None,
+        preserve_foreground=True,
+        offsets=None,
     ):
         """
         Instantiates a ValidateDataset object.
@@ -1024,16 +1029,15 @@ class CachedPatchDataset(Dataset):
         Transform mapping counts to the normalized domain.
     """
 
-    def __init__(
-        self, cache_dir, transform=None, preserve_foreground=True,
-    ):
+    def __init__(self, cache_dir, transform=None, preserve_foreground=True):
         """
         Instantiates a CachedPatchDataset.
 
         Parameters
         ----------
-        cache_dir : str
-            Directory holding raw.npy, teacher.npy, and fg.npy.
+        cache_dir : str or Iterable[str]
+            Directory or list of directories containing raw.npy, teacher.npy,
+            and fg.npy.
         transform : IntensityTransform, optional
             Transform mapping counts to the normalized domain. Default is an
             asinh transform.
@@ -1047,8 +1051,12 @@ class CachedPatchDataset(Dataset):
         # Create cache directory list
         if isinstance(cache_dir, (str, os.PathLike)):
             cache_dirs = [cache_dir]
-        else:
+        elif isinstance(cache_dir, Iterable):
             cache_dirs = list(cache_dir)
+        else:
+            raise TypeError(
+                "cache_dir must be a path or an iterable of paths"
+            )
 
         # Load arrays with mmap mode
         self.raw = self._load_cached_arrs(cache_dirs, "raw")
@@ -1088,15 +1096,28 @@ class CachedPatchDataset(Dataset):
         )
 
     def _get_arrays(self, idx):
-        ds, local_idx = self._locate(idx)
-        raw = np.asarray(self.raw[ds][local_idx], dtype=np.float32)
-        teacher = np.asarray(self.teacher[ds][local_idx], dtype=np.float32)
-        fg_mask = np.asarray(self.fg[ds][local_idx], dtype=np.float32)
+        """
+        Retrieves raw cached arrays for a global sample index.
+    
+        Parameters
+        ----------
+        idx : int
+            Global sample index.
+
+        Returns
+        -------
+        Tuple[np.ndarray]
+            Raw counts, teacher target, and foreground mask arrays.
+        """
+        cache_idx, local = self._locate(idx)
+        raw = np.asarray(self.raw[cache_idx][local], dtype=np.float32)
+        teacher = np.asarray(self.teacher[cache_idx][local], dtype=np.float32)
+        fg_mask = np.asarray(self.fg[cache_idx][local], dtype=np.float32)
         return raw, teacher, fg_mask
 
     def _locate(self, idx):
         """
-        Maps a global dataset index to a cache index and local offset.
+        Maps a global sample index to a cache index and local offset.
 
         Parameters
         ----------
@@ -1105,8 +1126,8 @@ class CachedPatchDataset(Dataset):
 
         Returns
         -------
-        ds : int
-            Index of the dataset cache containing the sample.
+        cache_idx : int
+            Index of the cache containing the sample.
         offset : int
             Local index within the selected cache.
         """
@@ -1115,16 +1136,33 @@ class CachedPatchDataset(Dataset):
             raise IndexError(idx)
 
         # Find dataset and local indices
-        ds = np.searchsorted(self.cumulative_lengths, idx, side="right")
+        cache_idx = np.searchsorted(
+            self.cumulative_lengths, idx, side="right"
+        )
         offset = (
             idx
-            if ds == 0
-            else idx - self.cumulative_lengths[ds - 1]
+            if cache_idx == 0
+            else idx - self.cumulative_lengths[cache_idx - 1]
         )
-        return ds, offset
+        return cache_idx, offset
 
     @staticmethod
     def _load_cached_arrs(cache_dirs, name):
+        """
+        Loads memory-mapped arrays from multiple cache directories.
+
+        Parameters
+        ----------
+        cache_dirs : List[str]
+            Cache directories containing the array files.
+        name : str
+            Array name (e.g., "raw", "teacher", or "fg").
+
+        Returns
+        -------
+        List[np.ndarray]
+            Memory-mapped arrays, one per cache directory.
+        """
         return [
             np.load(os.path.join(d, f"{name}.npy"), mmap_mode="r")
             for d in cache_dirs
