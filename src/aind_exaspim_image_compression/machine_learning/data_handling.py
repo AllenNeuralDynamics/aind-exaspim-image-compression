@@ -19,6 +19,7 @@ from tqdm import tqdm
 
 import logging
 import fastremap
+import math
 import numpy as np
 import os
 import queue
@@ -77,6 +78,8 @@ def build_training_example(
         transform.forward(target),
         fg.astype(np.float32),
     )
+
+
 from aind_exaspim_image_compression.utils.swc_util import Reader
 
 
@@ -1311,6 +1314,9 @@ class DataLoader:
             for j, field in enumerate(fields):
                 batched[j][i, 0, ...] = field
         return tuple(to_tensor(arr) for arr in batched)
+
+    def __len__(self):
+        return math.ceil(len(self.dataset) / self.batch_size)
 
 
 # --- Helpers ---

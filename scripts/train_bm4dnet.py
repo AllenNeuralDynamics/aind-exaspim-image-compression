@@ -141,7 +141,7 @@ if __name__ == "__main__":
     use_amp = False
     use_amp_validation = False
     # Validate (and consider a checkpoint) after every full-cache epoch.
-    val_every = 1
+    val_every = 1000
     seed = 42
 
     # Signal-preserving loss + target/sampling (Parts E/F). preserve_foreground
