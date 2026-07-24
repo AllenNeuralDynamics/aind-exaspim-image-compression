@@ -4,53 +4,78 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Dispatcher: routes to train.py or evaluate.py based on --run_mode.
 #
-# Handles both  --run_mode value  and  --run_mode=value  formats.
-# run_mode is matched case-insensitively (e.g. "Train" == "train").
-#
-# Usage:
-#   ./run --run_mode train    --img_norm_mode <m> --model_name <n> --use_amp_train False
-#   ./run --run_mode evaluate [eval-specific flags forwarded to evaluate.py]
+# App Panel parameters (named_parameters=true):
+#   Run Configuration:   --run_mode      (Train | Evaluate)
+#                        --dataset_name  (alpha | beta | beta2 | all)
+#   Train Parameters:    --config_name   path stem of the JSON config in /data
+#                        --model_name    (unet | n2v2_unet)
+#   Evaluate Parameters: --crop_shape    e.g. "1024, 1024, 1024"
+#                        --clevel        integer 1-9
+#                        --top_k_ckpts   integer >= 1
 # ---------------------------------------------------------------------------
 
 run_mode=""
-remaining_args=()
+dataset_name=""
+config_name=""
+model_name=""
+crop_shape=""
+clevel=""
+top_k_ckpts=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --run_mode|--run-mode)
-            run_mode="${2:?'--run_mode requires a value'}"
-            shift 2
-            ;;
-        --run_mode=*|--run-mode=*)
-            run_mode="${1#*=}"
-            shift
-            ;;
-        *)
-            remaining_args+=("$1")
-            shift
-            ;;
+        --run_mode)       run_mode="$2";         shift 2 ;;
+        --run_mode=*)     run_mode="${1#*=}";     shift   ;;
+        --dataset_name)   dataset_name="$2";      shift 2 ;;
+        --dataset_name=*) dataset_name="${1#*=}"; shift   ;;
+        --config_name)    config_name="$2";       shift 2 ;;
+        --config_name=*)  config_name="${1#*=}";  shift   ;;
+        --model_name)     model_name="$2";        shift 2 ;;
+        --model_name=*)   model_name="${1#*=}";   shift   ;;
+        --crop_shape)     crop_shape="$2";        shift 2 ;;
+        --crop_shape=*)   crop_shape="${1#*=}";   shift   ;;
+        --clevel)         clevel="$2";            shift 2 ;;
+        --clevel=*)       clevel="${1#*=}";       shift   ;;
+        --top_k_ckpts)    top_k_ckpts="$2";       shift 2 ;;
+        --top_k_ckpts=*)  top_k_ckpts="${1#*=}";  shift   ;;
+        *) echo "Error: unknown argument '$1'" >&2; exit 1 ;;
     esac
 done
 
-# Normalise to lower-case (requires bash 4+, standard on all CO instances)
+# Normalise to lower-case (bash 4+, standard on all CO instances)
 run_mode="${run_mode,,}"
 
-[[ -n "$run_mode" ]] || {
-    echo "Error: --run_mode is required. Expected 'train' or 'eval'/'evaluate'." >&2
-    exit 1
-}
+# --- Validate shared required params ---------------------------------------
+[[ -n "$run_mode" ]]     || { echo "Error: --run_mode is required (train|evaluate)." >&2; exit 1; }
+[[ -n "$dataset_name" ]] || { echo "Error: --dataset_name is required." >&2; exit 1; }
 
+# --- Route -----------------------------------------------------------------
 case "$run_mode" in
     train)
-        echo "[run] mode=train"
-        python -u /code/train.py "${remaining_args[@]+"${remaining_args[@]}"}"
+        [[ -n "$config_name" ]] || { echo "Error: --config_name is required for train mode." >&2; exit 1; }
+        [[ -n "$model_name"  ]] || { echo "Error: --model_name is required for train mode." >&2; exit 1; }
+
+        echo "[run] mode=train  dataset=${dataset_name}  config=${config_name}  model=${model_name}"
+
+        python -u /code/train.py \
+            --dataset_name "$dataset_name" \
+            --config_name  "$config_name"  \
+            --model_name   "$model_name"
         ;;
+
     eval|evaluate)
-        echo "[run] mode=eval"
-        python -u /code/evaluate.py "${remaining_args[@]+"${remaining_args[@]}"}"
+        echo "[run] mode=evaluate  dataset=${dataset_name}"
+
+        eval_args=( --dataset_name "$dataset_name" )
+        [[ -n "$crop_shape"  ]] && eval_args+=( --crop_shape  "$crop_shape"  )
+        [[ -n "$clevel"      ]] && eval_args+=( --clevel      "$clevel"      )
+        [[ -n "$top_k_ckpts" ]] && eval_args+=( --top_k_ckpts "$top_k_ckpts" )
+
+        python -u /code/evaluate.py "${eval_args[@]}"
         ;;
+
     *)
-        echo "Error: unknown run_mode '${run_mode}' — expected 'train' or 'eval'/'evaluate'." >&2
+        echo "Error: unknown run_mode '${run_mode}' — expected 'train' or 'evaluate'." >&2
         exit 1
         ;;
 esac
