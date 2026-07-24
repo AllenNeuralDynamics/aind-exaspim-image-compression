@@ -22,7 +22,10 @@ from aind_exaspim_image_compression.machine_learning.transforms import (
     estimate_offset,
     with_offset,
 )
-from aind_exaspim_image_compression.machine_learning.unet3d import UNet
+from aind_exaspim_image_compression.machine_learning.unet3d import (
+    N2V2UNet,
+    UNet,
+)
 
 
 def predict(
