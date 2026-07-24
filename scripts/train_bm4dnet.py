@@ -14,64 +14,108 @@ os.environ["GRPC_TRACE"] = ""
 _REQUIRED_CACHE_FILES = ("raw.npy", "teacher.npy", "fg.npy", "transform.json")
 
 
-def _load_cached_transform(train_cache_dir, val_cache_dir):
-    """Validates both patch caches and returns their shared transform."""
-    cache_dirs = {
-        "train_cache_dir": train_cache_dir,
-        "val_cache_dir": val_cache_dir,
-    }
-    transform_cfgs = {}
-    for name, cache_dir in cache_dirs.items():
-        if not cache_dir:
-            raise ValueError(f"{name} is required for training")
-        if not os.path.isdir(cache_dir):
-            raise FileNotFoundError(
-                f"{name} does not exist or is not a directory: {cache_dir}"
-            )
-        missing = [
-            filename
-            for filename in _REQUIRED_CACHE_FILES
-            if not os.path.isfile(os.path.join(cache_dir, filename))
-        ]
-        if missing:
-            raise FileNotFoundError(
-                f"{name} is missing required cache files: "
-                + ", ".join(missing)
-            )
-        transform_cfgs[name] = util.read_json(
-            os.path.join(cache_dir, "transform.json")
-        )
+def _normalize_cache_dirs(cache_dir, name):
+    """Returns one or more cache paths as a nonempty list of strings."""
+    if cache_dir is None:
+        raise ValueError(f"{name} is required for training")
+    if isinstance(cache_dir, (str, os.PathLike)):
+        cache_dirs = [cache_dir]
+    else:
+        try:
+            cache_dirs = list(cache_dir)
+        except TypeError as error:
+            raise TypeError(
+                f"{name} must be a path or an iterable of paths"
+            ) from error
 
-    if transform_cfgs["train_cache_dir"] != transform_cfgs["val_cache_dir"]:
-        raise ValueError(
-            "train and validation patch caches use different transforms"
-        )
-    return build_transform(transform_cfgs["train_cache_dir"])
+    if not cache_dirs:
+        raise ValueError(f"{name} is required for training")
+
+    normalized = []
+    for index, path in enumerate(cache_dirs):
+        if not isinstance(path, (str, os.PathLike)):
+            raise TypeError(f"{name}[{index}] is not a path: {path!r}")
+        normalized.append(os.fspath(path))
+    return normalized
+
+
+def _load_cached_transform(train_cache_dir, val_cache_dir):
+    """Validates all patch caches and returns their shared transform."""
+    cache_groups = {
+        "train_cache_dir": _normalize_cache_dirs(
+            train_cache_dir, "train_cache_dir"
+        ),
+        "val_cache_dir": _normalize_cache_dirs(val_cache_dir, "val_cache_dir"),
+    }
+    transform_cfg = None
+    for name, cache_dirs in cache_groups.items():
+        for index, cache_dir in enumerate(cache_dirs):
+            label = name if len(cache_dirs) == 1 else f"{name}[{index}]"
+            if not os.path.isdir(cache_dir):
+                raise FileNotFoundError(
+                    f"{label} does not exist or is not a directory: "
+                    f"{cache_dir}"
+                )
+            missing = [
+                filename
+                for filename in _REQUIRED_CACHE_FILES
+                if not os.path.isfile(os.path.join(cache_dir, filename))
+            ]
+            if missing:
+                raise FileNotFoundError(
+                    f"{label} is missing required cache files: "
+                    + ", ".join(missing)
+                )
+            current_cfg = util.read_json(
+                os.path.join(cache_dir, "transform.json")
+            )
+            if transform_cfg is None:
+                transform_cfg = current_cfg
+            elif current_cfg != transform_cfg:
+                raise ValueError(
+                    "train and validation patch caches use different "
+                    f"transforms: {label}"
+                )
+    return build_transform(transform_cfg)
 
 
 def train(train_cache_dir, val_cache_dir):
     """Trains and validates exclusively from precomputed patch caches."""
     # Per-brain offsets and the BM4D teacher are already baked into the cached
     # counts. Both caches must use the identical count-space transform.
-    transform = _load_cached_transform(train_cache_dir, val_cache_dir)
+    train_cache_dirs = _normalize_cache_dirs(
+        train_cache_dir, "train_cache_dir"
+    )
+    val_cache_dirs = _normalize_cache_dirs(val_cache_dir, "val_cache_dir")
+    transform = _load_cached_transform(train_cache_dirs, val_cache_dirs)
+    train_cache_arg = (
+        train_cache_dirs[0] if len(train_cache_dirs) == 1 else train_cache_dirs
+    )
+    val_cache_arg = (
+        val_cache_dirs[0] if len(val_cache_dirs) == 1 else val_cache_dirs
+    )
     train_dataset = data_handling.CachedPatchDataset(
-        train_cache_dir,
+        train_cache_arg,
         transform=transform,
         preserve_foreground=preserve_foreground,
     )
     val_dataset = data_handling.CachedValidateDataset(
-        val_cache_dir,
+        val_cache_arg,
         transform=transform,
         preserve_foreground=preserve_foreground,
     )
     print("Transform:", transform.cfg)
     print(
-        "Training from cache:", train_cache_dir,
-        "| pool size:", len(train_dataset.raw),
+        "Training from cache:",
+        train_cache_arg,
+        "| pool size:",
+        len(train_dataset),
     )
     print(
-        "Validating from cache:", val_cache_dir,
-        "| examples:", len(val_dataset),
+        "Validating from cache:",
+        val_cache_arg,
+        "| examples:",
+        len(val_dataset),
     )
 
     # Cached patches are cheap to load, so read them in-thread.
@@ -94,8 +138,8 @@ def train(train_cache_dir, val_cache_dir):
     # session is reproducible (the Trainer merges in its own hyperparameters).
     trainer.save_config(
         {
-            "train_cache_dir": train_cache_dir,
-            "val_cache_dir": val_cache_dir,
+            "train_cache_dir": train_cache_arg,
+            "val_cache_dir": val_cache_arg,
             "resume_path": resume_path,
             "transform_cfg": transform.cfg,
             "preserve_foreground": preserve_foreground,

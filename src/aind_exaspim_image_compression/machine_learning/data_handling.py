@@ -10,6 +10,7 @@ Routines for loading data during training and inference.
 
 from aind_exaspim_dataset_utils.s3_util import get_img_prefix
 from bm4d import bm4d
+from collections.abc import Iterable
 from concurrent.futures import (
     as_completed, ProcessPoolExecutor, ThreadPoolExecutor,
 )
@@ -797,8 +798,12 @@ class TrainDataset(Dataset):
 class ValidateDataset(Dataset):
 
     def __init__(
-        self, patch_shape, sigma_bm4d=16, transform=None,
-        preserve_foreground=True, offsets=None,
+        self,
+        patch_shape,
+        sigma_bm4d=16,
+        transform=None,
+        preserve_foreground=True,
+        offsets=None,
     ):
         """
         Instantiates a ValidateDataset object.
@@ -1025,16 +1030,15 @@ class CachedPatchDataset(Dataset):
         Transform mapping counts to the normalized domain.
     """
 
-    def __init__(
-        self, cache_dir, transform=None, preserve_foreground=True,
-    ):
+    def __init__(self, cache_dir, transform=None, preserve_foreground=True):
         """
         Instantiates a CachedPatchDataset.
 
         Parameters
         ----------
-        cache_dir : str
-            Directory holding raw.npy, teacher.npy, and fg.npy.
+        cache_dir : str or Iterable[str]
+            Directory or list of directories containing raw.npy, teacher.npy,
+            and fg.npy.
         transform : IntensityTransform, optional
             Transform mapping counts to the normalized domain. Default is an
             asinh transform.
@@ -1042,19 +1046,36 @@ class CachedPatchDataset(Dataset):
             Whether the target keeps raw counts on the foreground. Default is
             True.
         """
-        super(CachedPatchDataset, self).__init__()
-        self.raw = np.load(os.path.join(cache_dir, "raw.npy"), mmap_mode="r")
-        self.teacher = np.load(
-            os.path.join(cache_dir, "teacher.npy"), mmap_mode="r"
-        )
-        self.fg = np.load(os.path.join(cache_dir, "fg.npy"), mmap_mode="r")
+        # Call parent class
+        super().__init__()
+
+        # Create cache directory list
+        if isinstance(cache_dir, (str, os.PathLike)):
+            cache_dirs = [cache_dir]
+        elif isinstance(cache_dir, Iterable):
+            cache_dirs = list(cache_dir)
+        else:
+            raise TypeError(
+                "cache_dir must be a path or an iterable of paths"
+            )
+
+        # Load arrays with mmap mode
+        self.raw = self._load_cached_arrs(cache_dirs, "raw")
+        self.teacher = self._load_cached_arrs(cache_dirs, "teacher")
+        self.fg = self._load_cached_arrs(cache_dirs, "fg")
+        self._validate_cache()
+
+        self.lengths = [len(x) for x in self.raw]
+        self.cumulative_lengths = np.cumsum(self.lengths)
+
+        # Instance attributes
         self.transform = transform or build_transform({"kind": "asinh"})
         self.preserve_foreground = preserve_foreground
-        self.patch_shape = tuple(self.raw.shape[1:])
+        self.patch_shape = tuple(self.raw[0].shape[1:])
 
     def __len__(self):
         """Number of cached training examples."""
-        return len(self.raw)
+        return int(self.cumulative_lengths[-1])
 
     def __getitem__(self, idx):
         """
@@ -1070,64 +1091,109 @@ class CachedPatchDataset(Dataset):
         Tuple[numpy.ndarray]
             (x, y, fg_mask) for the model.
         """
-        raw = np.asarray(self.raw[idx], dtype=np.float32)
-        teacher = np.asarray(self.teacher[idx], dtype=np.float32)
-        fg_mask = np.asarray(self.fg[idx])
+        raw, teacher, fg_mask = self._get_arrays(idx)
         return build_training_example(
             self.transform, self.preserve_foreground, raw, teacher, fg_mask
         )
 
-
-class CachedValidateDataset(Dataset):
-    """
-    Validation dataset backed by a precomputed count-space patch cache.
-
-    Mirrors CachedPatchDataset but reproduces the ValidateDataset interface:
-    a fixed set of examples iterated in order (not sampled at random), whose
-    __getitem__ also returns the raw counts needed for the count-space
-    metrics. The expensive cloud reads + BM4D + foreground masks are
-    precomputed once (see scripts/precompute.py --split val); this dataset
-    applies only the cheap transform + target construction, so a cache-backed
-    training run needs no cloud access or BM4D at startup.
-
-    Attributes
-    ----------
-    patch_shape : Tuple[int]
-        Shape of the cached patches.
-    transform : IntensityTransform
-        Transform mapping counts to the normalized domain.
-    """
-
-    def __init__(
-        self, cache_dir, transform=None, preserve_foreground=True,
-    ):
+    def _get_arrays(self, idx):
         """
-        Instantiates a CachedValidateDataset.
+        Retrieves raw cached arrays for a global sample index.
+    
+        Parameters
+        ----------
+        idx : int
+            Global sample index.
+
+        Returns
+        -------
+        Tuple[np.ndarray]
+            Raw counts, teacher target, and foreground mask arrays.
+        """
+        cache_idx, local = self._locate(idx)
+        raw = np.asarray(self.raw[cache_idx][local], dtype=np.float32)
+        teacher = np.asarray(self.teacher[cache_idx][local], dtype=np.float32)
+        fg_mask = np.asarray(self.fg[cache_idx][local], dtype=np.float32)
+        return raw, teacher, fg_mask
+
+    def _locate(self, idx):
+        """
+        Maps a global sample index to a cache index and local offset.
 
         Parameters
         ----------
-        cache_dir : str
-            Directory holding raw.npy, teacher.npy, and fg.npy.
-        transform : IntensityTransform, optional
-            Transform mapping counts to the normalized domain. Default is an
-            asinh transform.
-        preserve_foreground : bool, optional
-            Whether the target keeps raw counts on the foreground. Default is
-            True.
-        """
-        super(CachedValidateDataset, self).__init__()
-        self.raw = np.load(os.path.join(cache_dir, "raw.npy"), mmap_mode="r")
-        self.teacher = np.load(
-            os.path.join(cache_dir, "teacher.npy"), mmap_mode="r"
-        )
-        self.fg = np.load(os.path.join(cache_dir, "fg.npy"), mmap_mode="r")
-        self.transform = transform or build_transform({"kind": "asinh"})
-        self.preserve_foreground = preserve_foreground
-        self.patch_shape = tuple(self.raw.shape[1:])
+        idx : int
+            Global sample index.
 
-    def __len__(self):
-        """Number of cached validation examples."""
-        return len(self.raw)
+        Returns
+        -------
+        cache_idx : int
+            Index of the cache containing the sample.
+        offset : int
+            Local index within the selected cache.
+        """
+        # Check for valid index
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+
+        # Find dataset and local indices
+        cache_idx = np.searchsorted(
+            self.cumulative_lengths, idx, side="right"
+        )
+        offset = (
+            idx
+            if cache_idx == 0
+            else idx - self.cumulative_lengths[cache_idx - 1]
+        )
+        return cache_idx, offset
+
+    @staticmethod
+    def _load_cached_arrs(cache_dirs, name):
+        """
+        Loads memory-mapped arrays from multiple cache directories.
+
+        Parameters
+        ----------
+        cache_dirs : List[str]
+            Cache directories containing the array files.
+        name : str
+            Array name (e.g., "raw", "teacher", or "fg").
+
+        Returns
+        -------
+        List[np.ndarray]
+            Memory-mapped arrays, one per cache directory.
+        """
+        return [
+            np.load(os.path.join(d, f"{name}.npy"), mmap_mode="r")
+            for d in cache_dirs
+        ]
+
+    def _validate_cache(self):
+        # Check same number of cached datasets
+        assert len(self.raw) == len(self.teacher) == len(self.fg)
+
+        # Check cache is nonempty
+        if len(self.raw) == 0:
+            raise ValueError("No cached arrays found")
+
+        # Check patch shapes are the same within dataset
+        for raw, teacher, fg in zip(self.raw, self.teacher, self.fg):
+            assert len(raw) == len(teacher) == len(fg)
+            assert raw.shape[1:] == teacher.shape[1:] == fg.shape[1:]
+
+        # Check patch shapes are same across datasets
+        shapes = {r.shape[1:] for r in self.raw}
+        if len(shapes) > 1:
+            raise ValueError(
+                f"Inconsistent patch shapes across cache_dirs: {shapes}"
+            )
+
+
+class CachedValidateDataset(CachedPatchDataset):
+    """
+    Cached validation dataset with raw counts returned for metrics.
+    """
 
     def __getitem__(self, idx):
         """
@@ -1145,9 +1211,7 @@ class CachedValidateDataset(Dataset):
             input, target, raw counts (for count-space metrics), and the
             foreground mask (float 0/1).
         """
-        raw = np.asarray(self.raw[idx], dtype=np.float32)
-        teacher = np.asarray(self.teacher[idx], dtype=np.float32)
-        fg_mask = np.asarray(self.fg[idx])
+        raw, teacher, fg_mask = self._get_arrays(idx)
         x, y, fg = build_training_example(
             self.transform, self.preserve_foreground, raw, teacher, fg_mask
         )

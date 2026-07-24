@@ -5,7 +5,6 @@ import runpy
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
 
@@ -75,11 +74,12 @@ class CachedTrainingTest(unittest.TestCase):
                 load_transform(str(train_cache), str(val_cache))
 
     def test_cache_transforms_must_match(self):
-        """Train and validation caches cannot use different transforms."""
+        """Every train and validation cache must use the same transform."""
         load_transform = self.namespace["_load_cached_transform"]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            train_cache = self._make_cache(root, "train")
+            train_cache = self._make_cache(root, "train-0")
+            extra_train_cache = self._make_cache(root, "train-1")
             val_cache = self._make_cache(
                 root,
                 "val",
@@ -89,7 +89,27 @@ class CachedTrainingTest(unittest.TestCase):
                 },
             )
             with self.assertRaisesRegex(ValueError, "different transforms"):
-                load_transform(str(train_cache), str(val_cache))
+                load_transform(
+                    [str(train_cache), str(extra_train_cache)],
+                    [str(val_cache)],
+                )
+
+    def test_each_cache_in_an_iterable_is_validated(self):
+        """Missing files in any iterable entry fail before construction."""
+        load_transform = self.namespace["_load_cached_transform"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train_cache = self._make_cache(root, "train-0")
+            incomplete = self._make_cache(
+                root, "train-1", omit=("teacher.npy",)
+            )
+            val_cache = self._make_cache(root, "val")
+            with self.assertRaisesRegex(
+                FileNotFoundError, r"train_cache_dir\[1\].*teacher.npy"
+            ):
+                load_transform(
+                    [str(train_cache), str(incomplete)], str(val_cache)
+                )
 
     def test_training_uses_only_cached_datasets(self):
         """Training constructs both cache adapters and records cache config."""
@@ -115,14 +135,15 @@ class CachedTrainingTest(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                train_cache = self._make_cache(root, "train")
+                train_cache = self._make_cache(root, "train-0")
+                extra_train_cache = self._make_cache(root, "train-1")
                 val_cache = self._make_cache(root, "val")
                 transform = self.namespace["_load_cached_transform"](
-                    str(train_cache), str(val_cache)
+                    [str(train_cache), str(extra_train_cache)],
+                    str(val_cache),
                 )
-                train_dataset = SimpleNamespace(
-                    raw=[object(), object()], transform=transform
-                )
+                train_dataset = MagicMock(spec_set=["__len__"])
+                train_dataset.__len__.return_value = 2
                 val_dataset = MagicMock()
                 val_dataset.__len__.return_value = 3
                 val_dataset.transform = transform
@@ -143,11 +164,14 @@ class CachedTrainingTest(unittest.TestCase):
                 ) as init_datasets, patch.dict(
                     globals_, {"Trainer": trainer_factory}
                 ):
-                    train(str(train_cache), str(val_cache))
+                    train(
+                        [str(train_cache), str(extra_train_cache)],
+                        str(val_cache),
+                    )
 
                 init_datasets.assert_not_called()
                 cached_train.assert_called_once_with(
-                    str(train_cache),
+                    [str(train_cache), str(extra_train_cache)],
                     transform=ANY,
                     preserve_foreground=True,
                 )
@@ -158,7 +182,10 @@ class CachedTrainingTest(unittest.TestCase):
                 )
                 trainer.run.assert_called_once_with(train_dataset, val_dataset)
                 config = trainer.save_config.call_args.args[0]
-                self.assertEqual(config["train_cache_dir"], str(train_cache))
+                self.assertEqual(
+                    config["train_cache_dir"],
+                    [str(train_cache), str(extra_train_cache)],
+                )
                 self.assertEqual(config["val_cache_dir"], str(val_cache))
                 self.assertEqual(config["transform_cfg"], transform.cfg)
                 self.assertTrue(config["use_amp"])
