@@ -155,14 +155,19 @@ class TrainerShuffleTest(unittest.TestCase):
             finally:
                 trainer.writer.close()
 
-    def test_trainer_sets_epoch_and_persists_seed(self):
-        """Trainer passes its seed, sets every epoch, and saves the seed."""
+    def test_trainer_uses_local_scheduler_and_persists_seed(self):
+        """Trainer configures its run-local scheduler and persists its seed."""
         model = torch.nn.Linear(1, 1)
         dataset = SimpleNamespace(
             patch_shape=(1, 1, 1), transform=IdentityTransform()
         )
         train_loader = MagicMock()
+        train_loader.__len__.return_value = 3
+        train_loader.__iter__.side_effect = lambda: iter(
+            [(None, None, None)] * 3
+        )
         val_loader = MagicMock()
+        scheduler = MagicMock()
 
         with tempfile.TemporaryDirectory() as directory:
             trainer = Trainer(
@@ -175,14 +180,16 @@ class TrainerShuffleTest(unittest.TestCase):
                 seed=42,
             )
             trainer.train_step = MagicMock(return_value=1.0)
-            trainer.validate_step = MagicMock(return_value=(1.0, 2.0, False))
-            trainer.scheduler.step = MagicMock()
             try:
                 with patch(
                     "aind_exaspim_image_compression.machine_learning."
                     "train.DataLoader",
                     side_effect=[train_loader, val_loader],
-                ) as loader_factory:
+                ) as loader_factory, patch(
+                    "aind_exaspim_image_compression.machine_learning."
+                    "train.CosineAnnealingLR",
+                    return_value=scheduler,
+                ) as scheduler_factory:
                     trainer.run(dataset, dataset)
 
                 self.assertEqual(
@@ -208,6 +215,11 @@ class TrainerShuffleTest(unittest.TestCase):
                 self.assertEqual(
                     train_loader.set_epoch.call_args_list, [call(0), call(1)]
                 )
+                scheduler_factory.assert_called_once_with(
+                    trainer.optimizer, T_max=6
+                )
+                self.assertEqual(scheduler.step.call_count, 6)
+                self.assertFalse(hasattr(trainer, "scheduler"))
 
                 trainer.save_config({})
                 with open(

@@ -99,8 +99,8 @@ class Trainer:
         self.prefetch = prefetch
         self.val_every = max(1, int(val_every))
         self.seed = seed
-        self.use_amp = bool(use_amp and device.startswith("cuda"))
-        self.use_amp_validation = bool(use_amp_validation and device.startswith("cuda"))
+        self.use_amp = bool(use_amp)
+        self.use_amp_validation = bool(use_amp_validation)
 
         self.codec = blosc.Blosc(cname="zstd", clevel=6, shuffle=blosc.SHUFFLE)
         self.criterion = SignalPreservingLoss(fg_weight=fg_weight)
@@ -113,7 +113,10 @@ class Trainer:
         # Scale the loss before backward so small float16 gradients do not
         # underflow (and are unscaled before the step). Disabled => no-op, so
         # the same code path is correct with and without AMP.
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        device_type = torch.device(self.device).type
+        self.scaler = torch.amp.GradScaler(
+            device_type, enabled=self.use_amp
+        )
 
     # --- Core Routines ---
     def run(self, train_dataset, val_dataset):
