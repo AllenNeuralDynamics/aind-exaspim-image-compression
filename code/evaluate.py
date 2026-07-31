@@ -33,13 +33,12 @@ def find_session_dirs(root):
 
 def find_top_k_checkpoints(session_dir, k):
     """
-    Returns the top-k checkpoints from a training session, ranked by score.
+    Returns the last k checkpoints saved in a training session, ordered by
+    epoch (most recent first).
 
-    Checkpoints are named ``BM4DNet-<date>-<epoch>-<score>.pth`` by
-    Trainer.save_model, where <score> is the checkpoint-selection score at save
-    time and lower is better. The score can be negative (the cratio term is
-    subtracted), so it is parsed with a regex that allows a leading minus rather
-    than by splitting on "-".
+    Checkpoints are named ``BM4DNet-<date>-<update>-<score>.pth`` by
+    Trainer.save_model. The update number is parsed to determine save order;
+    higher update == saved later.
 
     Parameters
     ----------
@@ -51,7 +50,7 @@ def find_top_k_checkpoints(session_dir, k):
     Returns
     -------
     list of str
-        Paths to the k lowest-scoring (best) checkpoints, best first.
+        Paths to the k most-recently-saved checkpoints, latest first.
     """
     paths = glob.glob(os.path.join(session_dir, "BM4DNet-*.pth"))
     if not paths:
@@ -59,13 +58,13 @@ def find_top_k_checkpoints(session_dir, k):
             f"No BM4DNet-*.pth checkpoints found in {session_dir}"
         )
 
-    def score(path):
-        m = re.search(r"-(-?\d+\.\d+)\.pth$", os.path.basename(path))
+    def epoch(path):
+        m = re.search(r"BM4DNet-\d{8}-(\d+)-", os.path.basename(path))
         if m is None:
-            raise ValueError(f"Cannot parse score from checkpoint: {path}")
-        return float(m.group(1))
+            raise ValueError(f"Cannot parse update number from checkpoint: {path}")
+        return int(m.group(1))
 
-    return sorted(paths, key=score)[:k]
+    return sorted(paths, key=epoch, reverse=True)[:k]
 
 
 def load_blocks(csv_path):
