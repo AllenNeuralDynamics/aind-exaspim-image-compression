@@ -21,23 +21,26 @@ model_name=""
 crop_shape=""
 clevel=""
 top_k_ckpts=""
+upload_to_s3=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --run_mode)       run_mode="$2";         shift 2 ;;
-        --run_mode=*)     run_mode="${1#*=}";     shift   ;;
-        --dataset_name)   dataset_name="$2";      shift 2 ;;
-        --dataset_name=*) dataset_name="${1#*=}"; shift   ;;
-        --config_name)    config_name="$2";       shift 2 ;;
-        --config_name=*)  config_name="${1#*=}";  shift   ;;
-        --model_name)     model_name="$2";        shift 2 ;;
-        --model_name=*)   model_name="${1#*=}";   shift   ;;
-        --crop_shape)     crop_shape="$2";        shift 2 ;;
-        --crop_shape=*)   crop_shape="${1#*=}";   shift   ;;
-        --clevel)         clevel="$2";            shift 2 ;;
-        --clevel=*)       clevel="${1#*=}";       shift   ;;
-        --top_k_ckpts)    top_k_ckpts="$2";       shift 2 ;;
-        --top_k_ckpts=*)  top_k_ckpts="${1#*=}";  shift   ;;
+        --run_mode)         run_mode="$2";           shift 2 ;;
+        --run_mode=*)       run_mode="${1#*=}";       shift   ;;
+        --dataset_name)     dataset_name="$2";        shift 2 ;;
+        --dataset_name=*)   dataset_name="${1#*=}";   shift   ;;
+        --config_name)      config_name="$2";         shift 2 ;;
+        --config_name=*)    config_name="${1#*=}";    shift   ;;
+        --model_name)       model_name="$2";          shift 2 ;;
+        --model_name=*)     model_name="${1#*=}";     shift   ;;
+        --crop_shape)       crop_shape="$2";          shift 2 ;;
+        --crop_shape=*)     crop_shape="${1#*=}";     shift   ;;
+        --clevel)           clevel="$2";              shift 2 ;;
+        --clevel=*)         clevel="${1#*=}";         shift   ;;
+        --top_k_ckpts)      top_k_ckpts="$2";         shift 2 ;;
+        --top_k_ckpts=*)    top_k_ckpts="${1#*=}";    shift   ;;
+        --upload_to_s3)     upload_to_s3="$2";        shift 2 ;;
+        --upload_to_s3=*)   upload_to_s3="${1#*=}";   shift   ;;
         *) echo "Error: unknown argument '$1'" >&2; exit 1 ;;
     esac
 done
@@ -67,9 +70,10 @@ case "$run_mode" in
         echo "[run] mode=evaluate  dataset=${dataset_name}"
 
         eval_args=( --dataset_name "$dataset_name" )
-        [[ -n "$crop_shape"  ]] && eval_args+=( --crop_shape  "$crop_shape"  )
-        [[ -n "$clevel"      ]] && eval_args+=( --clevel      "$clevel"      )
-        [[ -n "$top_k_ckpts" ]] && eval_args+=( --top_k_ckpts "$top_k_ckpts" )
+        [[ -n "$crop_shape"   ]] && eval_args+=( --crop_shape   "$crop_shape"   )
+        [[ -n "$clevel"       ]] && eval_args+=( --clevel       "$clevel"       )
+        [[ -n "$top_k_ckpts"  ]] && eval_args+=( --top_k_ckpts  "$top_k_ckpts"  )
+        [[ -n "$upload_to_s3" ]] && eval_args+=( --upload_to_s3 "$upload_to_s3" )
 
         python -u /code/evaluate.py "${eval_args[@]}"
         ;;
