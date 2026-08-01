@@ -171,10 +171,10 @@ def evaluate_block(
     # Save MIPs of raw and denoised
     util.mkdir(output_dir)
     img_util.plot_mips(
-        raw, output_path=os.path.join(output_dir, "raw_mips.png")
+        raw[5:-5, 5:-5, 5:-5], output_path=os.path.join(output_dir, "raw_mips.png")
     )
     img_util.plot_mips(
-        denoised, output_path=os.path.join(output_dir, "denoised_mips.png")
+        denoised[5:-5, 5:-5, 5:-5], output_path=os.path.join(output_dir, "denoised_mips.png")
     )
     print("MIPs written to:", output_dir)
 
@@ -361,7 +361,7 @@ if __name__ == "__main__":
     background_offsets_path = "/data/exaspim_background_offsets.json"
     img_prefixes_path = "/data/exaspim_image_prefixes.json"
     output_dir = "/results/"
-    session_root = "/data/denoise_net_v2"
+    session_root = "/data/denoise_net_v2_train"
     csv_path = f"/data/denoise_evaluation_datasets/evaluation_{args.dataset_name}_dataset.csv"
     util.mkdir(output_dir)
 
