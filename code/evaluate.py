@@ -86,12 +86,14 @@ def load_blocks(csv_path):
     List[dict]
     """
     blocks = []
-    for _, row in pd.read_csv(csv_path).iterrows():
+    df = pd.read_csv(csv_path)
+    for _, row in df.iterrows():
         coords = ast.literal_eval(row["Voxel"])
         blocks.append(
             {
                 "brain_id": int(row["Brain ID"]),
                 "voxel": tuple(coords),
+                "img_path": row["Image Path"] if "Image Path" in df.columns else None,
             }
         )
     return blocks
@@ -258,13 +260,17 @@ def evaluate():
                 crop_center = block["voxel"]
                 brain_id_str = str(brain_id)
 
-                img_path = os.path.join(img_prefixes.get(brain_id_str), str(0))
-                if img_path is None:
-                    print(
-                        f"[SKIP] Block {i + 1}/{len(blocks)}: brain_id={brain_id}"
-                        " (not found in img_prefixes)"
-                    )
-                    continue
+                if block["img_path"] is not None:
+                    img_path = block["img_path"].rstrip("/") + "/0"
+                else:
+                    prefix = img_prefixes.get(brain_id_str)
+                    if prefix is None:
+                        print(
+                            f"[SKIP] Block {i + 1}/{len(blocks)}: brain_id={brain_id}"
+                            " (not found in img_prefixes)"
+                        )
+                        continue
+                    img_path = os.path.join(prefix, "0")
 
                 background_offset = background_offsets.get(brain_id_str)
                 block_id = f"{brain_id}_block{i:02d}"
