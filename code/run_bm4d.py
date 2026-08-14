@@ -23,7 +23,7 @@ from aind_exaspim_image_compression.utils.util import list_s3_prefixes, parse_cl
 
 NG_BASE_URL = "https://neuroglancer-demo.appspot.com/#!"
 
-SIGMAS = [400, 800, 1600]
+SIGMAS = [10, 20, 50, 100, 200 400, 800, 1600]
 
 
 def main(source_prefix, dest_prefix):
