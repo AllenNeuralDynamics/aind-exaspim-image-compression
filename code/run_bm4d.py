@@ -23,10 +23,8 @@ from aind_exaspim_image_compression.utils.util import list_s3_prefixes, parse_cl
 
 NG_BASE_URL = "https://neuroglancer-demo.appspot.com/#!"
 
-SIGMAS = [10, 20, 50, 100, 200 400, 800, 1600]
 
-
-def main(source_prefix, dest_prefix):
+def main(source_prefix, dest_prefix, cast_to_uint8=False):
     # Parse cloud prefixes
     src_bucket, src_prefix = parse_cloud_path(source_prefix)
     dst_bucket, dst_prefix = parse_cloud_path(dest_prefix)
@@ -59,21 +57,27 @@ def main(source_prefix, dest_prefix):
             print(f"  Skipping: expected 3-D after squeeze, got shape {volume.shape}")
             continue
 
+        img_dtype = "uint8" if cast_to_uint8 else "uint16"
         print(f"  Shape: {vol3d.shape}, dtype: {vol3d.dtype}")
-        raw_cratio = compute_cratio(vol3d, codec)
+
+        vol3d_stored = to_storage_dtype(vol3d, cast_to_uint8)
+        img_size_mb = vol3d_stored.nbytes / 1e6
+        raw_cratio = compute_cratio(vol3d_stored, codec)
+        print(f"  Size: {img_size_mb:.2f} MB")
         print(f"  Raw cratio: {raw_cratio:.2f}x")
-        results[stem] = {"raw": raw_cratio}
+        results[stem] = {"img_size_mb": img_size_mb, "raw": raw_cratio}
 
         denoised_paths = {}
-        for j, sigma in enumerate(SIGMAS):
-            rel_out = f"{rel_dir}/{stem}_sigma{sigma}.zarr" if rel_dir else f"{stem}_sigma{sigma}.zarr"
-            output_path = f"s3://{dst_bucket}/{dst_prefix}/{rel_out}"
-            print(f"\n  [{j + 1}/{len(SIGMAS)}] sigma={sigma}")
+        for j, sigma in enumerate(sigmas):
+            label = f"sigma{sigma}_{img_dtype}"
+            rel_out = f"{rel_dir}/{stem}.zarr" if rel_dir else f"{stem}.zarr"
+            output_path = f"s3://{dst_bucket}/{dst_prefix}/{label}/{rel_out}"
+            print(f"\n  [{j + 1}/{len(sigmas)}] sigma={sigma}")
             print(f"    Denoising ...")
-            denoised = denoise_volume(vol3d, sigma)
+            denoised = to_storage_dtype(denoise_volume(vol3d, sigma), cast_to_uint8)
             cratio = compute_cratio(denoised, codec)
             results[stem][sigma] = cratio
-            denoised_paths[sigma] = output_path
+            denoised_paths[label] = output_path
             print(f"    Writing to {output_path} ...")
             write_zarr_volume(denoised, output_path)
             print(f"    Done  |  block={stem}  sigma={sigma}  cratio={cratio:.2f}x")
@@ -85,16 +89,24 @@ def main(source_prefix, dest_prefix):
 
     # Print summary table
     col_w = max(len(s) for s in results) + 2
-    header = f"{'Image':<{col_w}} {'Raw':>8}" + "".join(f"  sigma={s:>2}" for s in SIGMAS)
+    header = f"{'Image':<{col_w}} {'Size (MB)':>10} {'Raw':>8}" + "".join(f"  sigma={s:>2}" for s in sigmas)
     print("\n" + header)
     print("-" * len(header))
-    for stem, cratios in results.items():
-        row = f"{stem:<{col_w}} {cratios['raw']:>7.2f}x"
-        row += "".join(f"  {cratios[s]:>8.2f}x" for s in SIGMAS)
+    for stem, cratios in sorted(results.items()):
+        row = f"{stem:<{col_w}} {cratios['img_size_mb']:>9.2f}  {cratios['raw']:>7.2f}x"
+        row += "".join(f"  {cratios[s]:>8.2f}x" for s in sigmas)
         print(row)
 
-    print("\nNeuroglancer links:")
+    print("\nNeuroglancer links (this run):")
     for stem, link in ng_links.items():
+        print(f"  {stem}: {link}")
+
+    print("\nNeuroglancer comparison links (all subdirs under dest_prefix):")
+    dest_prefix = f"s3://{dst_bucket}/{dst_prefix}"
+    for (zarr_path, rel_path) in zarr_entries:
+        rel_dir = "/".join(rel_path.split("/")[:-1])
+        stem = rel_path.split("/")[-1].removesuffix(".zarr")
+        link = generate_comparison_ng_link(zarr_path, dest_prefix, src_bucket, rel_dir, stem)
         print(f"  {stem}: {link}")
 
     print("\nAll done.")
@@ -131,8 +143,8 @@ def generate_ng_link(raw_zarr_path, denoised_paths, src_bucket, rel_dir, stem):
     layers = [
         {"type": "image", "source": f"zarr://{s3_to_https(raw_zarr_path)}", "name": "raw"},
     ] + [
-        {"type": "image", "source": f"zarr://{s3_to_https(path)}", "name": f"sigma{sigma}", "visible": False}
-        for sigma, path in denoised_paths.items()
+        {"type": "image", "source": f"zarr://{s3_to_https(path)}", "name": label, "visible": False}
+        for label, path in denoised_paths.items()
     ]
 
     state = {
@@ -142,6 +154,27 @@ def generate_ng_link(raw_zarr_path, denoised_paths, src_bucket, rel_dir, stem):
         "layout": "4panel",
     }
     return NG_BASE_URL + quote(json.dumps(state))
+
+
+def generate_comparison_ng_link(raw_zarr_path, dest_prefix, src_bucket, rel_dir, stem):
+    """
+    Build a Neuroglancer link for a single image that includes one layer per
+    experiment subdir (sigma{value}_{dtype}) found under dest_prefix.
+
+    Useful for comparing uint8 and uint16 runs side-by-side after both
+    experiments have finished.
+    """
+    dst_bucket, dst_prefix_key = parse_cloud_path(dest_prefix)
+    search_prefix = dst_prefix_key.rstrip("/") + "/"
+    denoised_paths = {}
+    for subprefix in list_s3_prefixes(dst_bucket, search_prefix):
+        subdir = subprefix.rstrip("/").split("/")[-1]
+        if not subdir.startswith("sigma"):
+            continue
+        rel_out = f"{rel_dir}/{stem}.zarr" if rel_dir else f"{stem}.zarr"
+        path = f"s3://{dst_bucket}/{subprefix.rstrip('/')}/{rel_out}"
+        denoised_paths[subdir] = path
+    return generate_ng_link(raw_zarr_path, denoised_paths, src_bucket, rel_dir, stem)
 
 
 def write_zarr_volume(img, output_path, voxel_size_um=(2.0, 1.8, 1.8)):
@@ -157,7 +190,7 @@ def write_zarr_volume(img, output_path, voxel_size_um=(2.0, 1.8, 1.8)):
     zarr.create_array(
         store=output_path.rstrip("/") + "/0",
         shape=img.shape,
-        chunks=(1, 1, 128, 128, 128),
+        chunks=(1, 1, 64, 64, 64),
         dtype=img.dtype,
         zarr_format=2,
         chunk_key_encoding={"name": "v2", "separator": "/"},
@@ -193,8 +226,18 @@ def write_zarr_volume(img, output_path, voxel_size_um=(2.0, 1.8, 1.8)):
     s3.put_object(Bucket=bucket, Key=f"{prefix}/.zattrs", Body=json.dumps({"multiscales": multiscales}))
 
 
+def to_storage_dtype(volume, cast_to_uint8):
+    """Optionally rescale to uint8 via percentile-based clipping; otherwise return uint16."""
+    if cast_to_uint8:
+        vol = volume.astype(np.float32)
+        p1, p999 = np.percentile(vol, [1, 99.9])
+        vol = np.clip(vol - p1, 0, p999 - p1)
+        return (vol * (255.0 / (p999 - p1))).astype(np.uint8)
+    return volume.astype(np.uint16)
+
+
 def denoise_volume(volume_3d, sigma):
-    """Run BM4D on a 3-D array and return a non-negative uint16 result."""
+    """Run BM4D on a uint16 3-D array and return a non-negative uint16 result."""
     denoised = bm4d(volume_3d, sigma)
     return np.maximum(denoised, 0).astype(np.uint16)
 
@@ -223,12 +266,15 @@ def list_zarr_paths(bucket_name, prefix):
     return zarr_entries
 
 
-
 if __name__ == "__main__":
     # Parameters
-    exp_name = "smartspim_bm4d"
+    cast_to_uint8 = True
+    sigmas = [5] #[10, 20, 50, 100]
+    dataset_name = "mesoscale-anatomy-cell-detection"
+
+    # Paths
     source_prefix = "s3://aind-benchmark-data/mesoscale-anatomy-cell-detection/test/"
-    dst_prefix = f"s3://aind-msma-morphology-data/anna.grim/image_compression/{exp_name}"
+    dst_prefix = f"s3://aind-msma-morphology-data/anna.grim/image_compression/smartspim_bm4d/{dataset_name}"
 
     # Run code
-    main(source_prefix, dst_prefix)
+    main(source_prefix, dst_prefix, cast_to_uint8=cast_to_uint8)
