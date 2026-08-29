@@ -40,6 +40,7 @@ from aind_exaspim_image_compression.machine_learning.transforms import (
     calibrate_transform,
 )
 from aind_exaspim_image_compression.utils import img_util, util
+from aind_exaspim_image_compression.utils.swc_util import Reader
 
 
 logger = logging.getLogger(__name__)
@@ -79,10 +80,6 @@ def build_training_example(
         transform.forward(target),
         fg.astype(np.float32),
     )
-
-
-from aind_exaspim_image_compression.utils.swc_util import Reader
-
 
 # --- Custom Datasets ---
 class TrainDataset(Dataset):
