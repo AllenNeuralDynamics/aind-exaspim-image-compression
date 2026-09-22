@@ -21,6 +21,7 @@ import logging
 import fastremap
 import numpy as np
 import os
+import pandas as pd
 import queue
 import random
 import tensorstore as ts
@@ -789,6 +790,179 @@ class TrainDataset(Dataset):
         for i in range(3):
             xyz_arr[:, i] = xyz_arr[:, i] / self.anisotropy[i]
         return np.flip(xyz_arr, axis=1).astype(int)
+
+
+class CellLocationsDataset(Dataset):
+    """
+    A PyTorch Dataset that samples 3D patches centered on detected cell
+    locations read from a CSV. Each patch center is the cell voxel plus a
+    random jitter drawn uniformly from [-max_shift, max_shift] per axis,
+    defaulting to patch_shape // 4 when not specified.
+
+    Attributes
+    ----------
+    patch_shape : Tuple[int]
+        Shape (z, y, x) of sampled patches.
+    anisotropy : Tuple[float]
+        Physical size per voxel in (x, y, z) order, used to convert the CSV's
+        physical coordinates to voxel indices.
+    max_shift : numpy.ndarray
+        Per-axis maximum jitter in voxels.
+    n_examples_per_epoch : int
+        Length of one epoch.
+    offsets : dict
+        Per-brain background offsets subtracted from raw patches.
+    preserve_foreground : bool
+        Whether targets keep raw counts on the foreground.
+    sigma_bm4d : float
+        Noise level passed to BM4D.
+    transform : IntensityTransform
+        Mapping from counts to the normalized domain.
+    """
+
+    def __init__(
+        self,
+        patch_shape,
+        anisotropy=(0.748, 0.748, 1.0),
+        max_shift=None,
+        n_examples_per_epoch=300,
+        offsets=None,
+        preserve_foreground=True,
+        sigma_bm4d=16,
+        transform=None,
+    ):
+        super(CellLocationsDataset, self).__init__()
+        self.patch_shape = patch_shape
+        self.anisotropy = anisotropy
+        self.max_shift = (
+            np.array(max_shift)
+            if max_shift is not None
+            else np.array(patch_shape) // 4
+        )
+        self.n_examples_per_epoch = n_examples_per_epoch
+        self.offsets = offsets or dict()
+        self.preserve_foreground = preserve_foreground
+        self.sigma_bm4d = sigma_bm4d
+        self.transform = transform or build_transform({"kind": "asinh"})
+
+        self.cells = dict()
+        self.imgs = dict()
+
+    def ingest_brain(self, brain_id, img_path, csv_path):
+        """
+        Loads a brain image and its detected-cell CSV.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier for the brain.
+        img_path : str
+            Path to the whole-brain zarr image (local or s3://).
+        csv_path : str
+            Path to the detected_cells.csv (local or s3://) with columns
+            x, y, z in physical coordinates.
+        """
+        self.imgs[brain_id] = img_util.read(img_path)
+        self.cells[brain_id] = self._load_cells(csv_path)
+
+    def _load_cells(self, csv_path):
+        # Coordinates in the detected_cells CSV are in voxel space (x, y, z).
+        # Flip to (z, y, x) to match the (z, y, x) indexing used everywhere
+        # else in the dataset.
+        storage_options = {"anon": True} if csv_path.startswith("s3://") else {}
+        df = pd.read_csv(csv_path, storage_options=storage_options)
+        xyz = df[["x", "y", "z"]].to_numpy(dtype=np.float32)
+        return np.round(xyz[:, ::-1]).astype(int)
+
+    def __len__(self):
+        return self.n_examples_per_epoch
+
+    def __getitem__(self, dummy_input):
+        """
+        Returns a (x, y, fg_mask) training example sampled near a cell center.
+
+        Parameters
+        ----------
+        dummy_input : Any
+            Unused index required by the Dataset interface.
+
+        Returns
+        -------
+        Tuple[numpy.ndarray]
+            (x, y, fg_mask) in the normalized transform domain.
+        """
+        brain_id = self.sample_brain()
+        voxel = self.sample_voxel(brain_id)
+        raw = self.read_counts(brain_id, voxel)
+        teacher = bm4d(raw, self.sigma_bm4d)
+        teacher = np.clip(teacher, 0, self.transform.max_count)
+        fg_mask = make_foreground_mask(raw)
+        return build_training_example(
+            self.transform, self.preserve_foreground, raw, teacher, fg_mask
+        )
+
+    def sample_brain(self):
+        """Samples a brain ID uniformly at random."""
+        return util.sample_once(self.cells.keys())
+
+    def sample_voxel(self, brain_id):
+        """
+        Picks a random detected cell and applies a uniform random jitter.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the brain to sample from.
+
+        Returns
+        -------
+        Tuple[int]
+            Jittered voxel coordinate in (z, y, x) order.
+        """
+        idx = random.randint(0, len(self.cells[brain_id]) - 1)
+        center = self.cells[brain_id][idx]
+        shift = np.array(
+            [np.random.randint(-r, r + 1) for r in self.max_shift]
+        )
+        return tuple((center + shift).tolist())
+
+    def read_counts(self, brain_id, center):
+        """
+        Reads a patch and subtracts the per-brain background offset.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the brain.
+        center : Tuple[int]
+            Center voxel of the patch in (z, y, x) order.
+
+        Returns
+        -------
+        numpy.ndarray
+            Offset-subtracted raw counts.
+        """
+        raw = np.asarray(self.read_patch(brain_id, center)).astype(np.float32)
+        return raw - self.offsets.get(brain_id, 0.0)
+
+    def read_patch(self, brain_id, center):
+        """
+        Reads an image patch from the brain's zarr array.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the brain.
+        center : Tuple[int]
+            Center voxel of the patch in (z, y, x) order.
+
+        Returns
+        -------
+        numpy.ndarray
+            Image patch of shape self.patch_shape.
+        """
+        s = img_util.get_slices(center, self.patch_shape)
+        return self.imgs[brain_id][(0, 0, *s)]
 
 
 class ValidateDataset(Dataset):
