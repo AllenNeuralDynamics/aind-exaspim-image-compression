@@ -10,7 +10,6 @@ Routines for loading data during training and inference.
 
 from aind_exaspim_dataset_utils.s3_util import get_img_prefix
 from bm4d import bm4d
-from collections.abc import Iterable
 from concurrent.futures import (
     as_completed, ProcessPoolExecutor, ThreadPoolExecutor,
 )
@@ -20,9 +19,9 @@ from tqdm import tqdm
 
 import logging
 import fastremap
-import math
 import numpy as np
 import os
+import pandas as pd
 import queue
 import random
 import tensorstore as ts
@@ -79,8 +78,6 @@ def build_training_example(
         transform.forward(target),
         fg.astype(np.float32),
     )
-
-
 from aind_exaspim_image_compression.utils.swc_util import Reader
 
 
@@ -795,15 +792,184 @@ class TrainDataset(Dataset):
         return np.flip(xyz_arr, axis=1).astype(int)
 
 
-class ValidateDataset(Dataset):
+class CellLocationsDataset(Dataset):
+    """
+    A PyTorch Dataset that samples 3D patches centered on detected cell
+    locations read from a CSV. Each patch center is the cell voxel plus a
+    random jitter drawn uniformly from [-max_shift, max_shift] per axis,
+    defaulting to patch_shape // 4 when not specified.
+
+    Attributes
+    ----------
+    patch_shape : Tuple[int]
+        Shape (z, y, x) of sampled patches.
+    anisotropy : Tuple[float]
+        Physical size per voxel in (x, y, z) order, used to convert the CSV's
+        physical coordinates to voxel indices.
+    max_shift : numpy.ndarray
+        Per-axis maximum jitter in voxels.
+    n_examples_per_epoch : int
+        Length of one epoch.
+    offsets : dict
+        Per-brain background offsets subtracted from raw patches.
+    preserve_foreground : bool
+        Whether targets keep raw counts on the foreground.
+    sigma_bm4d : float
+        Noise level passed to BM4D.
+    transform : IntensityTransform
+        Mapping from counts to the normalized domain.
+    """
 
     def __init__(
         self,
         patch_shape,
+        anisotropy=(0.748, 0.748, 1.0),
+        max_shift=None,
+        n_examples_per_epoch=300,
+        offsets=None,
+        preserve_foreground=True,
         sigma_bm4d=16,
         transform=None,
-        preserve_foreground=True,
-        offsets=None,
+    ):
+        super(CellLocationsDataset, self).__init__()
+        self.patch_shape = patch_shape
+        self.anisotropy = anisotropy
+        self.max_shift = (
+            np.array(max_shift)
+            if max_shift is not None
+            else np.array(patch_shape) // 4
+        )
+        self.n_examples_per_epoch = n_examples_per_epoch
+        self.offsets = offsets or dict()
+        self.preserve_foreground = preserve_foreground
+        self.sigma_bm4d = sigma_bm4d
+        self.transform = transform or build_transform({"kind": "asinh"})
+
+        self.cells = dict()
+        self.imgs = dict()
+
+    def ingest_brain(self, brain_id, img_path, csv_path):
+        """
+        Loads a brain image and its detected-cell CSV.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier for the brain.
+        img_path : str
+            Path to the whole-brain zarr image (local or s3://).
+        csv_path : str
+            Path to the detected_cells.csv (local or s3://) with columns
+            x, y, z in physical coordinates.
+        """
+        self.imgs[brain_id] = img_util.read(img_path)
+        self.cells[brain_id] = self._load_cells(csv_path)
+
+    def _load_cells(self, csv_path):
+        # Coordinates in the detected_cells CSV are in voxel space (x, y, z).
+        # Flip to (z, y, x) to match the (z, y, x) indexing used everywhere
+        # else in the dataset.
+        storage_options = {"anon": True} if csv_path.startswith("s3://") else {}
+        df = pd.read_csv(csv_path, storage_options=storage_options)
+        xyz = df[["x", "y", "z"]].to_numpy(dtype=np.float32)
+        return np.round(xyz[:, ::-1]).astype(int)
+
+    def __len__(self):
+        return self.n_examples_per_epoch
+
+    def __getitem__(self, dummy_input):
+        """
+        Returns a (x, y, fg_mask) training example sampled near a cell center.
+
+        Parameters
+        ----------
+        dummy_input : Any
+            Unused index required by the Dataset interface.
+
+        Returns
+        -------
+        Tuple[numpy.ndarray]
+            (x, y, fg_mask) in the normalized transform domain.
+        """
+        brain_id = self.sample_brain()
+        voxel = self.sample_voxel(brain_id)
+        raw = self.read_counts(brain_id, voxel)
+        teacher = bm4d(raw, self.sigma_bm4d)
+        teacher = np.clip(teacher, 0, self.transform.max_count)
+        fg_mask = make_foreground_mask(raw)
+        return build_training_example(
+            self.transform, self.preserve_foreground, raw, teacher, fg_mask
+        )
+
+    def sample_brain(self):
+        """Samples a brain ID uniformly at random."""
+        return util.sample_once(self.cells.keys())
+
+    def sample_voxel(self, brain_id):
+        """
+        Picks a random detected cell and applies a uniform random jitter.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the brain to sample from.
+
+        Returns
+        -------
+        Tuple[int]
+            Jittered voxel coordinate in (z, y, x) order.
+        """
+        idx = random.randint(0, len(self.cells[brain_id]) - 1)
+        center = self.cells[brain_id][idx]
+        shift = np.array(
+            [np.random.randint(-r, r + 1) for r in self.max_shift]
+        )
+        return tuple((center + shift).tolist())
+
+    def read_counts(self, brain_id, center):
+        """
+        Reads a patch and subtracts the per-brain background offset.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the brain.
+        center : Tuple[int]
+            Center voxel of the patch in (z, y, x) order.
+
+        Returns
+        -------
+        numpy.ndarray
+            Offset-subtracted raw counts.
+        """
+        raw = np.asarray(self.read_patch(brain_id, center)).astype(np.float32)
+        return raw - self.offsets.get(brain_id, 0.0)
+
+    def read_patch(self, brain_id, center):
+        """
+        Reads an image patch from the brain's zarr array.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of the brain.
+        center : Tuple[int]
+            Center voxel of the patch in (z, y, x) order.
+
+        Returns
+        -------
+        numpy.ndarray
+            Image patch of shape self.patch_shape.
+        """
+        s = img_util.get_slices(center, self.patch_shape)
+        return self.imgs[brain_id][(0, 0, *s)]
+
+
+class ValidateDataset(Dataset):
+
+    def __init__(
+        self, patch_shape, sigma_bm4d=16, transform=None,
+        preserve_foreground=True, offsets=None,
     ):
         """
         Instantiates a ValidateDataset object.
@@ -1030,15 +1196,16 @@ class CachedPatchDataset(Dataset):
         Transform mapping counts to the normalized domain.
     """
 
-    def __init__(self, cache_dir, transform=None, preserve_foreground=True):
+    def __init__(
+        self, cache_dir, transform=None, preserve_foreground=True,
+    ):
         """
         Instantiates a CachedPatchDataset.
 
         Parameters
         ----------
-        cache_dir : str or Iterable[str]
-            Directory or list of directories containing raw.npy, teacher.npy,
-            and fg.npy.
+        cache_dir : str
+            Directory holding raw.npy, teacher.npy, and fg.npy.
         transform : IntensityTransform, optional
             Transform mapping counts to the normalized domain. Default is an
             asinh transform.
@@ -1046,36 +1213,19 @@ class CachedPatchDataset(Dataset):
             Whether the target keeps raw counts on the foreground. Default is
             True.
         """
-        # Call parent class
-        super().__init__()
-
-        # Create cache directory list
-        if isinstance(cache_dir, (str, os.PathLike)):
-            cache_dirs = [cache_dir]
-        elif isinstance(cache_dir, Iterable):
-            cache_dirs = list(cache_dir)
-        else:
-            raise TypeError(
-                "cache_dir must be a path or an iterable of paths"
-            )
-
-        # Load arrays with mmap mode
-        self.raw = self._load_cached_arrs(cache_dirs, "raw")
-        self.teacher = self._load_cached_arrs(cache_dirs, "teacher")
-        self.fg = self._load_cached_arrs(cache_dirs, "fg")
-        self._validate_cache()
-
-        self.lengths = [len(x) for x in self.raw]
-        self.cumulative_lengths = np.cumsum(self.lengths)
-
-        # Instance attributes
+        super(CachedPatchDataset, self).__init__()
+        self.raw = np.load(os.path.join(cache_dir, "raw.npy"), mmap_mode="r")
+        self.teacher = np.load(
+            os.path.join(cache_dir, "teacher.npy"), mmap_mode="r"
+        )
+        self.fg = np.load(os.path.join(cache_dir, "fg.npy"), mmap_mode="r")
         self.transform = transform or build_transform({"kind": "asinh"})
         self.preserve_foreground = preserve_foreground
-        self.patch_shape = tuple(self.raw[0].shape[1:])
+        self.patch_shape = tuple(self.raw.shape[1:])
 
     def __len__(self):
         """Number of cached training examples."""
-        return int(self.cumulative_lengths[-1])
+        return len(self.raw)
 
     def __getitem__(self, idx):
         """
@@ -1091,109 +1241,64 @@ class CachedPatchDataset(Dataset):
         Tuple[numpy.ndarray]
             (x, y, fg_mask) for the model.
         """
-        raw, teacher, fg_mask = self._get_arrays(idx)
+        raw = np.asarray(self.raw[idx], dtype=np.float32)
+        teacher = np.asarray(self.teacher[idx], dtype=np.float32)
+        fg_mask = np.asarray(self.fg[idx])
         return build_training_example(
             self.transform, self.preserve_foreground, raw, teacher, fg_mask
         )
 
-    def _get_arrays(self, idx):
-        """
-        Retrieves raw cached arrays for a global sample index.
-    
-        Parameters
-        ----------
-        idx : int
-            Global sample index.
 
-        Returns
-        -------
-        Tuple[np.ndarray]
-            Raw counts, teacher target, and foreground mask arrays.
-        """
-        cache_idx, local = self._locate(idx)
-        raw = np.asarray(self.raw[cache_idx][local], dtype=np.float32)
-        teacher = np.asarray(self.teacher[cache_idx][local], dtype=np.float32)
-        fg_mask = np.asarray(self.fg[cache_idx][local], dtype=np.float32)
-        return raw, teacher, fg_mask
-
-    def _locate(self, idx):
-        """
-        Maps a global sample index to a cache index and local offset.
-
-        Parameters
-        ----------
-        idx : int
-            Global sample index.
-
-        Returns
-        -------
-        cache_idx : int
-            Index of the cache containing the sample.
-        offset : int
-            Local index within the selected cache.
-        """
-        # Check for valid index
-        if idx < 0 or idx >= len(self):
-            raise IndexError(idx)
-
-        # Find dataset and local indices
-        cache_idx = np.searchsorted(
-            self.cumulative_lengths, idx, side="right"
-        )
-        offset = (
-            idx
-            if cache_idx == 0
-            else idx - self.cumulative_lengths[cache_idx - 1]
-        )
-        return cache_idx, offset
-
-    @staticmethod
-    def _load_cached_arrs(cache_dirs, name):
-        """
-        Loads memory-mapped arrays from multiple cache directories.
-
-        Parameters
-        ----------
-        cache_dirs : List[str]
-            Cache directories containing the array files.
-        name : str
-            Array name (e.g., "raw", "teacher", or "fg").
-
-        Returns
-        -------
-        List[np.ndarray]
-            Memory-mapped arrays, one per cache directory.
-        """
-        return [
-            np.load(os.path.join(d, f"{name}.npy"), mmap_mode="r")
-            for d in cache_dirs
-        ]
-
-    def _validate_cache(self):
-        # Check same number of cached datasets
-        assert len(self.raw) == len(self.teacher) == len(self.fg)
-
-        # Check cache is nonempty
-        if len(self.raw) == 0:
-            raise ValueError("No cached arrays found")
-
-        # Check patch shapes are the same within dataset
-        for raw, teacher, fg in zip(self.raw, self.teacher, self.fg):
-            assert len(raw) == len(teacher) == len(fg)
-            assert raw.shape[1:] == teacher.shape[1:] == fg.shape[1:]
-
-        # Check patch shapes are same across datasets
-        shapes = {r.shape[1:] for r in self.raw}
-        if len(shapes) > 1:
-            raise ValueError(
-                f"Inconsistent patch shapes across cache_dirs: {shapes}"
-            )
-
-
-class CachedValidateDataset(CachedPatchDataset):
+class CachedValidateDataset(Dataset):
     """
-    Cached validation dataset with raw counts returned for metrics.
+    Validation dataset backed by a precomputed count-space patch cache.
+
+    Mirrors CachedPatchDataset but reproduces the ValidateDataset interface:
+    a fixed set of examples iterated in order (not sampled at random), whose
+    __getitem__ also returns the raw counts needed for the count-space
+    metrics. The expensive cloud reads + BM4D + foreground masks are
+    precomputed once (see scripts/precompute.py --split val); this dataset
+    applies only the cheap transform + target construction, so a cache-backed
+    training run needs no cloud access or BM4D at startup.
+
+    Attributes
+    ----------
+    patch_shape : Tuple[int]
+        Shape of the cached patches.
+    transform : IntensityTransform
+        Transform mapping counts to the normalized domain.
     """
+
+    def __init__(
+        self, cache_dir, transform=None, preserve_foreground=True,
+    ):
+        """
+        Instantiates a CachedValidateDataset.
+
+        Parameters
+        ----------
+        cache_dir : str
+            Directory holding raw.npy, teacher.npy, and fg.npy.
+        transform : IntensityTransform, optional
+            Transform mapping counts to the normalized domain. Default is an
+            asinh transform.
+        preserve_foreground : bool, optional
+            Whether the target keeps raw counts on the foreground. Default is
+            True.
+        """
+        super(CachedValidateDataset, self).__init__()
+        self.raw = np.load(os.path.join(cache_dir, "raw.npy"), mmap_mode="r")
+        self.teacher = np.load(
+            os.path.join(cache_dir, "teacher.npy"), mmap_mode="r"
+        )
+        self.fg = np.load(os.path.join(cache_dir, "fg.npy"), mmap_mode="r")
+        self.transform = transform or build_transform({"kind": "asinh"})
+        self.preserve_foreground = preserve_foreground
+        self.patch_shape = tuple(self.raw.shape[1:])
+
+    def __len__(self):
+        """Number of cached validation examples."""
+        return len(self.raw)
 
     def __getitem__(self, idx):
         """
@@ -1211,7 +1316,9 @@ class CachedValidateDataset(CachedPatchDataset):
             input, target, raw counts (for count-space metrics), and the
             foreground mask (float 0/1).
         """
-        raw, teacher, fg_mask = self._get_arrays(idx)
+        raw = np.asarray(self.raw[idx], dtype=np.float32)
+        teacher = np.asarray(self.teacher[idx], dtype=np.float32)
+        fg_mask = np.asarray(self.fg[idx])
         x, y, fg = build_training_example(
             self.transform, self.preserve_foreground, raw, teacher, fg_mask
         )
@@ -1378,9 +1485,6 @@ class DataLoader:
             for j, field in enumerate(fields):
                 batched[j][i, 0, ...] = field
         return tuple(to_tensor(arr) for arr in batched)
-
-    def __len__(self):
-        return math.ceil(len(self.dataset) / self.batch_size)
 
 
 # --- Helpers ---
