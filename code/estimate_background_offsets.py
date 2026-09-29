@@ -1,8 +1,8 @@
 """
 Estimate per-brain background offsets from the level-5 multiscale zarr.
 
-For each brain in the training list, this reads the coarse (level-5) image,
-computes a low percentile as the background / black-point, and writes a
+For each brain in the image prefixes JSON, this reads the coarse (level-5)
+image, computes a low percentile as the background / black-point, and writes a
 {brain_id: offset} JSON. It also prints the distribution of offsets across
 brains so the fixed-vs-per-brain decision falls out of the numbers:
 
@@ -50,7 +50,7 @@ def estimate_offset(brain_id, img_prefixes_path, level, percentile):
         fraction of zero voxels.
     """
     prefix = get_img_prefix(brain_id, img_prefixes_path)
-    arr = img_util.read(prefix + str(level))
+    arr = img_util.read(prefix.rstrip("/") + "/" + str(level))
     vol = np.asarray(arr[0, 0]).reshape(-1)  # channel 0, timepoint 0
     nonzero = vol[vol > 0]
     zero_fraction = 1.0 - nonzero.size / vol.size
@@ -68,8 +68,8 @@ def estimate_offset(brain_id, img_prefixes_path, level, percentile):
 
 
 def main():
-    # Estimate an offset per brain
-    brain_ids = util.read_txt(brain_ids_path)
+    # Derive brain IDs from the keys of the image prefixes JSON
+    brain_ids = list(util.read_json(img_prefixes_path).keys())
     offsets = dict()
     for brain_id in tqdm(brain_ids, desc="Estimate offsets"):
         try:
@@ -113,20 +113,22 @@ def main():
 
 if __name__ == "__main__":
     import argparse
+    import os
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--filename", default="train_brain_ids.txt")
+    parser.add_argument("--img_prefixes_path", default="/data/exaspim_image_prefixes.json")
     parser.add_argument("--level", type=int, default=5)
     parser.add_argument("--percentile", type=float, default=0.1)
     parser.add_argument("--scale_hint", type=float, default=32.0)
-    args, _ = parser.parse_known_args()
- 
-    # Paths
-    brain_ids_path = f"/data/{args.filename.strip()}"
-    img_prefixes_path = "/data/exaspim_image_prefixes.json"
-    output_path = f"/results/{args.filename.replace('brain_ids', 'background_offsets').replace('.txt', '.json')}"
+    args = parser.parse_args()
+
+    # Derive output path from the prefixes filename
+    prefixes_name = os.path.basename(args.img_prefixes_path)
+    output_name = prefixes_name.replace("image_prefixes", "background_offsets")
+    output_path = f"/results/{output_name}"
 
     # Parameters
+    img_prefixes_path = args.img_prefixes_path
     level = args.level
     percentile = args.percentile
     scale_hint = args.scale_hint  # asinh knee; only used to judge whether spread matters

@@ -123,8 +123,8 @@ def _sample_counts(index):
     fg_mask = _WORKER_TRAIN.annotation_mask(brain_id, voxel, labels=labels)
     return _WORKER_VAL.sample_counts(brain_id, voxel, fg_mask=fg_mask, raw=raw)
 
-
-def precompute():
+    
+def precompute(cache_dir, n_patches, split):
     # Offset calibration would need a cloud sample the cache is meant to avoid,
     # and each worker would calibrate on its own random sample -- so the cache
     # would mix inconsistent offsets and none would match the stamped cfg. The
@@ -243,19 +243,12 @@ def precompute():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--split",
-        choices=("train", "val"),
-        default="train",
-        help="Which cache to build (default: train).",
-    )
-    parser.add_argument(
         "--brain_type",
         choices=("alpha", "beta", "beta2"),
         default="alpha",
         help="Which brain type to build the cache for (default: alpha).",
     )
     args = parser.parse_args()
-    split = args.split
     brain_type = args.brain_type
 
     # Set brain ids path based on brain type
@@ -265,13 +258,13 @@ if __name__ == "__main__":
         brains_filename = "train_beta_brain_ids.txt"
     else:
         brains_filename = "train_beta2_brain_ids.txt"
-    
+
     brain_ids_path = f"/data/{brains_filename}"
 
     # Save brain ids in results
     dst_path = f"/results/{brains_filename}"
     shutil.copy2(brain_ids_path, dst_path)
-    
+
     # Paths (shared by both splits)
     img_prefixes_path = "/data/exaspim_image_prefixes.json"
     segmentation_prefixes_path = "/data/exaspim_segmentation_prefixes.json"
@@ -334,18 +327,12 @@ if __name__ == "__main__":
     seed = 42
     num_workers = None
 
-    # Per-split output location and pool size.
-    if split == "train":
-        # ~2.4 MB/patch (fp32 raw+teacher + uint8 fg), so 30000 ~= 71 GB.
-        cache_dir = "/results/patch_cache"
-        n_patches = 30000
-    else:
-        # The per-patch metrics are heavy-tailed (a sizable fraction of patches
-        # are near-pure background that compress at hundreds of x), so a small
-        # set makes the reported median cratio -- and thus checkpoint selection
-        # -- noisy. ~500 keeps that sampling error small; returns diminish past
-        # ~1000. Disk is cheap.
-        cache_dir = "/results/val_patch_cache"
-        n_patches = 500
+    # Train cached dataset
+    train_cache_dir = "/results/patch_cache"
+    n_train_patches = 30000
+    precompute(train_cache_dir, n_train_patches, "train")
 
-    precompute()
+    # Val cached dataset
+    val_cache_dir = "/results/val_patch_cache"
+    n_val_patches = 500
+    precompute(val_cache_dir, n_val_patches, "val")

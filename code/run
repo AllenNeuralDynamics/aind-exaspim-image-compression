@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -ex
+set -euo pipefail
 
 setup_google_creds() {
     TEMP_CRED_FILE=$(mktemp --suffix=".json")
@@ -10,37 +10,43 @@ setup_google_creds() {
 
 setup_google_creds
 
-# Extract --run_mode and strip it from the forwarded args so each script
-# only sees the flags it declares in its own argparser.
+# Route args to the correct script:
+#   --run_mode   consumed here (not forwarded)
+#   --brain_type forwarded only to run.py (generate_cached_dataset)
+#   everything else forwarded only to estimate_background_offsets.py
 run_mode=""
-remaining=()
+brain_type_args=()
+bg_offset_args=()
+smartspim_args=()
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --run_mode)
-            run_mode="$2"
-            shift 2
-            ;;
-        --run_mode=*)
-            run_mode="${1#--run_mode=}"
-            shift
-            ;;
-        *)
-            remaining+=("$1")
-            shift
-            ;;
+        --run_mode)     run_mode="$2"; shift 2 ;;
+        --run_mode=*)   run_mode="${1#--run_mode=}"; shift ;;
+        --brain_type)   brain_type_args+=(--brain_type "$2"); shift 2 ;;
+        --brain_type=*) brain_type_args+=("$1"); shift ;;
+        --sigma_bm4d)   smartspim_args+=(--sigma_bm4d "$2"); shift 2 ;;
+        --sigma_bm4d=*) smartspim_args+=("$1"); shift ;;
+        --img_prefixes_path) bg_offset_args+=(--img_prefixes_path "$2"); shift 2 ;;
+        --img_prefixes_path=*) bg_offset_args+=("$1"); shift ;;
+        *)              bg_offset_args+=("$1"); shift ;;
     esac
 done
 
 case "$run_mode" in
     generate_cached_dataset)
-        python -u run.py "${remaining[@]}"
+        python -u run.py "${brain_type_args[@]}"
+        ;;
+    generate_cached_dataset_smartspim)
+        python -u run_smartspim.py "${smartspim_args[@]}"
         ;;
     compute_background_offsets)
-        python -u estimate_background_offsets.py "${remaining[@]}"
+        python -u estimate_background_offsets.py "${bg_offset_args[@]}"
         ;;
     *)
         echo "ERROR: unknown or missing run_mode '${run_mode}'." \
-             "Must be 'generate_cached_dataset' or 'compute_background_offsets'." >&2
+             "Must be 'generate_cached_dataset', 'generate_cached_dataset_smartspim'," \
+             "or 'compute_background_offsets'." >&2
         exit 1
         ;;
 esac
