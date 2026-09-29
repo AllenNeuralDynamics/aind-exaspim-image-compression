@@ -30,8 +30,17 @@ loads with CachedValidateDataset):
 
 """
 
+import os
+import sys
+
+# aind_exaspim_image_compression is imported from the environment image,
+# which pins a pushed commit of this repo (see environment/postInstall). Edits
+# to the capsule's src/ therefore do not take effect until they are committed,
+# pushed, the pin is bumped, and the environment is rebuilt.
+
 import random
 import shutil
+import warnings
 
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
@@ -43,6 +52,16 @@ from aind_exaspim_image_compression.machine_learning.transforms import (
     build_transform,
 )
 from aind_exaspim_image_compression.utils import util
+
+# The OME-Zarr v2 arrays in aind-open-data declare "filters": [] instead of
+# null, which zarr warns about on every array open in every worker. The data
+# is read correctly; drop the message so real errors stay visible.
+warnings.filterwarnings(
+    "ignore",
+    message="Found an empty list of filters",
+    category=UserWarning,
+    module="zarr",
+)
 
 _SEED_STREAMS = {"train": 0, "val": 1}
 
@@ -187,6 +206,18 @@ if __name__ == "__main__":
         default=24,
         help="BM4D noise level used for teacher denoising (default: 24)",
     )
+    parser.add_argument(
+        "--sanity_check",
+        action="store_true",
+        help="Write a handful of patches per split to a throwaway cache and "
+             "exit, instead of running the full precompute",
+    )
+    parser.add_argument(
+        "--n_sanity",
+        type=int,
+        default=3,
+        help="Patches per split for --sanity_check (default: 3)",
+    )
     args = parser.parse_args()
 
     brain_ids_path = "/data/train_smartspim_brain_ids.txt"
@@ -223,18 +254,39 @@ if __name__ == "__main__":
     sigma_bm4d = args.sigma_bm4d
 
     seed = 42
-    num_workers = None
+    # A sanity run samples a few patches; one worker avoids paying the
+    # per-worker cost of ingesting every brain just to read them.
+    num_workers = 1 if args.sanity_check else None
 
     # Locate each brain's detected_cells.csv (sibling of the fused image,
     # same channel) and record the mapping next to the cache.
     if use_detected_cells:
-        cell_paths = data_handling.find_detected_cells_paths(
-            util.read_txt(brain_ids_path), img_prefixes_path
-        )
-        util.write_json(cell_prefixes_path, cell_paths)
-        print(f"Found detected cells for {len(cell_paths)} brains")
+        if args.sanity_check and os.path.exists(cell_prefixes_path):
+            # Resolving the mapping walks S3 for every brain; a sanity run
+            # reuses whatever the last full run recorded.
+            print(f"Reusing cell prefixes: {cell_prefixes_path}")
+        else:
+            cell_paths = data_handling.find_detected_cells_paths(
+                util.read_txt(brain_ids_path), img_prefixes_path
+            )
+            util.write_json(cell_prefixes_path, cell_paths)
+            print(f"Found detected cells for {len(cell_paths)} brains")
     else:
         cell_prefixes_path = None
+
+    if args.sanity_check:
+        # Flat sibling dirs: util.mkdir is a plain os.mkdir, no parents.
+        for sanity_split in ("train", "val"):
+            sanity_dir = (
+                f"/results/smartspim_sanity_{sanity_split}_sigma{sigma_bm4d}"
+            )
+            precompute(sanity_dir, args.n_sanity, sanity_split)
+            print(
+                f"Render it with:\n"
+                f"    python scripts/visualize_patches.py {sanity_dir} "
+                f"--n {args.n_sanity} --out {sanity_dir}/preview.png"
+            )
+        sys.exit(0)
 
     # Train cached dataset
     train_cache_dir = f"/results/smartspim_patch_cache_sigma{sigma_bm4d}"
