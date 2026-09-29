@@ -20,9 +20,11 @@ from tqdm import tqdm
 
 import logging
 import fastremap
+import fsspec
 import math
 import numpy as np
 import os
+import pandas as pd
 import queue
 import random
 import tensorstore as ts
@@ -101,6 +103,7 @@ class TrainDataset(Dataset):
         patch_shape,
         anisotropy=(0.748, 0.748, 1.0),
         boundary_buffer=5000,
+        cell_max_shift=None,
         foreground_sampling_rate=0.5,
         min_foreground_voxels=50,
         min_segmentation_volume=200,
@@ -126,6 +129,11 @@ class TrainDataset(Dataset):
         # Class attributes
         self.anisotropy = anisotropy
         self.boundary_buffer = boundary_buffer
+        self.cell_max_shift = (
+            np.array(cell_max_shift)
+            if cell_max_shift is not None
+            else np.array(patch_shape) // 4
+        )
         self.foreground_sampling_rate = foreground_sampling_rate
         self.min_foreground_voxels = min_foreground_voxels
         self.min_segmentation_volume = min_segmentation_volume
@@ -148,15 +156,19 @@ class TrainDataset(Dataset):
         self.swc_reader = Reader()
 
         # Data structures
+        self.cells = dict()
         self.segmentations = dict()
         self.skeletons = dict()
         self.imgs = dict()
 
     # --- Ingest data ---
-    def ingest_brain(self, brain_id, img_path, segmentation_path, swc_pointer):
+    def ingest_brain(
+        self, brain_id, img_path, segmentation_path, swc_pointer,
+        cells_path=None,
+    ):
         """
-        Loads a brain image, label mask, and skeletons, then stores each in
-        internal dictionaries.
+        Loads a brain image, label mask, skeletons, and detected cells, then
+        stores each in internal dictionaries.
 
         Parameters
         ----------
@@ -168,10 +180,44 @@ class TrainDataset(Dataset):
             Path to segmentation.
         swc_path : str
             Path to SWC files.
+        cells_path : str, optional
+            Path to a detected_cells.csv for this brain. Default is None.
         """
         self.imgs[brain_id] = img_util.read(img_path)
         self._load_segmentation(brain_id, segmentation_path)
         self._load_swcs(brain_id, swc_pointer)
+        self._load_cells(brain_id, cells_path)
+
+    def _load_cells(self, brain_id, csv_path):
+        """
+        Reads detected cell locations from a CSV of cell centroids.
+
+        Coordinates in the CSV are voxel indices given as (x, y, z); they are
+        flipped to (z, y, x) to match the indexing used everywhere else in
+        this dataset.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier for the brain corresponding to the given path.
+        csv_path : str
+            Path to detected_cells.csv (local or s3://) with columns x, y, z.
+        """
+        if csv_path:
+            storage_options = (
+                {"anon": True} if str(csv_path).startswith("s3://") else {}
+            )
+            df = pd.read_csv(csv_path, storage_options=storage_options)
+            xyz = df[["x", "y", "z"]].to_numpy(dtype=np.float32)
+            cells = np.round(xyz[:, ::-1]).astype(int)
+            if len(cells):
+                self.cells[brain_id] = cells
+            else:
+                logger.warning(
+                    "Detected-cell CSV for brain %s is empty: %s",
+                    brain_id,
+                    csv_path,
+                )
 
     def _load_segmentation(self, brain_id, segmentation_path):
         """
@@ -549,7 +595,9 @@ class TrainDataset(Dataset):
         Tuple[int]
             Voxel coordinate representing a likely foreground location.
         """
-        if brain_id in self.skeletons and np.random.random() > 0.5:
+        if brain_id in self.cells:
+            return self.sample_cell_voxel(brain_id)
+        elif brain_id in self.skeletons and np.random.random() > 0.5:
             return self.sample_skeleton_voxel(brain_id)
         elif brain_id in self.segmentations:
             return self.sample_segmentation_voxel(brain_id)
@@ -577,6 +625,55 @@ class TrainDataset(Dataset):
             upper = s - self.boundary_buffer
             voxel.append(random.randint(self.boundary_buffer, upper))
         return tuple(voxel)
+
+    def sample_cell_voxel(self, brain_id):
+        """
+        Samples a voxel coordinate near a detected cell.
+
+        Picks a detected cell uniformly at random and jitters it by a uniform
+        shift drawn per axis from [-cell_max_shift, cell_max_shift], so the
+        cell lands somewhere in the patch rather than always at its center.
+        The result is clamped so the patch stays inside the volume, since
+        detected cells can sit near the image boundary.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of a whole-brain.
+
+        Returns
+        -------
+        Tuple[int]
+            Jittered voxel coordinate in (z, y, x) order.
+        """
+        idx = random.randint(0, len(self.cells[brain_id]) - 1)
+        center = self.cells[brain_id][idx]
+        shift = np.array(
+            [np.random.randint(-r, r + 1) for r in self.cell_max_shift]
+        )
+        return self.clip_to_interior(brain_id, center + shift)
+
+    def clip_to_interior(self, brain_id, voxel):
+        """
+        Clamps a voxel so its patch lies fully inside the image volume.
+
+        Parameters
+        ----------
+        brain_id : str
+            Unique identifier of a whole-brain.
+        voxel : ArrayLike
+            Voxel coordinate in (z, y, x) order.
+
+        Returns
+        -------
+        Tuple[int]
+            Clamped voxel coordinate.
+        """
+        clipped = list()
+        img_shape = self.imgs[brain_id].shape[2::]
+        for v, s, d in zip(voxel, img_shape, self.patch_shape):
+            clipped.append(int(np.clip(v, d // 2, s - (d - d // 2))))
+        return tuple(clipped)
 
     def sample_skeleton_voxel(self, brain_id):
         """
@@ -1384,10 +1481,111 @@ class DataLoader:
 
 
 # --- Helpers ---
+# --- Locate Detected Cells ---
+_FUSED_IMAGE_DIR = "image_tile_fusing/OMEZarr"
+_CELL_SEGMENTATION_DIR = "image_cell_segmentation"
+
+
+def resolve_detected_cells_path(img_path):
+    """
+    Derives the detected_cells.csv that sits alongside a fused image.
+
+    A stitched SmartSPIM asset stores the cell segmentation as a sibling of
+    the fused image, keyed by the same channel::
+
+        <asset>/image_tile_fusing/OMEZarr/<channel>.zarr
+        <asset>/image_cell_segmentation/<channel>/detected_cells.csv
+
+    The channel must match: a brain segmented only on a different channel
+    (e.g. Ex_488_Em_525 when training on Ex_561_Em_600) has cells marking a
+    different label, which would not be bright in the training image, so no
+    path is derived for it.
+
+    Parameters
+    ----------
+    img_path : str
+        Path to a fused whole-brain image, with or without a trailing
+        multiscale level.
+
+    Returns
+    -------
+    str or None
+        Path to the channel-matched detected_cells.csv, or None when
+        "img_path" does not follow the fused SmartSPIM layout.
+    """
+    asset, sep, rest = str(img_path).partition(f"/{_FUSED_IMAGE_DIR}/")
+    channel = rest.split(".zarr")[0]
+    if not sep or not channel:
+        return None
+    return (
+        f"{asset}/{_CELL_SEGMENTATION_DIR}/{channel}/detected_cells.csv"
+    )
+
+
+def find_detected_cells_paths(brain_ids, img_paths_json, max_workers=16):
+    """
+    Locates the detected_cells.csv of each brain that has one.
+
+    Brains whose asset has no cell segmentation, or has one only on a channel
+    other than the image channel, are omitted; foreground sampling then falls
+    back to the intensity threshold for them.
+
+    Parameters
+    ----------
+    brain_ids : List[str]
+        Unique identifiers of the brains to look up.
+    img_paths_json : str
+        Path to the JSON mapping brain IDs to image prefixes.
+    max_workers : int, optional
+        Number of concurrent existence checks. Default is 16.
+
+    Returns
+    -------
+    dict
+        Maps brain ID to its detected_cells.csv path, for brains that have
+        one.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def check(brain_id):
+        try:
+            img_prefix = get_img_prefix(brain_id, img_paths_json)
+        except Exception:
+            return brain_id, None
+        csv_path = resolve_detected_cells_path(img_prefix)
+        if csv_path and _path_exists(csv_path):
+            return brain_id, csv_path
+        return brain_id, None
+
+    cell_paths = dict()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        threads = [executor.submit(check, b) for b in brain_ids]
+        for thread in as_completed(threads):
+            brain_id, csv_path = thread.result()
+            if csv_path:
+                cell_paths[brain_id] = csv_path
+    logger.info(
+        "Found detected cells for %d of %d brains",
+        len(cell_paths),
+        len(brain_ids),
+    )
+    return cell_paths
+
+
+def _path_exists(path):
+    """Checks whether a local or (anonymous) S3 path exists."""
+    if img_util.is_s3_path(path):
+        return fsspec.filesystem("s3", anon=True).exists(path)
+    return os.path.exists(path)
+
+
 def init_datasets(
     brain_ids,
     img_paths_json,
     patch_shape,
+    boundary_buffer=5000,
+    cell_prefixes_path=None,
+    cell_max_shift=None,
     foreground_sampling_rate=0.5,
     min_foreground_voxels=50,
     min_segmentation_volume=200,
@@ -1414,6 +1612,8 @@ def init_datasets(
         transform_cfg = {"kind": "asinh"}
     train_dataset = TrainDataset(
         patch_shape,
+        boundary_buffer=boundary_buffer,
+        cell_max_shift=cell_max_shift,
         foreground_sampling_rate=foreground_sampling_rate,
         min_foreground_voxels=min_foreground_voxels,
         min_segmentation_volume=min_segmentation_volume,
@@ -1444,6 +1644,12 @@ def init_datasets(
     else:
         segmentation_paths = dict()
 
+    # Read detected-cell CSV lookup (if applicable)
+    if cell_prefixes_path:
+        cell_paths = util.read_json(cell_prefixes_path)
+    else:
+        cell_paths = dict()
+
     # Load data
     for brain_id in tqdm(brain_ids, desc="Load Data"):
         # Set image path
@@ -1465,7 +1671,11 @@ def init_datasets(
         # Ingest data
         val_dataset.ingest_brain(brain_id, img_path)
         train_dataset.ingest_brain(
-            brain_id, img_path, segmentation_path, swc_pointer
+            brain_id,
+            img_path,
+            segmentation_path,
+            swc_pointer,
+            cells_path=cell_paths.get(brain_id),
         )
 
     # Resolve one frozen transform, optionally calibrating the offset from a
