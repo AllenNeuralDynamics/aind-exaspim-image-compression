@@ -218,7 +218,7 @@ if __name__ == "__main__":
     foreground_sampling_rate = 0.5
     min_foreground_voxels = 50
     patch_shape = (64, 64, 64)
-    boundary_buffer = 128  # SmartSPIM z is ~4k voxels; run.py's 5000 exceeds it
+    boundary_buffer = 128
     cell_max_shift = None  # defaults to patch_shape // 4
     sigma_bm4d = args.sigma_bm4d
 

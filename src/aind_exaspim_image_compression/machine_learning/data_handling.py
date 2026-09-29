@@ -1556,9 +1556,11 @@ def find_detected_cells_paths(brain_ids, img_paths_json, max_workers=16):
         one.
     """
     def check(brain_id):
-        csv_path = resolve_detected_cells_path(
-            get_img_prefix(brain_id, img_paths_json)
-        )
+        try:
+            img_prefix = get_img_prefix(brain_id, img_paths_json)
+        except Exception:
+            return brain_id, None
+        csv_path = resolve_detected_cells_path(img_prefix)
         if csv_path and _path_exists(csv_path):
             return brain_id, csv_path
         return brain_id, None
